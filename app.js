@@ -1,0 +1,5748 @@
+﻿/* RideSync MVP - Browser demo (mock data + local multi-tab sync)
+ *
+ * Goals:
+ * - Create/join private sessions via a short code
+ * - Simulate per-user telemetry (power / HR / cadence)
+ * - Broadcast updates via localStorage events (works across tabs)
+ * - Render a live leaderboard + session timer
+ * - Store session summaries locally
+ */
+
+const STORAGE_PREFIX = "ridesync";
+const SESSION_STORE_KEY = (code) => `${STORAGE_PREFIX}:session:${code}`;
+const SUMMARIES_KEY = `${STORAGE_PREFIX}:summaries`;
+const AUTH_USERS_KEY = `${STORAGE_PREFIX}:auth:users`;
+const AUTH_SESSION_KEY = `${STORAGE_PREFIX}:auth:currentUserId`;
+const PROFILES_KEY = `${STORAGE_PREFIX}:profiles`;
+const PUBLIC_PROFILES_KEY = `${STORAGE_PREFIX}:publicProfiles`;
+const FRIEND_REQUESTS_KEY = `${STORAGE_PREFIX}:friendRequests`;
+const FRIENDSHIPS_KEY = `${STORAGE_PREFIX}:friendships`;
+
+// WebRTC signaling server (fallbacks to localStorage if unavailable)
+const DEFAULT_SIGNALING_SERVER = "ws://localhost:3000";
+const SIGNALING_SERVER_QUERY_PARAM = "signaling"; // e.g. ?signaling=ws://example.com:3000
+
+const appEl = document.getElementById("app");
+const PRIVATE_RIDER_STATS_REFRESH_MS = 5000;
+const PRIVATE_RIDER_PEAK_WINDOWS = Object.freeze([
+  { label: "10s", seconds: 10 },
+  { label: "30s", seconds: 30 },
+  { label: "1m", seconds: 60 },
+  { label: "5m", seconds: 300 },
+  { label: "10m", seconds: 600 },
+  { label: "20m", seconds: 1200 },
+  { label: "40m", seconds: 2400 },
+  { label: "1h", seconds: 3600 },
+]);
+const PRIVATE_RIDER_MAX_WINDOW_SECONDS = PRIVATE_RIDER_PEAK_WINDOWS[PRIVATE_RIDER_PEAK_WINDOWS.length - 1].seconds;
+const BIKE_SWITCH_SPEED_LIMIT_KPH = 2;
+// Bike catalog is intentionally data-driven so adding new bike types is a catalog-only change.
+const BIKE_CATALOG = Object.freeze([
+  {
+    id: "climbing_bike",
+    name: "Climbing Bike",
+    description: "Lightweight bike built for hills and sustained gradients.",
+    weightKg: 6.8,
+    aeroModifier: 1.08, // >1 means more drag (worse aero)
+    climbingModifier: 1.04,
+    flatModifier: 0.97,
+    pros: "Lighter and stronger on climbs",
+    cons: "Less aerodynamic on flats and descents",
+  },
+  {
+    id: "road_bike",
+    name: "Road Bike",
+    description: "More aerodynamic all-rounder for speed on flatter terrain.",
+    weightKg: 8.2,
+    aeroModifier: 0.94, // <1 means less drag (better aero)
+    climbingModifier: 0.98,
+    flatModifier: 1.03,
+    pros: "Faster on flats and high-speed sections",
+    cons: "Heavier and slightly weaker on steep climbs",
+  },
+]);
+const DEFAULT_BIKE_ID = "road_bike";
+const MAX_PLAYER_LEVEL = 100;
+// Tuned for an MVP target of ~2 years to level 100 at roughly 1 hour/day of consistent riding.
+const XP_CONFIG = Object.freeze({
+  xpPerMinuteRidden: 8,
+  xpPerKmTraveled: 6,
+  xpPerMeterClimbed: 0.35,
+});
+const LEVEL_CURVE_CONFIG = Object.freeze({
+  baseXpPerLevel: 125,
+  linearXpScale: 36,
+  quadraticXpScale: 1.25,
+  minXpPerLevel: 120,
+});
+const POWER_UP_GRANT_DISTANCE_METERS = 1000;
+const POWER_UP_QUEUE_MAX = 2;
+const POWER_UP_TYPE_SPEED_BOOST = "speed_boost";
+const POWER_UP_TYPES = Object.freeze({
+  [POWER_UP_TYPE_SPEED_BOOST]: Object.freeze({
+    type: POWER_UP_TYPE_SPEED_BOOST,
+    label: "BOOST",
+    durationMs: 10000,
+    speedMultiplier: 1.05,
+  }),
+});
+
+// Progression math is kept centralized so balancing can be tuned in one place.
+function normalizeXpValue(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.round(parsed);
+}
+
+function getXpRequiredForLevelTransition(levelInput) {
+  const level = Math.round(Number(levelInput));
+  if (!Number.isFinite(level) || level < 1 || level >= MAX_PLAYER_LEVEL) return 0;
+  const rawRequirement =
+    LEVEL_CURVE_CONFIG.baseXpPerLevel +
+    LEVEL_CURVE_CONFIG.linearXpScale * level +
+    LEVEL_CURVE_CONFIG.quadraticXpScale * level * level;
+  return Math.max(LEVEL_CURVE_CONFIG.minXpPerLevel, Math.round(rawRequirement));
+}
+
+function getXpForLevel(levelInput) {
+  const requestedLevel = Math.round(Number(levelInput));
+  if (!Number.isFinite(requestedLevel) || requestedLevel <= 1) return 0;
+  const level = Math.min(MAX_PLAYER_LEVEL, requestedLevel);
+  let total = 0;
+  for (let currentLevel = 1; currentLevel < level; currentLevel += 1) {
+    total += getXpRequiredForLevelTransition(currentLevel);
+  }
+  return total;
+}
+
+function getLevelFromTotalXp(totalXpInput) {
+  const totalXp = normalizeXpValue(totalXpInput);
+  let level = 1;
+  while (level < MAX_PLAYER_LEVEL && totalXp >= getXpForLevel(level + 1)) {
+    level += 1;
+  }
+  return level;
+}
+
+function getProgressToNextLevel(totalXpInput) {
+  const totalXp = normalizeXpValue(totalXpInput);
+  const currentLevel = getLevelFromTotalXp(totalXp);
+  if (currentLevel >= MAX_PLAYER_LEVEL) {
+    const finalLevelRequirement = getXpRequiredForLevelTransition(MAX_PLAYER_LEVEL - 1);
+    return {
+      currentLevel: MAX_PLAYER_LEVEL,
+      currentXp: finalLevelRequirement,
+      totalXp,
+      xpRequiredForNextLevel: finalLevelRequirement,
+      levelProgressPercent: 100,
+      nextLevel: MAX_PLAYER_LEVEL,
+      isMaxLevel: true,
+    };
+  }
+
+  const levelStartXp = getXpForLevel(currentLevel);
+  const nextLevelXp = getXpForLevel(currentLevel + 1);
+  const xpRequiredForNextLevel = Math.max(1, nextLevelXp - levelStartXp);
+  const currentXp = clamp(totalXp - levelStartXp, 0, xpRequiredForNextLevel);
+  const levelProgressPercent = clamp((currentXp / xpRequiredForNextLevel) * 100, 0, 100);
+
+  return {
+    currentLevel,
+    currentXp,
+    totalXp,
+    xpRequiredForNextLevel,
+    levelProgressPercent,
+    nextLevel: currentLevel + 1,
+    isMaxLevel: false,
+  };
+}
+
+function withProfileProgression(profileInput) {
+  const profile = profileInput && typeof profileInput === "object" ? profileInput : {};
+  const progression = getProgressToNextLevel(profile.totalXp);
+  return {
+    ...profile,
+    currentLevel: progression.currentLevel,
+    currentXp: progression.currentXp,
+    totalXp: progression.totalXp,
+    xpRequiredForNextLevel: progression.xpRequiredForNextLevel,
+    levelProgressPercent: progression.levelProgressPercent,
+  };
+}
+
+function calculateSessionXp(sessionSummary, participantSummary) {
+  if (!sessionSummary || !participantSummary) {
+    return {
+      totalXp: 0,
+      breakdown: { durationXp: 0, distanceXp: 0, climbXp: 0 },
+      metrics: { durationMinutes: 0, distanceKm: 0, climbMeters: 0 },
+    };
+  }
+
+  const durationMinutes = Math.max(0, Number(sessionSummary.durationSec) || 0) / 60;
+  const distanceKm = Math.max(0, Number(participantSummary.totalDistance) || 0) / 1000;
+  const climbMeters = Math.max(0, Number(participantSummary.totalClimbMeters) || 0);
+
+  const durationXp = Math.round(durationMinutes * XP_CONFIG.xpPerMinuteRidden);
+  const distanceXp = Math.round(distanceKm * XP_CONFIG.xpPerKmTraveled);
+  const climbXp = Math.round(climbMeters * XP_CONFIG.xpPerMeterClimbed);
+  const totalXp = Math.max(0, durationXp + distanceXp + climbXp);
+
+  return {
+    totalXp,
+    breakdown: { durationXp, distanceXp, climbXp },
+    metrics: { durationMinutes, distanceKm, climbMeters },
+  };
+}
+
+function applySessionXpToProfile(profileInput, sessionSummary, participantSummary) {
+  const profile = withProfileProgression(profileInput);
+  const xpResult = calculateSessionXp(sessionSummary, participantSummary);
+  const beforeProgress = getProgressToNextLevel(profile.totalXp);
+  const nextTotalXp = normalizeXpValue(profile.totalXp + xpResult.totalXp);
+  const afterProgress = getProgressToNextLevel(nextTotalXp);
+  const levelsGained = Math.max(0, afterProgress.currentLevel - beforeProgress.currentLevel);
+
+  return {
+    profile: withProfileProgression({
+      ...profile,
+      totalXp: nextTotalXp,
+    }),
+    xpAward: {
+      earnedXp: xpResult.totalXp,
+      breakdown: xpResult.breakdown,
+      metrics: xpResult.metrics,
+      beforeLevel: beforeProgress.currentLevel,
+      afterLevel: afterProgress.currentLevel,
+      levelsGained,
+      totalXpBefore: beforeProgress.totalXp,
+      totalXpAfter: afterProgress.totalXp,
+      currentXpAfter: afterProgress.currentXp,
+      xpRequiredForNextLevelAfter: afterProgress.xpRequiredForNextLevel,
+      levelProgressPercentAfter: afterProgress.levelProgressPercent,
+      awardedAt: currentMs(),
+    },
+  };
+}
+
+function validateProgressionMath() {
+  const issues = [];
+  let previousCumulative = -1;
+  let previousPerLevel = -1;
+  for (let level = 1; level <= MAX_PLAYER_LEVEL; level += 1) {
+    const cumulative = getXpForLevel(level);
+    if (cumulative < previousCumulative) {
+      issues.push(`Cumulative XP decreased at level ${level}.`);
+    }
+    previousCumulative = cumulative;
+    if (level < MAX_PLAYER_LEVEL) {
+      const perLevel = getXpRequiredForLevelTransition(level);
+      if (perLevel < previousPerLevel) {
+        issues.push(`Per-level XP decreased at level ${level}.`);
+      }
+      previousPerLevel = perLevel;
+    }
+  }
+  const levelAtZero = getLevelFromTotalXp(0);
+  if (levelAtZero !== 1) issues.push("Expected level 1 at 0 XP.");
+  const maxLevelProgress = getProgressToNextLevel(getXpForLevel(MAX_PLAYER_LEVEL));
+  if (maxLevelProgress.currentLevel !== MAX_PLAYER_LEVEL) issues.push("Expected max level progress at level cap.");
+  return { valid: issues.length === 0, issues };
+}
+
+function createEmptyPrivateRiderStats(sessionCode = null, userId = null) {
+  const bestRollingWatts = {};
+  PRIVATE_RIDER_PEAK_WINDOWS.forEach((windowDef) => {
+    bestRollingWatts[windowDef.seconds] = null;
+  });
+  return {
+    sessionCode,
+    userId,
+    recentPowerSeconds: [],
+    totalPowerSeconds: 0,
+    totalDurationSeconds: 0,
+    latestSpeedMps: null,
+    bestRollingWatts,
+    lastPolledAtMs: currentMs(),
+    snapshot: {
+      updatedAtMs: null,
+      avgWatts: null,
+      speedMps: null,
+      bestRollingWatts: { ...bestRollingWatts },
+      totalDurationSeconds: 0,
+    },
+  };
+}
+
+function createEmptyPowerUpState(sessionCode = null, userId = null) {
+  return {
+    sessionCode,
+    userId,
+    powerUpQueue: [],
+    activePowerUp: null,
+    lastPowerUpDistanceThreshold: 0,
+  };
+}
+
+let state = {
+  view: "lobby", // "lobby" | "session" | "summary" | "pairing"
+  pairingReturnView: "lobby",
+  account: {
+    userId: null,
+    showProfileEditor: false,
+    showFriendsPanel: false,
+    friendSearchQuery: "",
+  },
+  lobby: {
+    selectedRouteId: null,
+    routeSelectionMode: "preset",
+    selectedBikeId: DEFAULT_BIKE_ID,
+    activeSection: null,
+    generatedRouteDraft: null,
+    generatedRouteConfirmed: null,
+    generatedRouteDistanceKm: 20,
+    generatedRouteHilliness: "rolling",
+  },
+  session: null,
+  user: null,
+  timer: null,
+  lastTick: null,
+  toastTimeout: null,
+  devices: {
+    trainer: {
+      connected: false,
+      name: null,
+      device: null,
+      server: null,
+      characteristic: null,
+      controlCharacteristic: null,
+      controlSupported: false,
+      controlGranted: false,
+      lastControlError: null,
+      lastResistancePercent: null,
+      lastResistanceAt: 0,
+      lastReading: null,
+    },
+    hrm: {
+      connected: false,
+      name: null,
+      device: null,
+      server: null,
+      characteristic: null,
+      lastReading: null,
+    },
+  },
+  webrtc: {
+    enabled: true,
+    isHost: false,
+    code: null,
+    peerId: null,
+    peers: {},
+    ws: null,
+    wsConnected: false,
+    useLocalStorage: false,
+    awaitingSessionState: false,
+  },
+  simulation: {
+    gradientScale: 1.0, // 0.0 - 1.0
+    gradeSmoothing: 0.35,
+    speedSmoothing: 0.45,
+    lastSmoothedGrade: 0,
+    terrain: {
+      currentGrade: 0,
+      effectiveGrade: 0,
+      nextGrade: 0,
+      distanceToNext: null,
+      routeDistance: 0,
+      resistancePercent: 20,
+      resistanceLabel: "Light",
+      trainerControlStatus: "No trainer",
+    },
+  },
+  privateRiderStats: createEmptyPrivateRiderStats(),
+  powerUps: createEmptyPowerUpState(),
+};
+
+function makeId(len = 6) {
+  const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  return Array.from({ length: len }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function cloneJson(value) {
+  return safeJsonParse(JSON.stringify(value));
+}
+
+function loadSessionFromStorage(code) {
+  const raw = localStorage.getItem(SESSION_STORE_KEY(code));
+  return raw ? safeJsonParse(raw) : null;
+}
+
+function saveSessionToStorage(session) {
+  localStorage.setItem(SESSION_STORE_KEY(session.code), JSON.stringify(session));
+}
+
+function loadSummaries() {
+  const raw = localStorage.getItem(SUMMARIES_KEY);
+  return raw ? safeJsonParse(raw) : [];
+}
+
+function saveSummaries(summaries) {
+  localStorage.setItem(SUMMARIES_KEY, JSON.stringify(summaries));
+}
+
+function persistLocalSession(code, userId) {
+  sessionStorage.setItem(`${STORAGE_PREFIX}:currentSession`, code);
+  sessionStorage.setItem(`${STORAGE_PREFIX}:currentUser`, userId);
+}
+
+function clearLocalSession() {
+  sessionStorage.removeItem(`${STORAGE_PREFIX}:currentSession`);
+  sessionStorage.removeItem(`${STORAGE_PREFIX}:currentUser`);
+}
+
+function loadLocalSession() {
+  const code = sessionStorage.getItem(`${STORAGE_PREFIX}:currentSession`);
+  const userId = sessionStorage.getItem(`${STORAGE_PREFIX}:currentUser`);
+  return { code, userId };
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function loadJson(key, fallback) {
+  const raw = localStorage.getItem(key);
+  const parsed = raw ? safeJsonParse(raw) : null;
+  return parsed ?? fallback;
+}
+
+function saveJson(key, value) {
+  localStorage.setItem(key, JSON.stringify(value));
+}
+
+function loadAuthUsers() {
+  return loadJson(AUTH_USERS_KEY, []);
+}
+
+function saveAuthUsers(users) {
+  saveJson(AUTH_USERS_KEY, users);
+}
+
+function loadProfiles() {
+  return loadJson(PROFILES_KEY, {});
+}
+
+function saveProfiles(profiles) {
+  saveJson(PROFILES_KEY, profiles);
+}
+
+function loadPublicProfiles() {
+  return loadJson(PUBLIC_PROFILES_KEY, {});
+}
+
+function savePublicProfiles(publicProfiles) {
+  saveJson(PUBLIC_PROFILES_KEY, publicProfiles);
+}
+
+function loadFriendRequests() {
+  return loadJson(FRIEND_REQUESTS_KEY, []);
+}
+
+function saveFriendRequests(requests) {
+  saveJson(FRIEND_REQUESTS_KEY, requests);
+}
+
+function loadFriendships() {
+  return loadJson(FRIENDSHIPS_KEY, []);
+}
+
+function saveFriendships(friendships) {
+  saveJson(FRIENDSHIPS_KEY, friendships);
+}
+
+function normalizeEmail(email) {
+  return (email || "").trim().toLowerCase();
+}
+
+function isAuthenticated() {
+  return !!state.account.userId;
+}
+
+function getCurrentAccountProfile() {
+  if (!state.account.userId) return null;
+  const profiles = loadProfiles();
+  const profile = profiles[state.account.userId];
+  if (!profile) return null;
+  const normalizedProfile = withProfileProgression(profile);
+  const needsPersistence =
+    profile.currentLevel !== normalizedProfile.currentLevel ||
+    profile.currentXp !== normalizedProfile.currentXp ||
+    profile.totalXp !== normalizedProfile.totalXp ||
+    profile.xpRequiredForNextLevel !== normalizedProfile.xpRequiredForNextLevel ||
+    profile.levelProgressPercent !== normalizedProfile.levelProgressPercent;
+  if (needsPersistence) {
+    profiles[state.account.userId] = normalizedProfile;
+    saveProfiles(profiles);
+  }
+  return normalizedProfile;
+}
+
+function computeAgeFromDob(dateOfBirth, referenceMs = currentMs()) {
+  if (!dateOfBirth) return null;
+  const dob = new Date(`${dateOfBirth}T00:00:00`);
+  if (Number.isNaN(dob.getTime())) return null;
+  const now = new Date(referenceMs);
+  let age = now.getFullYear() - dob.getFullYear();
+  const m = now.getMonth() - dob.getMonth();
+  if (m < 0 || (m === 0 && now.getDate() < dob.getDate())) {
+    age -= 1;
+  }
+  return age >= 0 ? age : null;
+}
+
+function formatProfileHeight(profile) {
+  if (!profile) return "--";
+  if (profile.heightUnit === "ft_in") {
+    const totalInches = Number.isFinite(profile.height) ? profile.height : null;
+    const feet = Number.isFinite(profile.heightFeet) ? profile.heightFeet : totalInches != null ? Math.floor(totalInches / 12) : null;
+    const inches = Number.isFinite(profile.heightInches) ? profile.heightInches : totalInches != null ? totalInches - feet * 12 : null;
+    if (feet == null || inches == null) return "--";
+    const inText = Number.isInteger(inches) ? String(inches) : Number(inches).toFixed(1);
+    return `${feet}ft ${inText}in`;
+  }
+  if (!Number.isFinite(profile.height)) return "--";
+  const cmText = Number.isInteger(profile.height) ? String(profile.height) : Number(profile.height).toFixed(1);
+  return `${cmText} cm`;
+}
+
+function buildDefaultProfile({ id, email }) {
+  const now = currentMs();
+  const baseName = email.split("@")[0] || "Rider";
+  return withProfileProgression({
+    id,
+    email,
+    displayName: baseName.slice(0, 24),
+    age: null,
+    dateOfBirth: null,
+    weight: null,
+    weightUnit: "kg",
+    height: null,
+    heightUnit: "cm",
+    heightFeet: null,
+    heightInches: null,
+    weightKg: null,
+    heightCm: null,
+    profilePhotoUrl: "",
+    createdAt: now,
+    updatedAt: now,
+  });
+}
+
+function upsertPublicProfile(profile) {
+  const publicProfiles = loadPublicProfiles();
+  publicProfiles[profile.id] = {
+    userId: profile.id,
+    displayName: profile.displayName || "Rider",
+    profilePhotoUrl: profile.profilePhotoUrl || "",
+    email: profile.email || "",
+  };
+  savePublicProfiles(publicProfiles);
+}
+
+function setAuthenticatedUser(userId) {
+  state.account.userId = userId;
+  localStorage.setItem(AUTH_SESSION_KEY, userId);
+}
+
+function clearAuthenticatedUser() {
+  state.account.userId = null;
+  state.account.showProfileEditor = false;
+  state.account.showFriendsPanel = false;
+  state.account.friendSearchQuery = "";
+  localStorage.removeItem(AUTH_SESSION_KEY);
+}
+
+function restoreAuthSession() {
+  const userId = localStorage.getItem(AUTH_SESSION_KEY);
+  if (!userId) return;
+  const profiles = loadProfiles();
+  if (profiles[userId]) {
+    setAuthenticatedUser(userId);
+  } else {
+    clearAuthenticatedUser();
+  }
+}
+
+function signUpWithEmail(email, password) {
+  const normalized = normalizeEmail(email);
+  if (!normalized || !password || password.length < 6) {
+    return { error: "Use a valid email and a password with at least 6 characters." };
+  }
+
+  const users = loadAuthUsers();
+  if (users.some((u) => u.email === normalized)) {
+    return { error: "An account with that email already exists." };
+  }
+
+  const newUser = {
+    id: `acct_${makeId(10)}`,
+    email: normalized,
+    password,
+    createdAt: currentMs(),
+  };
+  users.push(newUser);
+  saveAuthUsers(users);
+
+  const profiles = loadProfiles();
+  profiles[newUser.id] = buildDefaultProfile({ id: newUser.id, email: normalized });
+  saveProfiles(profiles);
+  upsertPublicProfile(profiles[newUser.id]);
+  setAuthenticatedUser(newUser.id);
+  return { ok: true };
+}
+
+function logInWithEmail(email, password) {
+  const normalized = normalizeEmail(email);
+  const users = loadAuthUsers();
+  const found = users.find((u) => u.email === normalized && u.password === password);
+  if (!found) return { error: "Invalid email or password." };
+  setAuthenticatedUser(found.id);
+  return { ok: true };
+}
+
+function sendPasswordReset(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return { error: "Enter your account email first." };
+  const users = loadAuthUsers();
+  const exists = users.some((u) => u.email === normalized);
+  if (!exists) return { error: "No account found for that email." };
+  return { ok: true, message: "Password reset email simulated (basic MVP mode)." };
+}
+
+function updateProfile(profileUpdate) {
+  const userId = state.account.userId;
+  if (!userId) return { error: "Not logged in." };
+
+  const profiles = loadProfiles();
+  const existingProfile = profiles[userId];
+  if (!existingProfile) return { error: "Profile not found." };
+  const current = withProfileProgression(existingProfile);
+
+  const displayName = String(profileUpdate.displayName || "").trim();
+  const dateOfBirth = String(profileUpdate.dateOfBirth || "").trim() || null;
+  const age = computeAgeFromDob(dateOfBirth);
+  const weight = profileUpdate.weight === "" ? null : Number(profileUpdate.weight);
+  const heightCmInput = profileUpdate.heightCm === "" ? null : Number(profileUpdate.heightCm);
+  const heightFeetInput = profileUpdate.heightFeet === "" ? null : Number(profileUpdate.heightFeet);
+  const heightInchesInput = profileUpdate.heightInches === "" ? null : Number(profileUpdate.heightInches);
+  const weightUnit = profileUpdate.weightUnit === "lb" ? "lb" : "kg";
+  const heightUnit = profileUpdate.heightUnit === "ft_in" ? "ft_in" : "cm";
+
+  if (displayName.length < 2 || displayName.length > 24) {
+    return { error: "Display name must be 2-24 characters." };
+  }
+  if (dateOfBirth && (age == null || age < 13 || age > 100)) {
+    return { error: "Date of birth must result in an age between 13 and 100." };
+  }
+  if (weight != null && (!Number.isFinite(weight) || weight <= 0)) {
+    return { error: "Weight must be greater than 0." };
+  }
+
+  let height = null;
+  let heightFeet = null;
+  let heightInches = null;
+  let heightCm = null;
+
+  if (heightUnit === "cm") {
+    if (heightCmInput != null && (!Number.isFinite(heightCmInput) || heightCmInput <= 0)) {
+      return { error: "Height must be greater than 0." };
+    }
+    height = heightCmInput;
+    heightCm = heightCmInput;
+  } else {
+    const feet = heightFeetInput ?? 0;
+    const inches = heightInchesInput ?? 0;
+    if (!Number.isFinite(feet) || feet < 0) {
+      return { error: "Feet must be 0 or greater." };
+    }
+    if (!Number.isFinite(inches) || inches < 0 || inches >= 12) {
+      return { error: "Inches must be between 0 and 11.9." };
+    }
+    if (feet === 0 && inches === 0) {
+      return { error: "Height must be greater than 0." };
+    }
+    heightFeet = Math.floor(feet);
+    heightInches = Number(inches);
+    height = heightFeet * 12 + heightInches;
+    heightCm = height * 2.54;
+  }
+
+  const weightKg = weight == null ? null : weightUnit === "kg" ? weight : weight / 2.20462;
+
+  profiles[userId] = withProfileProgression({
+    ...current,
+    displayName,
+    age,
+    dateOfBirth,
+    weight,
+    weightUnit,
+    height,
+    heightUnit,
+    heightFeet,
+    heightInches,
+    weightKg,
+    heightCm,
+    updatedAt: currentMs(),
+  });
+  saveProfiles(profiles);
+  upsertPublicProfile(profiles[userId]);
+  return { ok: true };
+}
+
+function friendshipId(userA, userB) {
+  return [userA, userB].sort().join("_");
+}
+
+function isFriend(userA, userB) {
+  const friendships = loadFriendships();
+  return friendships.some((f) => f.id === friendshipId(userA, userB));
+}
+
+function hasPendingRequest(userA, userB) {
+  const requests = loadFriendRequests();
+  return requests.some(
+    (r) =>
+      r.status === "pending" &&
+      ((r.fromUserId === userA && r.toUserId === userB) || (r.fromUserId === userB && r.toUserId === userA)),
+  );
+}
+
+function sendFriendRequest(toUserId) {
+  const fromUserId = state.account.userId;
+  if (!fromUserId) return { error: "Log in first." };
+  if (!toUserId || toUserId === fromUserId) return { error: "Cannot add yourself." };
+  if (isFriend(fromUserId, toUserId)) return { error: "Already friends." };
+  if (hasPendingRequest(fromUserId, toUserId)) return { error: "A request is already pending." };
+
+  const requests = loadFriendRequests();
+  requests.push({
+    id: `fr_${makeId(10)}`,
+    fromUserId,
+    toUserId,
+    status: "pending",
+    createdAt: currentMs(),
+  });
+  saveFriendRequests(requests);
+  return { ok: true };
+}
+
+function acceptFriendRequest(requestId) {
+  const userId = state.account.userId;
+  const requests = loadFriendRequests();
+  const request = requests.find((r) => r.id === requestId && r.toUserId === userId && r.status === "pending");
+  if (!request) return { error: "Request not found." };
+
+  request.status = "accepted";
+  saveFriendRequests(requests);
+
+  const friendships = loadFriendships();
+  const id = friendshipId(request.fromUserId, request.toUserId);
+  if (!friendships.some((f) => f.id === id)) {
+    friendships.push({
+      id,
+      userIds: [request.fromUserId, request.toUserId],
+      createdAt: currentMs(),
+    });
+    saveFriendships(friendships);
+  }
+  return { ok: true };
+}
+
+function rejectFriendRequest(requestId) {
+  const userId = state.account.userId;
+  const requests = loadFriendRequests();
+  const request = requests.find((r) => r.id === requestId && r.toUserId === userId && r.status === "pending");
+  if (!request) return { error: "Request not found." };
+  request.status = "rejected";
+  saveFriendRequests(requests);
+  return { ok: true };
+}
+
+function cancelFriendRequest(requestId) {
+  const userId = state.account.userId;
+  const requests = loadFriendRequests();
+  const next = requests.filter((r) => !(r.id === requestId && r.fromUserId === userId && r.status === "pending"));
+  saveFriendRequests(next);
+  return { ok: true };
+}
+
+function removeFriend(friendUserId) {
+  const userId = state.account.userId;
+  const id = friendshipId(userId, friendUserId);
+  const friendships = loadFriendships().filter((f) => f.id !== id);
+  saveFriendships(friendships);
+  return { ok: true };
+}
+
+function getFriendContext(userId) {
+  const requests = loadFriendRequests();
+  const friendships = loadFriendships();
+  const publicProfiles = loadPublicProfiles();
+
+  const incoming = requests.filter((r) => r.toUserId === userId && r.status === "pending");
+  const outgoing = requests.filter((r) => r.fromUserId === userId && r.status === "pending");
+  const friendLinks = friendships.filter((f) => f.userIds.includes(userId));
+  const friendIds = friendLinks.map((f) => f.userIds.find((id) => id !== userId)).filter(Boolean);
+
+  return {
+    incoming,
+    outgoing,
+    friendIds,
+    getProfile: (id) => publicProfiles[id] || null,
+  };
+}
+
+function searchUsers(query, userId) {
+  const normalized = String(query || "").trim().toLowerCase();
+  if (!normalized) return [];
+
+  const publicProfiles = loadPublicProfiles();
+  const profiles = Object.values(publicProfiles);
+  const context = getFriendContext(userId);
+  const pendingTargetIds = new Set([
+    ...context.incoming.map((r) => r.fromUserId),
+    ...context.outgoing.map((r) => r.toUserId),
+  ]);
+  const friendIds = new Set(context.friendIds);
+
+  return profiles
+    .filter((p) => p.userId !== userId)
+    .filter((p) => !friendIds.has(p.userId))
+    .filter((p) => !pendingTargetIds.has(p.userId))
+    .filter((p) => (p.email || "").toLowerCase().includes(normalized) || (p.displayName || "").toLowerCase().includes(normalized))
+    .slice(0, 10);
+}
+
+function fileToResizedDataUrl(file, maxSize = 512, quality = 0.85) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const ratio = Math.min(1, maxSize / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * ratio));
+        const h = Math.max(1, Math.round(img.height * ratio));
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = () => reject(new Error("Invalid image file."));
+      img.src = reader.result;
+    };
+    reader.onerror = () => reject(new Error("Failed to read image."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function showToast(message, duration = 2200) {
+  let toast = document.getElementById("toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "toast";
+    toast.className = "toast";
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message;
+  toast.classList.add("show");
+
+  clearTimeout(state.toastTimeout);
+  state.toastTimeout = setTimeout(() => {
+    toast.classList.remove("show");
+  }, duration);
+}
+
+function currentMs() {
+  return Date.now();
+}
+
+function formatDuration(seconds) {
+  const mm = Math.floor(seconds / 60);
+  const ss = seconds % 60;
+  return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+}
+
+function formatNumber(value, decimals = 0) {
+  return value != null && !Number.isNaN(value) ? value.toFixed(decimals) : "--";
+}
+
+function formatDistanceKmFloor(distanceMeters) {
+  if (distanceMeters == null || Number.isNaN(distanceMeters)) return "--";
+  const kmFloored = Math.floor((distanceMeters / 1000) * 10) / 10;
+  return `${kmFloored.toFixed(1)}KM`;
+}
+
+function calculateElevationGainMeters(speedMetersPerSecond, gradientPercent, deltaTimeSeconds) {
+  const speed = Number(speedMetersPerSecond);
+  const gradient = Number(gradientPercent);
+  const delta = Number(deltaTimeSeconds);
+  if (!Number.isFinite(speed) || !Number.isFinite(gradient) || !Number.isFinite(delta)) return 0;
+  if (speed <= 0 || delta <= 0 || gradient <= 0) return 0;
+  const distanceMeters = speed * delta;
+  return distanceMeters * (gradient / 100);
+}
+
+function formatClimbedMeters(totalClimbedMeters) {
+  const climbed = Number(totalClimbedMeters);
+  if (!Number.isFinite(climbed) || climbed < 0) return "--";
+  return `${Math.round(climbed)} m climbed`;
+}
+
+function formatSpeedMpsAsKph(speedMps) {
+  const speed = Number(speedMps);
+  if (!Number.isFinite(speed) || speed < 0) return "--";
+  return `${(speed * 3.6).toFixed(1)} km/h`;
+}
+
+function normalizeBikeId(bikeIdInput) {
+  const normalized = String(bikeIdInput || "").trim().toLowerCase();
+  const found = BIKE_CATALOG.find((bike) => bike.id === normalized);
+  return found ? found.id : DEFAULT_BIKE_ID;
+}
+
+function getBikeById(bikeIdInput) {
+  const bikeId = normalizeBikeId(bikeIdInput);
+  return BIKE_CATALOG.find((bike) => bike.id === bikeId) || BIKE_CATALOG[0];
+}
+
+function buildBikeOptionsHtml(selectedBikeId) {
+  const activeBikeId = normalizeBikeId(selectedBikeId);
+  return BIKE_CATALOG.map(
+    (bike) => `<option value="${bike.id}" ${bike.id === activeBikeId ? "selected" : ""}>${escapeHtml(bike.name)}</option>`,
+  ).join("");
+}
+
+function renderBikeDetailsHtml(selectedBikeId) {
+  const bike = getBikeById(selectedBikeId);
+  return `
+    <div class="small"><strong>${escapeHtml(bike.name)}</strong> - ${escapeHtml(bike.description)}</div>
+    <div class="small" style="margin-top:2px;">Pros: ${escapeHtml(bike.pros)}</div>
+    <div class="small" style="margin-top:2px;">Cons: ${escapeHtml(bike.cons)}</div>
+  `;
+}
+
+function canSwitchBikeAtSpeed(speedMps) {
+  const speedKph = Number(speedMps) * 3.6;
+  if (!Number.isFinite(speedKph) || speedKph < 0) return true;
+  return speedKph <= BIKE_SWITCH_SPEED_LIMIT_KPH;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function buildSegmentsFromGradientBlocks(distanceKm, gradientBlocksInput) {
+  const totalDistanceMeters = Math.max(100, Math.round((Number(distanceKm) || 0) * 1000));
+  const gradientBlocks = Array.isArray(gradientBlocksInput) && gradientBlocksInput.length > 0
+    ? gradientBlocksInput
+    : [{ ratio: 1, gradientPct: 0 }];
+  const ratioSum = gradientBlocks.reduce((sum, block) => sum + (Number(block.ratio) || 0), 0) || 1;
+
+  let cursor = 0;
+  return gradientBlocks.map((block, index) => {
+    const normalizedRatio = (Number(block.ratio) || 0) / ratioSum;
+    const remaining = totalDistanceMeters - cursor;
+    const blockLength = index === gradientBlocks.length - 1 ? remaining : Math.max(1, Math.round(totalDistanceMeters * normalizedRatio));
+    const startDistance = cursor;
+    const endDistance = Math.min(totalDistanceMeters, cursor + blockLength);
+    cursor = endDistance;
+    return {
+      startDistance,
+      endDistance,
+      grade: Number(block.gradientPct) || 0,
+    };
+  });
+}
+
+function scaleGradientBlocksToElevationGain(distanceKm, elevationGainM, gradientBlocksInput, maxGradientPct = null) {
+  const totalDistanceMeters = Math.max(100, Math.round((Number(distanceKm) || 0) * 1000));
+  const gradientBlocks = Array.isArray(gradientBlocksInput) ? gradientBlocksInput : [];
+  const ratioSum = gradientBlocks.reduce((sum, block) => sum + (Number(block.ratio) || 0), 0) || 1;
+  const rawGain = gradientBlocks.reduce((sum, block) => {
+    const ratio = (Number(block.ratio) || 0) / ratioSum;
+    const gradient = Number(block.gradientPct) || 0;
+    return sum + totalDistanceMeters * ratio * (gradient / 100);
+  }, 0);
+  const targetGain = Number(elevationGainM) || 0;
+  const scale = rawGain > 0 ? targetGain / rawGain : 1;
+
+  return gradientBlocks.map((block) => {
+    const scaledGradient = (Number(block.gradientPct) || 0) * scale;
+    const capped = Number.isFinite(maxGradientPct) && maxGradientPct > 0
+      ? clamp(scaledGradient, -maxGradientPct, maxGradientPct)
+      : scaledGradient;
+    return {
+      ratio: Number(block.ratio) || 0,
+      gradientPct: capped,
+    };
+  });
+}
+
+function findSegmentByAbsoluteDistance(segmentsInput, distanceMeters) {
+  const segments = Array.isArray(segmentsInput) ? segmentsInput : [];
+  if (segments.length === 0) return null;
+  const clampedDistance = clamp(Number(distanceMeters) || 0, 0, getCourseLengthMeters(segments));
+  return segments.find((segment) => clampedDistance >= segment.startDistance && clampedDistance < segment.endDistance) || segments[segments.length - 1];
+}
+
+function getGradientFromSegmentsAtDistance(segmentsInput, distanceMeters) {
+  const segment = findSegmentByAbsoluteDistance(segmentsInput, distanceMeters);
+  return Number(segment?.grade) || 0;
+}
+
+function getElevationAtDistanceFromSegments(segmentsInput, startElevationMeters, distanceMeters) {
+  const segments = Array.isArray(segmentsInput) ? segmentsInput : [];
+  if (segments.length === 0) return Number(startElevationMeters) || 0;
+  const clampedDistance = clamp(Number(distanceMeters) || 0, 0, getCourseLengthMeters(segments));
+  let elevation = Number(startElevationMeters) || 0;
+  for (const segment of segments) {
+    const segmentStart = Number(segment.startDistance) || 0;
+    const segmentEnd = Number(segment.endDistance) || segmentStart;
+    if (clampedDistance <= segmentStart) break;
+    const covered = Math.min(clampedDistance, segmentEnd) - segmentStart;
+    if (covered > 0) {
+      elevation += covered * ((Number(segment.grade) || 0) / 100);
+    }
+    if (clampedDistance <= segmentEnd) break;
+  }
+  return elevation;
+}
+
+function buildElevationProfileFromSegments(segmentsInput, startElevationMeters = 0, sampleStepMeters = 100) {
+  const segments = Array.isArray(segmentsInput) ? segmentsInput : [];
+  if (segments.length === 0) return [];
+
+  const totalDistanceMeters = getCourseLengthMeters(segments);
+  const step = Math.max(50, Number(sampleStepMeters) || 100);
+  const points = [];
+  for (let distance = 0; distance <= totalDistanceMeters; distance += step) {
+    points.push({
+      distanceFromStartM: distance,
+      elevationM: getElevationAtDistanceFromSegments(segments, startElevationMeters, distance),
+      gradientPct: getGradientFromSegmentsAtDistance(segments, distance),
+    });
+  }
+  if (points.length === 0 || points[points.length - 1].distanceFromStartM !== totalDistanceMeters) {
+    points.push({
+      distanceFromStartM: totalDistanceMeters,
+      elevationM: getElevationAtDistanceFromSegments(segments, startElevationMeters, totalDistanceMeters),
+      gradientPct: getGradientFromSegmentsAtDistance(segments, totalDistanceMeters),
+    });
+  }
+  return downsampleRoutePoints(
+    points.map((point) => ({
+      distanceMeters: point.distanceFromStartM,
+      elevationMeters: point.elevationM,
+      gradientPercent: point.gradientPct,
+    })),
+    1000,
+  ).map((point) => ({
+    distanceFromStartM: point.distanceMeters,
+    elevationM: point.elevationMeters,
+    gradientPct: point.gradientPercent,
+  }));
+}
+
+function createRoutePreset(seed) {
+  const scaledBlocks = scaleGradientBlocksToElevationGain(
+    seed.distanceKm,
+    seed.elevationGainM,
+    seed.gradientBlocks,
+    seed.maxGradientPct ?? null,
+  );
+  const courseSegments = buildSegmentsFromGradientBlocks(seed.distanceKm, scaledBlocks);
+  const startElevationM = Number(seed.startElevationM);
+  const safeStartElevation = Number.isFinite(startElevationM) ? startElevationM : 0;
+  const elevationProfile = buildElevationProfileFromSegments(courseSegments, safeStartElevation, 100);
+  const distanceKm = Number(seed.distanceKm) || 0;
+  const totalDistanceMeters = Math.round(distanceKm * 1000);
+  const summitElevationM = Number(seed.summitElevationM);
+
+  return {
+    id: seed.id,
+    name: seed.name,
+    country: seed.country,
+    distanceKm,
+    elevationGainM: Number(seed.elevationGainM) || 0,
+    startElevationM: Number.isFinite(startElevationM) ? startElevationM : safeStartElevation,
+    summitElevationM: Number.isFinite(summitElevationM) ? summitElevationM : safeStartElevation + (Number(seed.elevationGainM) || 0),
+    avgGradientPct: Number(seed.avgGradientPct) || 0,
+    maxGradientPct: Number.isFinite(Number(seed.maxGradientPct)) ? Number(seed.maxGradientPct) : null,
+    totalDistanceMeters,
+    courseSegments,
+    elevationProfile,
+  };
+}
+
+const ROUTE_PRESET_SEEDS = Object.freeze([
+  {
+    id: "alpe-dhuez",
+    name: "Alpe d'Huez",
+    country: "France",
+    distanceKm: 13.8,
+    elevationGainM: 1096,
+    startElevationM: 754,
+    summitElevationM: 1850,
+    avgGradientPct: 7.9,
+    gradientBlocks: [
+      { ratio: 0.12, gradientPct: 6.2 },
+      { ratio: 0.2, gradientPct: 7.4 },
+      { ratio: 0.23, gradientPct: 8.6 },
+      { ratio: 0.2, gradientPct: 7.8 },
+      { ratio: 0.15, gradientPct: 9.0 },
+      { ratio: 0.1, gradientPct: 8.3 },
+    ],
+  },
+  {
+    id: "mont-ventoux",
+    name: "Mont Ventoux (Bedoin)",
+    country: "France",
+    distanceKm: 21.2,
+    elevationGainM: 1577,
+    startElevationM: 302,
+    summitElevationM: 1879,
+    avgGradientPct: 7.5,
+    gradientBlocks: [
+      { ratio: 0.15, gradientPct: 4.8 },
+      { ratio: 0.2, gradientPct: 7.1 },
+      { ratio: 0.25, gradientPct: 8.2 },
+      { ratio: 0.2, gradientPct: 7.6 },
+      { ratio: 0.2, gradientPct: 8.9 },
+    ],
+  },
+  {
+    id: "stelvio-prato",
+    name: "Passo dello Stelvio (Prato)",
+    country: "Italy",
+    distanceKm: 24.5,
+    elevationGainM: 1824,
+    startElevationM: 934,
+    summitElevationM: 2758,
+    avgGradientPct: 7.5,
+    gradientBlocks: [
+      { ratio: 0.12, gradientPct: 5.8 },
+      { ratio: 0.18, gradientPct: 7.0 },
+      { ratio: 0.25, gradientPct: 8.1 },
+      { ratio: 0.25, gradientPct: 7.6 },
+      { ratio: 0.2, gradientPct: 8.2 },
+    ],
+  },
+  {
+    id: "tourmalet-luz",
+    name: "Col du Tourmalet (Luz)",
+    country: "France",
+    distanceKm: 18.8,
+    elevationGainM: 1357,
+    startElevationM: 757,
+    summitElevationM: 2115,
+    avgGradientPct: 7.2,
+    gradientBlocks: [
+      { ratio: 0.18, gradientPct: 5.5 },
+      { ratio: 0.22, gradientPct: 6.8 },
+      { ratio: 0.25, gradientPct: 7.6 },
+      { ratio: 0.2, gradientPct: 7.1 },
+      { ratio: 0.15, gradientPct: 8.4 },
+    ],
+  },
+  {
+    id: "galibier-valloire",
+    name: "Col du Galibier (Valloire)",
+    country: "France",
+    distanceKm: 17.5,
+    elevationGainM: 1214,
+    startElevationM: 1427,
+    summitElevationM: 2642,
+    avgGradientPct: 7.0,
+    gradientBlocks: [
+      { ratio: 0.2, gradientPct: 5.3 },
+      { ratio: 0.25, gradientPct: 6.5 },
+      { ratio: 0.22, gradientPct: 7.4 },
+      { ratio: 0.18, gradientPct: 7.0 },
+      { ratio: 0.15, gradientPct: 8.0 },
+    ],
+  },
+  {
+    id: "sa-calobra",
+    name: "Sa Calobra",
+    country: "Spain",
+    distanceKm: 9.9,
+    elevationGainM: 696,
+    startElevationM: 28,
+    summitElevationM: 724,
+    avgGradientPct: 7.0,
+    gradientBlocks: [
+      { ratio: 0.2, gradientPct: 6.4 },
+      { ratio: 0.2, gradientPct: 6.9 },
+      { ratio: 0.2, gradientPct: 7.1 },
+      { ratio: 0.2, gradientPct: 7.3 },
+      { ratio: 0.2, gradientPct: 6.8 },
+    ],
+  },
+  {
+    id: "passo-pordoi",
+    name: "Passo Pordoi",
+    country: "Italy",
+    distanceKm: 9.2,
+    elevationGainM: 638,
+    startElevationM: 1601,
+    summitElevationM: 2239,
+    avgGradientPct: 6.9,
+    gradientBlocks: [
+      { ratio: 0.2, gradientPct: 6.0 },
+      { ratio: 0.25, gradientPct: 6.8 },
+      { ratio: 0.25, gradientPct: 7.3 },
+      { ratio: 0.2, gradientPct: 6.9 },
+      { ratio: 0.1, gradientPct: 7.8 },
+    ],
+  },
+  {
+    id: "alto-angliru",
+    name: "Alto de l'Angliru",
+    country: "Spain",
+    distanceKm: 12.1,
+    elevationGainM: 1243,
+    startElevationM: 331,
+    summitElevationM: 1574,
+    avgGradientPct: 10.2,
+    gradientBlocks: [
+      { ratio: 0.15, gradientPct: 5.5 },
+      { ratio: 0.2, gradientPct: 7.2 },
+      { ratio: 0.2, gradientPct: 9.1 },
+      { ratio: 0.2, gradientPct: 11.0 },
+      { ratio: 0.15, gradientPct: 12.8 },
+      { ratio: 0.1, gradientPct: 14.0 },
+    ],
+  },
+  {
+    id: "muur-geraardsbergen",
+    name: "Muur van Geraardsbergen",
+    country: "Belgium",
+    distanceKm: 1.1,
+    elevationGainM: 85,
+    startElevationM: 19,
+    summitElevationM: 104,
+    avgGradientPct: 8.1,
+    maxGradientPct: 17.6,
+    gradientBlocks: [
+      { ratio: 0.2, gradientPct: 6.5 },
+      { ratio: 0.2, gradientPct: 9.5 },
+      { ratio: 0.2, gradientPct: 12.5 },
+      { ratio: 0.2, gradientPct: 15.5 },
+      { ratio: 0.2, gradientPct: 11.0 },
+    ],
+  },
+  {
+    id: "box-hill-zigzag",
+    name: "Box Hill Zig Zag Road",
+    country: "England",
+    distanceKm: 4.3,
+    elevationGainM: 204,
+    startElevationM: 56,
+    summitElevationM: 260,
+    avgGradientPct: 5.0,
+    gradientBlocks: [
+      { ratio: 0.25, gradientPct: 4.0 },
+      { ratio: 0.25, gradientPct: 5.1 },
+      { ratio: 0.2, gradientPct: 5.8 },
+      { ratio: 0.15, gradientPct: 4.8 },
+      { ratio: 0.15, gradientPct: 5.2 },
+    ],
+  },
+]);
+
+const ROUTE_PRESETS = Object.freeze(ROUTE_PRESET_SEEDS.map(createRoutePreset));
+const DEFAULT_ROUTE_PRESET = ROUTE_PRESETS[0];
+const DEFAULT_COURSE_SEGMENTS = Object.freeze(DEFAULT_ROUTE_PRESET.courseSegments.map((segment) => ({ ...segment })));
+const GENERATED_ROUTE_ID = "generated-route";
+const GENERATED_ROUTE_NAME = "Generated Route";
+const GENERATED_ROUTE_COUNTRY = "Virtual";
+const ROUTE_GENERATOR_SERVICE = window.RouteGeneratorService || null;
+const GENERATED_HILLINESS_KEYS = Object.freeze(["flat", "rolling", "hilly", "climbing"]);
+const GENERATED_HILLINESS_LABELS = Object.freeze({
+  flat: "Flat",
+  rolling: "Rolling",
+  hilly: "Hilly",
+  climbing: "Climbing",
+});
+const LOBBY_SECTIONS = Object.freeze(["account", "create", "join", "devices"]);
+
+function normalizeGeneratedRouteDistanceKm(distanceKmInput) {
+  const parsed = Number(distanceKmInput);
+  if (!Number.isFinite(parsed)) return 20;
+  return clamp(parsed, 2, 300);
+}
+
+function normalizeGeneratedHilliness(hillinessInput) {
+  const key = String(hillinessInput || "rolling").trim().toLowerCase();
+  return GENERATED_HILLINESS_KEYS.includes(key) ? key : "rolling";
+}
+
+function normalizeRouteSelectionMode(modeInput) {
+  return String(modeInput || "").trim().toLowerCase() === "generated" ? "generated" : "preset";
+}
+
+function normalizeLobbySection(sectionInput, fallbackSection = "account") {
+  const fallback = LOBBY_SECTIONS.includes(fallbackSection) ? fallbackSection : "account";
+  const normalized = String(sectionInput || "").trim().toLowerCase();
+  return LOBBY_SECTIONS.includes(normalized) ? normalized : fallback;
+}
+
+function getGeneratedHillinessLabel(hillinessInput) {
+  const key = normalizeGeneratedHilliness(hillinessInput);
+  return GENERATED_HILLINESS_LABELS[key] || GENERATED_HILLINESS_LABELS.rolling;
+}
+
+function computeSegmentElevationStats(segmentsInput = [], startElevationM = 0) {
+  const segments = Array.isArray(segmentsInput) ? segmentsInput : [];
+  let elevation = Number(startElevationM) || 0;
+  let summit = elevation;
+  let totalAscentM = 0;
+  let totalDescentM = 0;
+  let maxAbsGradePct = 0;
+  let totalDistanceMeters = 0;
+  let weightedAbsGrade = 0;
+
+  segments.forEach((segment) => {
+    const start = Number(segment.startDistance) || 0;
+    const end = Number(segment.endDistance) || start;
+    const distance = Math.max(0, end - start);
+    const grade = Number(segment.grade) || 0;
+    const delta = distance * (grade / 100);
+    if (delta > 0) totalAscentM += delta;
+    if (delta < 0) totalDescentM += -delta;
+    elevation += delta;
+    summit = Math.max(summit, elevation);
+    totalDistanceMeters += distance;
+    maxAbsGradePct = Math.max(maxAbsGradePct, Math.abs(grade));
+    weightedAbsGrade += Math.abs(grade) * distance;
+  });
+
+  return {
+    totalDistanceMeters,
+    totalAscentM,
+    totalDescentM,
+    maxAbsGradePct,
+    summitElevationM: summit,
+    endElevationM: elevation,
+    endDeltaM: elevation - (Number(startElevationM) || 0),
+    avgAbsGradientPct: totalDistanceMeters > 0 ? weightedAbsGrade / totalDistanceMeters : 0,
+  };
+}
+
+function validateGeneratedRoute(routePreset, targetDistanceKm, hillinessPreset) {
+  const fallbackValidation = { valid: true, errors: [], warnings: [], metrics: null };
+  if (!routePreset || typeof routePreset !== "object") {
+    return { ...fallbackValidation, valid: false, errors: ["Route payload missing."] };
+  }
+  if (ROUTE_GENERATOR_SERVICE?.validateRoutePreset) {
+    return ROUTE_GENERATOR_SERVICE.validateRoutePreset(routePreset, {
+      distanceKm: targetDistanceKm,
+      hillinessPreset,
+    });
+  }
+
+  const metrics = computeSegmentElevationStats(routePreset.courseSegments, routePreset.startElevationM || 0);
+  const totalDistanceMeters = Number(routePreset.totalDistanceMeters) || Math.round((Number(routePreset.distanceKm) || 0) * 1000);
+  const errors = [];
+  const targetMeters = Math.round(normalizeGeneratedRouteDistanceKm(targetDistanceKm) * 1000);
+  if (Math.abs(totalDistanceMeters - targetMeters) > 10) errors.push("Distance mismatch.");
+  if (Math.abs(metrics.endDeltaM) > 0.5) errors.push("End altitude mismatch.");
+  if (metrics.maxAbsGradePct > 12.001) errors.push("Grade limit exceeded.");
+  const ascentDescentGap = Math.abs(metrics.totalAscentM - metrics.totalDescentM);
+  const maxGap = Math.max(8, Math.max(metrics.totalAscentM, metrics.totalDescentM) * 0.08);
+  if (ascentDescentGap > maxGap) errors.push("Ascent and descent are not balanced.");
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings: [],
+    metrics,
+  };
+}
+
+function createGeneratedRoutePreset({
+  distanceKm,
+  hilliness,
+  id = GENERATED_ROUTE_ID,
+  name = GENERATED_ROUTE_NAME,
+  country = GENERATED_ROUTE_COUNTRY,
+} = {}) {
+  if (!ROUTE_GENERATOR_SERVICE?.generateRoutePreset) return null;
+  const resolvedDistanceKm = normalizeGeneratedRouteDistanceKm(distanceKm);
+  const resolvedHilliness = normalizeGeneratedHilliness(hilliness);
+  const generated = ROUTE_GENERATOR_SERVICE.generateRoutePreset({
+    id,
+    name,
+    country,
+    distanceKm: resolvedDistanceKm,
+    hillinessPreset: resolvedHilliness,
+    startElevationM: 0,
+    maxAttempts: 50,
+  });
+  if (!generated?.routePreset) return null;
+
+  const route = { ...generated.routePreset };
+  const stats = computeSegmentElevationStats(route.courseSegments, route.startElevationM || 0);
+  route.id = id;
+  route.name = name;
+  route.country = country;
+  route.routeId = id;
+  route.distanceKm = Number(route.distanceKm) || resolvedDistanceKm;
+  route.totalDistanceMeters = Number(route.totalDistanceMeters) || Math.round(route.distanceKm * 1000);
+  route.hillinessPreset = resolvedHilliness;
+  route.generatedAt = currentMs();
+  route.totalDescentM = Math.round(stats.totalDescentM);
+  route.elevationGainM = Math.round(stats.totalAscentM);
+  route.summitElevationM = Number.isFinite(Number(route.summitElevationM))
+    ? Number(route.summitElevationM)
+    : Number(stats.summitElevationM.toFixed(1));
+  route.avgGradientPct = Number.isFinite(Number(route.avgGradientPct))
+    ? Number(route.avgGradientPct)
+    : Number(stats.avgAbsGradientPct.toFixed(1));
+  route.maxGradientPct = Number.isFinite(Number(route.maxGradientPct))
+    ? Number(route.maxGradientPct)
+    : Number(stats.maxAbsGradePct.toFixed(1));
+  route._validation = generated.validation || validateGeneratedRoute(route, resolvedDistanceKm, resolvedHilliness);
+  return route;
+}
+
+function ensureRoutePresetShape(routePresetInput, fallbackPreset = DEFAULT_ROUTE_PRESET) {
+  if (!routePresetInput || typeof routePresetInput !== "object") return fallbackPreset;
+
+  const sourceSegmentsRaw = Array.isArray(routePresetInput.courseSegments)
+    ? routePresetInput.courseSegments
+    : Array.isArray(routePresetInput.segments)
+      ? routePresetInput.segments
+      : [];
+  const courseSegments = sourceSegmentsRaw
+    .map((segment) => ({
+      startDistance: Number(segment.startDistance) || 0,
+      endDistance: Number(segment.endDistance) || 0,
+      grade: Number(segment.grade) || 0,
+    }))
+    .filter((segment) => segment.endDistance > segment.startDistance);
+  if (courseSegments.length === 0) return fallbackPreset;
+
+  const orderedSegments = courseSegments.sort((a, b) => a.startDistance - b.startDistance);
+  const lengthMeters = getCourseLengthMeters(orderedSegments);
+  const startElevationM = Number.isFinite(Number(routePresetInput.startElevationM))
+    ? Number(routePresetInput.startElevationM)
+    : 0;
+  const stats = computeSegmentElevationStats(orderedSegments, startElevationM);
+  const providedProfile = Array.isArray(routePresetInput.elevationProfile)
+    ? routePresetInput.elevationProfile
+        .map((point) => ({
+          distanceFromStartM: Number(point?.distanceFromStartM) || 0,
+          elevationM: Number(point?.elevationM) || 0,
+          gradientPct: Number(point?.gradientPct) || 0,
+        }))
+        .sort((a, b) => a.distanceFromStartM - b.distanceFromStartM)
+    : [];
+
+  return {
+    id: routePresetInput.id || fallbackPreset.id,
+    name: routePresetInput.name || fallbackPreset.name,
+    country: routePresetInput.country || fallbackPreset.country,
+    distanceKm: Number.isFinite(Number(routePresetInput.distanceKm))
+      ? Number(routePresetInput.distanceKm)
+      : lengthMeters / 1000,
+    elevationGainM: Number.isFinite(Number(routePresetInput.elevationGainM))
+      ? Number(routePresetInput.elevationGainM)
+      : Math.round(stats.totalAscentM),
+    totalDescentM: Number.isFinite(Number(routePresetInput.totalDescentM))
+      ? Number(routePresetInput.totalDescentM)
+      : Math.round(stats.totalDescentM),
+    startElevationM,
+    summitElevationM: Number.isFinite(Number(routePresetInput.summitElevationM))
+      ? Number(routePresetInput.summitElevationM)
+      : Number(stats.summitElevationM.toFixed(1)),
+    avgGradientPct: Number.isFinite(Number(routePresetInput.avgGradientPct))
+      ? Number(routePresetInput.avgGradientPct)
+      : Number(stats.avgAbsGradientPct.toFixed(1)),
+    maxGradientPct: Number.isFinite(Number(routePresetInput.maxGradientPct))
+      ? Number(routePresetInput.maxGradientPct)
+      : Number(stats.maxAbsGradePct.toFixed(1)),
+    totalDistanceMeters: Number.isFinite(Number(routePresetInput.totalDistanceMeters))
+      ? Number(routePresetInput.totalDistanceMeters)
+      : lengthMeters,
+    courseSegments: orderedSegments,
+    elevationProfile:
+      providedProfile.length > 1 ? providedProfile : buildElevationProfileFromSegments(orderedSegments, startElevationM, 100),
+    hillinessPreset: routePresetInput.hillinessPreset || null,
+    generatedAt: routePresetInput.generatedAt || null,
+  };
+}
+
+function getRoutePresetById(routeId) {
+  const matched = ROUTE_PRESETS.find((route) => route.id === routeId);
+  return matched || DEFAULT_ROUTE_PRESET;
+}
+
+function createCourseFromRoutePreset(routePresetInput = DEFAULT_ROUTE_PRESET) {
+  const route =
+    typeof routePresetInput === "string"
+      ? getRoutePresetById(routePresetInput)
+      : ensureRoutePresetShape(routePresetInput, getRoutePresetById(routePresetInput?.id));
+  const segments = Array.isArray(route.courseSegments) ? route.courseSegments.map((segment) => ({ ...segment })) : [];
+  const elevationProfile = Array.isArray(route.elevationProfile) ? route.elevationProfile.map((point) => ({ ...point })) : [];
+  const lengthMeters = getCourseLengthMeters(segments);
+  return {
+    id: route.id,
+    routeId: route.id,
+    name: route.name,
+    country: route.country,
+    distanceKm: route.distanceKm,
+    elevationGainM: route.elevationGainM,
+    totalDescentM: Number.isFinite(Number(route.totalDescentM)) ? Number(route.totalDescentM) : null,
+    startElevationM: route.startElevationM,
+    summitElevationM: route.summitElevationM,
+    avgGradientPct: route.avgGradientPct,
+    maxGradientPct: route.maxGradientPct,
+    hillinessPreset: route.hillinessPreset || null,
+    generatedAt: route.generatedAt || null,
+    totalDistanceMeters: Number(route.totalDistanceMeters) || lengthMeters,
+    segments,
+    elevationProfile,
+    lengthMeters,
+  };
+}
+
+function normalizeSessionCourse(session) {
+  if (!session || typeof session !== "object") return;
+
+  const course = session.course;
+  if (!course || typeof course !== "object") {
+    session.course = createCourseFromRoutePreset(DEFAULT_ROUTE_PRESET);
+    return;
+  }
+
+  const fallbackRoute = getRoutePresetById(course.routeId || course.id);
+  const sourceSegments =
+    Array.isArray(course.segments) && course.segments.length > 0 ? course.segments : fallbackRoute.courseSegments;
+  const segments = sourceSegments
+    .map((segment) => ({
+      startDistance: Number(segment.startDistance) || 0,
+      endDistance: Number(segment.endDistance) || 0,
+      grade: Number(segment.grade) || 0,
+    }))
+    .filter((segment) => segment.endDistance > segment.startDistance);
+
+  if (segments.length === 0) {
+    session.course = createCourseFromRoutePreset(fallbackRoute);
+    return;
+  }
+
+  const lengthMeters = getCourseLengthMeters(segments);
+  const startElevationM = Number.isFinite(Number(course.startElevationM))
+    ? Number(course.startElevationM)
+    : Number(fallbackRoute.startElevationM) || 0;
+  const distanceKm = Number.isFinite(Number(course.distanceKm)) ? Number(course.distanceKm) : lengthMeters / 1000;
+  const elevationGainM = Number.isFinite(Number(course.elevationGainM))
+    ? Number(course.elevationGainM)
+    : Number(fallbackRoute.elevationGainM) || 0;
+  const totalDescentM = Number.isFinite(Number(course.totalDescentM))
+    ? Number(course.totalDescentM)
+    : Number.isFinite(Number(fallbackRoute.totalDescentM))
+      ? Number(fallbackRoute.totalDescentM)
+      : null;
+  const normalizedProfile = Array.isArray(course.elevationProfile)
+    ? course.elevationProfile
+        .map((point) => ({
+          distanceFromStartM: Number(point?.distanceFromStartM) || 0,
+          elevationM: Number(point?.elevationM) || 0,
+          gradientPct: Number(point?.gradientPct) || 0,
+        }))
+        .sort((a, b) => a.distanceFromStartM - b.distanceFromStartM)
+    : [];
+
+  session.course = {
+    ...course,
+    id: course.id || fallbackRoute.id,
+    routeId: course.routeId || course.id || fallbackRoute.id,
+    name: course.name || fallbackRoute.name,
+    country: course.country || fallbackRoute.country,
+    distanceKm,
+    elevationGainM,
+    totalDescentM,
+    startElevationM,
+    summitElevationM: Number.isFinite(Number(course.summitElevationM))
+      ? Number(course.summitElevationM)
+      : startElevationM + elevationGainM,
+    avgGradientPct: Number.isFinite(Number(course.avgGradientPct))
+      ? Number(course.avgGradientPct)
+      : Number(fallbackRoute.avgGradientPct) || 0,
+    maxGradientPct: Number.isFinite(Number(course.maxGradientPct))
+      ? Number(course.maxGradientPct)
+      : Number.isFinite(Number(fallbackRoute.maxGradientPct))
+        ? Number(fallbackRoute.maxGradientPct)
+        : null,
+    hillinessPreset: course.hillinessPreset || fallbackRoute.hillinessPreset || null,
+    generatedAt: course.generatedAt || fallbackRoute.generatedAt || null,
+    totalDistanceMeters: Number.isFinite(Number(course.totalDistanceMeters)) ? Number(course.totalDistanceMeters) : lengthMeters,
+    segments,
+    elevationProfile:
+      normalizedProfile.length > 1
+        ? normalizedProfile
+        : buildElevationProfileFromSegments(segments, startElevationM, 100),
+    lengthMeters,
+  };
+}
+
+function getSessionRoute(session) {
+  const fallback = getRoutePresetById(session?.course?.routeId || session?.course?.id);
+  const course = session?.course || {};
+  return {
+    ...fallback,
+    ...course,
+    id: course.id || fallback.id,
+    routeId: course.routeId || course.id || fallback.id,
+    name: course.name || fallback.name,
+    country: course.country || fallback.country,
+    totalDistanceMeters: Number(course.totalDistanceMeters) || Number(course.lengthMeters) || Number(fallback.totalDistanceMeters) || 0,
+    elevationProfile:
+      Array.isArray(course.elevationProfile) && course.elevationProfile.length > 1
+        ? course.elevationProfile
+        : Array.isArray(fallback.elevationProfile)
+          ? fallback.elevationProfile
+          : [],
+  };
+}
+
+function getAverageGradientAhead(route, distanceM, lookaheadMeters = 500) {
+  const totalDistanceMeters = Number(route?.totalDistanceMeters) || Math.round((Number(route?.distanceKm) || 0) * 1000);
+  if (totalDistanceMeters <= 0) return 0;
+  const start = clamp(Number(distanceM) || 0, 0, totalDistanceMeters);
+  const end = clamp(start + Math.max(1, Number(lookaheadMeters) || 500), 0, totalDistanceMeters);
+  if (end <= start) return 0;
+  const startElevation = getElevationAtDistance(route, start);
+  const endElevation = getElevationAtDistance(route, end);
+  return ((endElevation - startElevation) / (end - start)) * 100;
+}
+
+function formatRoutePresetMeta(route) {
+  const shaped = ensureRoutePresetShape(route, DEFAULT_ROUTE_PRESET);
+  const maxGradient = Number.isFinite(Number(shaped?.maxGradientPct)) ? `${Number(shaped.maxGradientPct).toFixed(1)}%` : "--";
+  const distanceKm = Number(shaped?.distanceKm) || 0;
+  const elevationGainM = Math.round(Number(shaped?.elevationGainM) || 0);
+  const avgGradientPct = Number(shaped?.avgGradientPct) || 0;
+  const hillinessText = shaped?.hillinessPreset ? ` | ${getGeneratedHillinessLabel(shaped.hillinessPreset)}` : "";
+  const descentText = Number.isFinite(Number(shaped?.totalDescentM)) ? ` | ${Math.round(Number(shaped.totalDescentM))} m descent` : "";
+  return `${shaped?.country || "Unknown"} | ${distanceKm.toFixed(1)} km | ${elevationGainM} m climb${descentText}${hillinessText} | avg ${avgGradientPct.toFixed(
+    1,
+  )}% | max ${maxGradient}`;
+}
+
+function renderRoutePresetPreview(routePreset) {
+  const route = ensureRoutePresetShape(routePreset, DEFAULT_ROUTE_PRESET);
+  const routeProfile = buildRouteProfileFromSegments(route.courseSegments);
+  const distanceKm = Number(route.distanceKm) || (Number(routeProfile.totalDistanceMeters) || 0) / 1000;
+  const elevationGainM = Math.round(Number(route.elevationGainM) || 0);
+  const totalDescentM = Number.isFinite(Number(route.totalDescentM)) ? Math.round(Number(route.totalDescentM)) : null;
+  const avgGradientPct = Number(route.avgGradientPct) || 0;
+  const maxGradientText = Number.isFinite(Number(route.maxGradientPct)) ? `${Number(route.maxGradientPct).toFixed(1)}%` : "--";
+  const hillinessText = route.hillinessPreset ? getGeneratedHillinessLabel(route.hillinessPreset) : null;
+  const profileHtml = renderElevationProfile({
+    routeProfile,
+    distanceTraveledMeters: 0,
+    width: 560,
+    height: 110,
+  });
+
+  return `
+    <div class="small">Distance: ${distanceKm.toFixed(1)} km | Total climb: ${elevationGainM} m${totalDescentM != null ? ` | Total descent: ${totalDescentM} m` : ""}</div>
+    <div class="small" style="margin-top:2px;">Average gradient: ${avgGradientPct.toFixed(1)}% | Max gradient: ${maxGradientText}</div>
+    ${hillinessText ? `<div class="small" style="margin-top:2px;">Hilliness: ${hillinessText}</div>` : ""}
+    <div style="margin-top:8px;">${profileHtml}</div>
+  `;
+}
+
+function getElevationAtDistance(route, distanceM) {
+  const points = route?.elevationProfile;
+  if (!Array.isArray(points) || points.length === 0) return 0;
+  const sorted = points.slice().sort((a, b) => a.distanceFromStartM - b.distanceFromStartM);
+  const totalDistance = Math.max(sorted[sorted.length - 1].distanceFromStartM, 1);
+  const target = clamp(Number(distanceM) || 0, 0, totalDistance);
+  for (let i = 1; i < sorted.length; i += 1) {
+    const p1 = sorted[i - 1];
+    const p2 = sorted[i];
+    if (target <= p2.distanceFromStartM) {
+      const span = Math.max(p2.distanceFromStartM - p1.distanceFromStartM, 1e-6);
+      const t = clamp((target - p1.distanceFromStartM) / span, 0, 1);
+      return lerp(Number(p1.elevationM) || 0, Number(p2.elevationM) || 0, t);
+    }
+  }
+  return Number(sorted[sorted.length - 1].elevationM) || 0;
+}
+
+function getGradientAtDistance(route, distanceM) {
+  const points = route?.elevationProfile;
+  if (!Array.isArray(points) || points.length === 0) return 0;
+  const sorted = points.slice().sort((a, b) => a.distanceFromStartM - b.distanceFromStartM);
+  const totalDistance = Math.max(sorted[sorted.length - 1].distanceFromStartM, 1);
+  const target = clamp(Number(distanceM) || 0, 0, totalDistance);
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (target <= sorted[i].distanceFromStartM) {
+      return Number(sorted[i - 1].gradientPct) || 0;
+    }
+  }
+  return Number(sorted[sorted.length - 1].gradientPct) || 0;
+}
+
+function getRemainingDistance(route, distanceM) {
+  const totalDistance = Number(route?.totalDistanceMeters) || Math.round((Number(route?.distanceKm) || 0) * 1000);
+  return Math.max(0, totalDistance - (Number(distanceM) || 0));
+}
+
+function getRemainingClimb(route, distanceM) {
+  const summitElevation = Number(route?.summitElevationM);
+  const currentElevation = getElevationAtDistance(route, distanceM);
+  if (!Number.isFinite(summitElevation)) return 0;
+  return Math.max(0, summitElevation - currentElevation);
+}
+
+function getCourseSegments(session) {
+  const segments = session?.course?.segments;
+  return Array.isArray(segments) && segments.length > 0 ? segments : DEFAULT_COURSE_SEGMENTS;
+}
+
+function getCourseLengthMeters(segments) {
+  const resolved = Array.isArray(segments) && segments.length > 0 ? segments : DEFAULT_COURSE_SEGMENTS;
+  return resolved[resolved.length - 1]?.endDistance || 0;
+}
+
+function normalizeCourseDistance(distanceMeters, segments) {
+  const length = getCourseLengthMeters(segments);
+  if (length <= 0) return 0;
+  const raw = Number(distanceMeters) || 0;
+  let normalized = raw % length;
+  if (normalized < 0) normalized += length;
+  return normalized;
+}
+
+function findSegmentByDistance(distanceMeters, segments) {
+  const resolved = Array.isArray(segments) && segments.length > 0 ? segments : DEFAULT_COURSE_SEGMENTS;
+  const distance = normalizeCourseDistance(distanceMeters, resolved);
+  return (
+    resolved.find((segment) => distance >= segment.startDistance && distance < segment.endDistance) ||
+    resolved[resolved.length - 1] ||
+    { startDistance: 0, endDistance: 1, grade: 0 }
+  );
+}
+
+function getCourseGradeContext(distanceMeters, segments) {
+  const resolved = Array.isArray(segments) && segments.length > 0 ? segments : DEFAULT_COURSE_SEGMENTS;
+  const routeDistance = normalizeCourseDistance(distanceMeters, resolved);
+  const currentSegment = findSegmentByDistance(routeDistance, resolved);
+  const currentGrade = Number(currentSegment.grade) || 0;
+
+  let nextSegment = null;
+  let distanceToNext = null;
+  const currentIndex = Math.max(
+    0,
+    resolved.findIndex((segment) => segment === currentSegment),
+  );
+
+  if (resolved.length > 1) {
+    const wrappedNextIndex = (currentIndex + 1) % resolved.length;
+    nextSegment = resolved[wrappedNextIndex];
+    const rawDistance =
+      nextSegment.startDistance >= routeDistance
+        ? nextSegment.startDistance - routeDistance
+        : getCourseLengthMeters(resolved) - routeDistance + nextSegment.startDistance;
+    distanceToNext = Math.max(0, rawDistance);
+  }
+
+  return {
+    routeDistance,
+    currentSegment,
+    currentGrade,
+    nextSegment,
+    nextGrade: Number(nextSegment?.grade) || currentGrade,
+    distanceToNext,
+    routeLength: getCourseLengthMeters(resolved),
+  };
+}
+
+function buildRouteProfileFromSegments(segmentsInput) {
+  const segments = Array.isArray(segmentsInput) ? [...segmentsInput] : [];
+  if (segments.length === 0) {
+    return { totalDistanceMeters: 0, points: [] };
+  }
+
+  const sorted = segments
+    .map((segment) => ({
+      startDistance: Number(segment.startDistance) || 0,
+      endDistance: Number(segment.endDistance) || 0,
+      grade: Number(segment.grade) || 0,
+    }))
+    .sort((a, b) => a.startDistance - b.startDistance);
+
+  const points = [];
+  let elevationMeters = 0;
+  let lastEndDistance = 0;
+
+  sorted.forEach((segment, index) => {
+    const startDistance = Math.max(0, segment.startDistance);
+    const endDistance = Math.max(startDistance, segment.endDistance);
+    const segmentDistance = Math.max(0, endDistance - startDistance);
+
+    if (index === 0 || startDistance !== lastEndDistance) {
+      points.push({
+        distanceMeters: startDistance,
+        elevationMeters,
+        gradientPercent: segment.grade,
+      });
+    }
+
+    elevationMeters += segmentDistance * (segment.grade / 100);
+    points.push({
+      distanceMeters: endDistance,
+      elevationMeters,
+      gradientPercent: segment.grade,
+    });
+    lastEndDistance = endDistance;
+  });
+
+  return {
+    totalDistanceMeters: Math.max(0, lastEndDistance),
+    points: downsampleRoutePoints(points, 1000),
+  };
+}
+
+function downsampleRoutePoints(points, maxPoints = 1000) {
+  if (!Array.isArray(points) || points.length <= maxPoints) return Array.isArray(points) ? points : [];
+  const sampled = [];
+  const step = (points.length - 1) / (maxPoints - 1);
+  for (let i = 0; i < maxPoints; i += 1) {
+    const idx = Math.round(i * step);
+    sampled.push(points[idx]);
+  }
+  return sampled;
+}
+
+function getElevationBounds(points) {
+  if (!Array.isArray(points) || points.length === 0) {
+    return { minElevationMeters: 0, maxElevationMeters: 0 };
+  }
+  let minElevationMeters = Number(points[0].elevationMeters) || 0;
+  let maxElevationMeters = minElevationMeters;
+  points.forEach((point) => {
+    const elevation = Number(point.elevationMeters) || 0;
+    minElevationMeters = Math.min(minElevationMeters, elevation);
+    maxElevationMeters = Math.max(maxElevationMeters, elevation);
+  });
+  return { minElevationMeters, maxElevationMeters };
+}
+
+// Route profile rendering scales:
+// - keep vertical exaggeration bounded and tunable
+// - do not auto-fit every route peak to the top of the chart
+const PROFILE_CHART_PADDING_PX = 4;
+const PROFILE_MIN_VERTICAL_EXAGGERATION = 1.6;
+const PROFILE_MAX_VERTICAL_EXAGGERATION = 12;
+const PROFILE_MIN_VISUAL_RANGE_PX = 4;
+const PROFILE_MAX_VISUAL_FILL_RATIO = 0.88;
+
+function sanitizeRoutePoints(pointsInput) {
+  const points = Array.isArray(pointsInput) ? [...pointsInput] : [];
+  return points
+    .map((point) => ({
+      distanceMeters: Number(point.distanceMeters) || 0,
+      elevationMeters: Number(point.elevationMeters) || 0,
+      gradientPercent: Number(point.gradientPercent) || 0,
+    }))
+    .sort((a, b) => a.distanceMeters - b.distanceMeters);
+}
+
+function getRouteDifficultyMetrics(pointsInput) {
+  const sorted = sanitizeRoutePoints(pointsInput);
+  if (sorted.length === 0) {
+    return {
+      totalDistanceMeters: 0,
+      minElevationMeters: 0,
+      maxElevationMeters: 0,
+      elevationRangeMeters: 0,
+      totalAscentM: 0,
+      totalDescentM: 0,
+      ascentPerKm: 0,
+      maxPositiveGradePct: 0,
+      maxAbsGradePct: 0,
+      avgPositiveGradePct: 0,
+      sustainedClimbMeters: 0,
+      longestSustainedClimbMeters: 0,
+      steepClimbShare: 0,
+      sustainedClimbShare: 0,
+      difficultyScore: 0,
+    };
+  }
+
+  const totalDistanceMeters = Math.max(sorted[sorted.length - 1].distanceMeters, 0);
+  const { minElevationMeters, maxElevationMeters } = getElevationBounds(sorted);
+  let totalAscentM = 0;
+  let totalDescentM = 0;
+  let maxPositiveGradePct = 0;
+  let maxAbsGradePct = 0;
+  let weightedPositiveGrade = 0;
+  let positiveDistanceMeters = 0;
+  let sustainedClimbMeters = 0;
+  let longestSustainedClimbMeters = 0;
+  let steepClimbMeters = 0;
+  let currentSustainedMeters = 0;
+
+  for (let i = 1; i < sorted.length; i += 1) {
+    const p1 = sorted[i - 1];
+    const p2 = sorted[i];
+    const segmentDistance = Math.max(0, p2.distanceMeters - p1.distanceMeters);
+    if (segmentDistance <= 0) continue;
+
+    const elevationDelta = p2.elevationMeters - p1.elevationMeters;
+    if (elevationDelta > 0) totalAscentM += elevationDelta;
+    if (elevationDelta < 0) totalDescentM += -elevationDelta;
+
+    const gradePct = (elevationDelta / segmentDistance) * 100;
+    maxAbsGradePct = Math.max(maxAbsGradePct, Math.abs(gradePct));
+
+    if (gradePct > 0) {
+      maxPositiveGradePct = Math.max(maxPositiveGradePct, gradePct);
+      weightedPositiveGrade += gradePct * segmentDistance;
+      positiveDistanceMeters += segmentDistance;
+    }
+
+    if (gradePct >= 4) {
+      sustainedClimbMeters += segmentDistance;
+      currentSustainedMeters += segmentDistance;
+      longestSustainedClimbMeters = Math.max(longestSustainedClimbMeters, currentSustainedMeters);
+    } else {
+      currentSustainedMeters = 0;
+    }
+
+    if (gradePct >= 6) {
+      steepClimbMeters += segmentDistance;
+    }
+  }
+
+  const distanceKm = totalDistanceMeters > 0 ? totalDistanceMeters / 1000 : 0;
+  const ascentPerKm = distanceKm > 0 ? totalAscentM / distanceKm : 0;
+  const avgPositiveGradePct = positiveDistanceMeters > 0 ? weightedPositiveGrade / positiveDistanceMeters : 0;
+  const elevationRangeMeters = Math.max(0, maxElevationMeters - minElevationMeters);
+  const rangeDensityPct = totalDistanceMeters > 0 ? (elevationRangeMeters / totalDistanceMeters) * 100 : 0;
+  const sustainedClimbShare = totalDistanceMeters > 0 ? sustainedClimbMeters / totalDistanceMeters : 0;
+  const steepClimbShare = totalDistanceMeters > 0 ? steepClimbMeters / totalDistanceMeters : 0;
+  const shortSteepBoost = totalDistanceMeters <= 16000 ? steepClimbShare * 0.12 : 0;
+  const difficultyScore = clamp(
+    clamp(ascentPerKm / 90, 0, 1) * 0.3 +
+      clamp(maxPositiveGradePct / 10, 0, 1) * 0.22 +
+      clamp(avgPositiveGradePct / 8, 0, 1) * 0.18 +
+      clamp(rangeDensityPct / 8, 0, 1) * 0.14 +
+      clamp(longestSustainedClimbMeters / 3000, 0, 1) * 0.1 +
+      clamp(steepClimbShare / 0.35, 0, 1) * 0.06 +
+      shortSteepBoost,
+    0,
+    1,
+  );
+
+  return {
+    totalDistanceMeters,
+    minElevationMeters,
+    maxElevationMeters,
+    elevationRangeMeters,
+    totalAscentM,
+    totalDescentM,
+    ascentPerKm,
+    maxPositiveGradePct,
+    maxAbsGradePct,
+    avgPositiveGradePct,
+    sustainedClimbMeters,
+    longestSustainedClimbMeters,
+    steepClimbShare,
+    sustainedClimbShare,
+    difficultyScore,
+  };
+}
+
+function getVerticalExaggerationFactor(metrics) {
+  const difficulty = clamp(Number(metrics?.difficultyScore) || 0, 0, 1);
+  const easedDifficulty = Math.pow(difficulty, 0.82);
+  return lerp(PROFILE_MIN_VERTICAL_EXAGGERATION, PROFILE_MAX_VERTICAL_EXAGGERATION, easedDifficulty);
+}
+
+function getRouteProfileScalingConfig(pointsInput, width, height) {
+  const sorted = sanitizeRoutePoints(pointsInput);
+  if (sorted.length === 0) return null;
+
+  const chartWidth = Math.max(1, Number(width) || 1);
+  const chartHeight = Math.max(1, Number(height) || 1);
+  const topPadding = PROFILE_CHART_PADDING_PX;
+  const bottomPadding = PROFILE_CHART_PADDING_PX;
+  const innerHeight = Math.max(1, chartHeight - topPadding - bottomPadding);
+  const metrics = getRouteDifficultyMetrics(sorted);
+  const totalDistanceMeters = Math.max(metrics.totalDistanceMeters, 1);
+  const elevationRangeMeters = Math.max(metrics.elevationRangeMeters, 0);
+  const centerElevation = (metrics.minElevationMeters + metrics.maxElevationMeters) / 2;
+  const centerY = topPadding + innerHeight / 2;
+
+  // Base scale keeps 1m vertical equal to 1m horizontal in chart units.
+  // Exaggeration then boosts visibility while preserving route-to-route differences.
+  const baseVerticalPxPerMeter = chartWidth / totalDistanceMeters;
+  const minVerticalPxPerMeter = baseVerticalPxPerMeter * PROFILE_MIN_VERTICAL_EXAGGERATION;
+  const maxVerticalPxPerMeter = baseVerticalPxPerMeter * PROFILE_MAX_VERTICAL_EXAGGERATION;
+  let verticalPxPerMeter = clamp(
+    baseVerticalPxPerMeter * getVerticalExaggerationFactor(metrics),
+    minVerticalPxPerMeter,
+    maxVerticalPxPerMeter,
+  );
+
+  if (elevationRangeMeters > 0) {
+    const minVisualRangePx = PROFILE_MIN_VISUAL_RANGE_PX + metrics.difficultyScore * 2;
+    const maxVisualRangePx = innerHeight * PROFILE_MAX_VISUAL_FILL_RATIO;
+    let currentRangePx = elevationRangeMeters * verticalPxPerMeter;
+
+    if (currentRangePx < minVisualRangePx) {
+      verticalPxPerMeter = Math.min(maxVerticalPxPerMeter, minVisualRangePx / elevationRangeMeters);
+      currentRangePx = elevationRangeMeters * verticalPxPerMeter;
+    }
+    if (currentRangePx > maxVisualRangePx) {
+      verticalPxPerMeter = Math.max(minVerticalPxPerMeter, maxVisualRangePx / elevationRangeMeters);
+    }
+  }
+
+  verticalPxPerMeter = clamp(verticalPxPerMeter, minVerticalPxPerMeter, maxVerticalPxPerMeter);
+
+  return {
+    chartWidth,
+    chartHeight,
+    topPadding,
+    bottomPadding,
+    minY: topPadding,
+    maxY: chartHeight - bottomPadding,
+    totalDistanceMeters,
+    centerElevation,
+    centerY,
+    verticalPxPerMeter,
+    baseVerticalPxPerMeter,
+    visualExaggeration: verticalPxPerMeter / Math.max(baseVerticalPxPerMeter, 1e-9),
+    metrics,
+  };
+}
+
+function mapElevationToChartY(elevationMeters, scalingConfig) {
+  if (!scalingConfig) return 0;
+  const rawY =
+    Number(scalingConfig.centerY) -
+    (Number(elevationMeters) - Number(scalingConfig.centerElevation)) * Number(scalingConfig.verticalPxPerMeter);
+  return clamp(rawY, Number(scalingConfig.minY), Number(scalingConfig.maxY));
+}
+
+function normalizeRoutePoints(pointsInput, width, height) {
+  const sorted = sanitizeRoutePoints(pointsInput);
+  if (sorted.length === 0) return [];
+  const scalingConfig = getRouteProfileScalingConfig(sorted, width, height);
+  if (!scalingConfig) return [];
+
+  return sorted.map((point) => {
+    const x = (point.distanceMeters / Math.max(scalingConfig.totalDistanceMeters, 1)) * scalingConfig.chartWidth;
+    const y = mapElevationToChartY(point.elevationMeters, scalingConfig);
+    return {
+      ...point,
+      x,
+      y,
+    };
+  });
+}
+
+function getPlayerPosition(pointsInput, distanceTraveledMeters, width, height) {
+  const normalized = normalizeRoutePoints(pointsInput, width, height);
+  if (normalized.length === 0) return { x: 0, y: height };
+  if (normalized.length === 1) return { x: normalized[0].x, y: normalized[0].y };
+
+  const totalDistanceMeters = Math.max(normalized[normalized.length - 1].distanceMeters, 1);
+  const clampedDistance = clamp(Number(distanceTraveledMeters) || 0, 0, totalDistanceMeters);
+
+  for (let i = 1; i < normalized.length; i += 1) {
+    const p1 = normalized[i - 1];
+    const p2 = normalized[i];
+    if (clampedDistance <= p2.distanceMeters) {
+      const segmentDistance = Math.max(p2.distanceMeters - p1.distanceMeters, 1e-6);
+      const t = clamp((clampedDistance - p1.distanceMeters) / segmentDistance, 0, 1);
+      return {
+        x: lerp(p1.x, p2.x, t),
+        y: lerp(p1.y, p2.y, t),
+      };
+    }
+  }
+
+  const last = normalized[normalized.length - 1];
+  return { x: last.x, y: last.y };
+}
+
+function getCompletedPath(pointsInput, distanceTraveledMeters, width, height) {
+  const normalized = normalizeRoutePoints(pointsInput, width, height);
+  if (normalized.length === 0) return [];
+  if (normalized.length === 1) return normalized;
+
+  const totalDistanceMeters = Math.max(normalized[normalized.length - 1].distanceMeters, 1);
+  const clampedDistance = clamp(Number(distanceTraveledMeters) || 0, 0, totalDistanceMeters);
+
+  const completed = [];
+  for (let i = 0; i < normalized.length; i += 1) {
+    const point = normalized[i];
+    if (point.distanceMeters < clampedDistance) {
+      completed.push(point);
+      continue;
+    }
+    if (point.distanceMeters === clampedDistance) {
+      completed.push(point);
+      return completed;
+    }
+    if (i === 0) {
+      completed.push(point);
+      return completed;
+    }
+    const previous = normalized[i - 1];
+    const segmentDistance = Math.max(point.distanceMeters - previous.distanceMeters, 1e-6);
+    const t = clamp((clampedDistance - previous.distanceMeters) / segmentDistance, 0, 1);
+    completed.push({
+      distanceMeters: clampedDistance,
+      elevationMeters: lerp(previous.elevationMeters, point.elevationMeters, t),
+      gradientPercent: previous.gradientPercent,
+      x: lerp(previous.x, point.x, t),
+      y: lerp(previous.y, point.y, t),
+    });
+    return completed;
+  }
+
+  return normalized;
+}
+
+function buildLinePath(points) {
+  if (!Array.isArray(points) || points.length === 0) return "";
+  return points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" ");
+}
+
+function buildAreaPath(points, baselineY) {
+  if (!Array.isArray(points) || points.length === 0) return "";
+  const first = points[0];
+  const last = points[points.length - 1];
+  return `${buildLinePath(points)} L ${last.x.toFixed(2)} ${baselineY.toFixed(2)} L ${first.x.toFixed(2)} ${baselineY.toFixed(2)} Z`;
+}
+
+function renderElevationProfile({ routeProfile, distanceTraveledMeters, width = 560, height = 120 }) {
+  const profile = routeProfile && typeof routeProfile === "object" ? routeProfile : { totalDistanceMeters: 0, points: [] };
+  const points = Array.isArray(profile.points) ? profile.points : [];
+  if (points.length === 0) {
+    return `<div class="small elevation-profile-empty">Route profile unavailable.</div>`;
+  }
+
+  const normalized = normalizeRoutePoints(points, width, height);
+  const completed = getCompletedPath(points, distanceTraveledMeters, width, height);
+  const player = getPlayerPosition(points, distanceTraveledMeters, width, height);
+  const baselineY = height - 2;
+
+  const fullLinePath = buildLinePath(normalized);
+  const completedLinePath = buildLinePath(completed);
+  const fullAreaPath = buildAreaPath(normalized, baselineY);
+  const completedAreaPath = buildAreaPath(completed, baselineY);
+  const progressRatio = clamp((Number(distanceTraveledMeters) || 0) / Math.max(profile.totalDistanceMeters || 0, 1), 0, 1);
+  const progressPct = Math.round(progressRatio * 100);
+
+  return `
+    <div class="elevation-profile">
+      <svg viewBox="0 0 ${width} ${height}" aria-label="Route elevation profile">
+        <path d="${fullAreaPath}" fill="rgba(255, 255, 255, 0.08)" stroke="none"></path>
+        <path d="${completedAreaPath}" fill="rgba(255, 255, 255, 0.24)" stroke="none"></path>
+        <path d="${fullLinePath}" fill="none" stroke="rgba(255, 255, 255, 0.38)" stroke-width="2"></path>
+        <path d="${completedLinePath}" fill="none" stroke="#f5f6ff" stroke-width="2.5"></path>
+        <circle cx="${player.x.toFixed(2)}" cy="${player.y.toFixed(2)}" r="4" fill="#ffffff"></circle>
+      </svg>
+      <div class="elevation-profile-labels">
+        <span>START</span>
+        <span>${progressPct}%</span>
+        <span>FINISH</span>
+      </div>
+    </div>
+  `;
+}
+
+function lerp(fromValue, toValue, factor) {
+  return fromValue + (toValue - fromValue) * factor;
+}
+
+function smoothToward(previousValue, nextValue, smoothingFactor, deltaSeconds = 1) {
+  const factor = clamp(smoothingFactor, 0, 1);
+  const dt = Math.max(0, Number(deltaSeconds) || 0);
+  const frameAdjusted = 1 - Math.pow(1 - factor, dt);
+  return lerp(previousValue, nextValue, frameAdjusted);
+}
+
+function resolveRiderMassKg(weightKg) {
+  const numeric = Number(weightKg);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 78;
+}
+
+function computeTargetSpeedFromPowerAndGrade(powerWatts, gradePercent, riderMassKg, bikeIdInput = DEFAULT_BIKE_ID) {
+  const power = Math.max(0, Number(powerWatts) || 0);
+  const grade = Number(gradePercent) || 0;
+  const riderMass = resolveRiderMassKg(riderMassKg);
+  const bike = getBikeById(bikeIdInput);
+  const totalMass = riderMass + (Number(bike.weightKg) || 0);
+
+  // Basic MVP model:
+  // - power drives base speed
+  // - grade reduces/increases speed
+  // - total system mass affects climbing (rider + bike)
+  // - aero and bike role shift flat/downhill vs uphill behavior
+  const baseSpeed = power <= 0 ? 0.8 : 1.6 + Math.pow(power, 0.43) * 0.85;
+  const massFactor = clamp(82 / totalMass, 0.78, 1.24);
+  const uphillFactor = clamp(1 - Math.max(0, grade) * (0.044 + ((totalMass - 82) / 1000) * 0.3), 0.2, 1);
+  const downhillFactor = 1 + Math.max(0, -grade) * 0.018;
+  const gradeFactor = grade >= 0 ? uphillFactor : downhillFactor;
+  const uphillSeverity = clamp(Math.max(0, grade) / 9, 0, 1);
+  const flatDownhillSeverity = clamp((Math.max(0, -grade) + 1.2) / 7.5, 0, 1);
+  const climbBikeFactor = lerp(1, Number(bike.climbingModifier) || 1, uphillSeverity);
+  const flatBikeFactor = lerp(1, Number(bike.flatModifier) || 1, flatDownhillSeverity);
+  const aeroModifier = Number.isFinite(Number(bike.aeroModifier)) ? Number(bike.aeroModifier) : 1;
+  const aeroBenefitFactor = clamp(1 / Math.max(aeroModifier, 0.7), 0.88, 1.16);
+  const aeroFactor = lerp(1, aeroBenefitFactor, flatDownhillSeverity);
+  const targetSpeed = baseSpeed * massFactor * gradeFactor * climbBikeFactor * flatBikeFactor * aeroFactor;
+
+  return clamp(targetSpeed, 1.4, 22);
+}
+
+function getGradeColorClass(gradePercent) {
+  const grade = Number(gradePercent) || 0;
+  if (grade > 1) return "grade-uphill";
+  if (grade < -1) return "grade-downhill";
+  return "grade-flat";
+}
+
+function formatSignedPercent(value, decimals = 1) {
+  const numeric = Number(value) || 0;
+  const sign = numeric > 0 ? "+" : "";
+  return `${sign}${numeric.toFixed(decimals)}%`;
+}
+
+function getResistanceFeelLabel(resistancePercent) {
+  const pct = clamp(Number(resistancePercent) || 0, 0, 100);
+  if (pct >= 70) return "Heavy";
+  if (pct >= 35) return "Moderate";
+  return "Light";
+}
+
+function getResistanceFeelClass(label) {
+  if (label === "Heavy") return "resistance-heavy";
+  if (label === "Moderate") return "resistance-moderate";
+  return "resistance-light";
+}
+
+function mapGradeToResistancePercent(gradePercent) {
+  const grade = Number(gradePercent) || 0;
+  // 0% grade should still have some baseline feel.
+  return clamp(20 + grade * 6, 0, 100);
+}
+
+async function writeBluetoothValue(characteristic, bytes) {
+  const payload = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+  if (typeof characteristic.writeValueWithResponse === "function") {
+    await characteristic.writeValueWithResponse(payload);
+    return;
+  }
+  await characteristic.writeValue(payload);
+}
+
+function encodeSint16LE(value) {
+  const clamped = clamp(Math.round(value), -32768, 32767);
+  const low = clamped & 0xff;
+  const high = (clamped >> 8) & 0xff;
+  return [low, high];
+}
+
+function buildFtmsSetResistanceCommand(resistancePercent) {
+  const resistanceTenth = Math.round(clamp(resistancePercent, 0, 100) * 10);
+  const [low, high] = encodeSint16LE(resistanceTenth);
+  return Uint8Array.from([0x04, low, high]);
+}
+
+function buildFtmsSimulationCommand(gradePercent) {
+  const windSpeedMs = 0;
+  const gradeHundredths = Math.round((Number(gradePercent) || 0) * 100);
+  const crrTenThousandths = 40; // 0.0040
+  const cwHundredths = 51; // 0.51
+  const windEncoded = encodeSint16LE(windSpeedMs * 1000);
+  const gradeEncoded = encodeSint16LE(gradeHundredths);
+  return Uint8Array.from([0x11, windEncoded[0], windEncoded[1], gradeEncoded[0], gradeEncoded[1], crrTenThousandths, cwHundredths]);
+}
+
+async function initializeTrainerControl(service) {
+  try {
+    const controlCharacteristic = await service.getCharacteristic("fitness_machine_control_point");
+    await writeBluetoothValue(controlCharacteristic, Uint8Array.from([0x00])); // Request control.
+    return {
+      characteristic: controlCharacteristic,
+      supported: true,
+      granted: true,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      characteristic: null,
+      supported: false,
+      granted: false,
+      error: error?.message || "Trainer control unavailable",
+    };
+  }
+}
+
+function getTrainerControlStatusText() {
+  const trainer = state.devices.trainer;
+  if (!trainer.connected) return "No trainer";
+  if (!trainer.controlSupported) return "Trainer connected (read-only)";
+  if (!trainer.controlGranted) return "Trainer control unavailable";
+  if (trainer.lastControlError) return `Control issue: ${trainer.lastControlError}`;
+  return "Simulation control active";
+}
+
+async function sendResistanceToTrainer(effectiveGrade) {
+  const trainer = state.devices.trainer;
+  if (!trainer.connected || !trainer.controlCharacteristic || !trainer.controlSupported || !trainer.controlGranted) {
+    return false;
+  }
+
+  const resistancePercent = mapGradeToResistancePercent(effectiveGrade);
+  const now = currentMs();
+  const shouldSend =
+    trainer.lastResistancePercent == null ||
+    Math.abs(trainer.lastResistancePercent - resistancePercent) >= 2 ||
+    now - (trainer.lastResistanceAt || 0) >= 4000;
+
+  if (!shouldSend) return true;
+
+  try {
+    await writeBluetoothValue(trainer.controlCharacteristic, buildFtmsSetResistanceCommand(resistancePercent));
+    trainer.lastResistancePercent = resistancePercent;
+    trainer.lastResistanceAt = now;
+    trainer.lastControlError = null;
+    return true;
+  } catch (setResistanceError) {
+    try {
+      await writeBluetoothValue(trainer.controlCharacteristic, buildFtmsSimulationCommand(effectiveGrade));
+      trainer.lastResistancePercent = resistancePercent;
+      trainer.lastResistanceAt = now;
+      trainer.lastControlError = null;
+      return true;
+    } catch (simulationError) {
+      trainer.lastControlError = simulationError?.message || setResistanceError?.message || "Resistance update failed";
+      return false;
+    }
+  }
+}
+
+function updateTerrainState(terrainUpdate) {
+  state.simulation.terrain = {
+    ...state.simulation.terrain,
+    ...terrainUpdate,
+  };
+}
+
+// Placeholder thresholds for MVP color zones.
+// Keep these centralized so we can replace with personalized zones later.
+const HEART_RATE_ZONE_THRESHOLDS = Object.freeze({
+  lowMax: 99,
+  mediumMax: 150,
+});
+
+const WATTS_ZONE_THRESHOLDS = Object.freeze({
+  lowMax: 99,
+  mediumMax: 250,
+});
+
+function getZoneFromValue(value, thresholds) {
+  const numericValue = Number(value);
+  const safeValue = Number.isFinite(numericValue) ? numericValue : 0;
+  if (safeValue <= thresholds.lowMax) return "low";
+  if (safeValue <= thresholds.mediumMax) return "medium";
+  return "high";
+}
+
+function getHeartRateZone(heartRate, thresholds = HEART_RATE_ZONE_THRESHOLDS) {
+  return getZoneFromValue(heartRate, thresholds);
+}
+
+function getWattsZone(watts, thresholds = WATTS_ZONE_THRESHOLDS) {
+  return getZoneFromValue(watts, thresholds);
+}
+
+function getZoneColorClass(zone) {
+  if (zone === "high") return "zone-high";
+  if (zone === "medium") return "zone-medium";
+  return "zone-low";
+}
+
+function getMockTelemetryParticipants() {
+  return [
+    { id: "mock_1", name: "Rider Alpha", heartRate: 92, watts: 85 },
+    { id: "mock_2", name: "Rider Beta", heartRate: 132, watts: 180 },
+    { id: "mock_3", name: "Rider Gamma", heartRate: 168, watts: 305 },
+  ];
+}
+
+function renderTelemetryZoneRows(participants) {
+  return participants
+    .map((participant) => {
+      const heartRate = Math.max(0, Math.round(Number(participant.heartRate) || 0));
+      const watts = Math.max(0, Math.round(Number(participant.watts) || 0));
+      const heartRateZone = getHeartRateZone(heartRate);
+      const wattsZone = getWattsZone(watts);
+      return `
+        <div class="telemetry-zone-grid telemetry-zone-row">
+          <div class="telemetry-zone-name">${escapeHtml(participant.name || "Rider")}</div>
+          <div class="telemetry-zone-pill ${getZoneColorClass(heartRateZone)}">HR ${heartRate} bpm</div>
+          <div class="telemetry-zone-pill ${getZoneColorClass(wattsZone)}">Power ${watts} W</div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function createUser({ name, weight, bikeId = DEFAULT_BIKE_ID, isHost = false, id = null }) {
+  return {
+    id: id || `u_${makeId(8)}`,
+    name: name?.trim() || "Rider",
+    weight: weight ? Number(weight) : null,
+    bikeId: normalizeBikeId(bikeId),
+    isHost,
+    joinedAt: currentMs(),
+  };
+}
+
+function isWebBluetoothSupported() {
+  return !!navigator.bluetooth;
+}
+
+function isWebRTCSupported() {
+  return typeof RTCPeerConnection !== "undefined";
+}
+
+function parseHeartRateMeasurement(dataView) {
+  const flags = dataView.getUint8(0);
+  const hr16 = flags & 0x01;
+  const offset = 1;
+  const hr = hr16 ? dataView.getUint16(offset, true) : dataView.getUint8(offset);
+  return { heartRate: hr };
+}
+
+function parseIndoorBikeData(dataView) {
+  // Fitness Machine Service - Indoor Bike Data (0x2AD2).
+  // Parse by flags so optional fields don't shift offsets and corrupt power.
+  const FLAG_MORE_DATA = 1 << 0;
+  const FLAG_AVERAGE_SPEED_PRESENT = 1 << 1;
+  const FLAG_INSTANT_CADENCE_PRESENT = 1 << 2;
+  const FLAG_AVERAGE_CADENCE_PRESENT = 1 << 3;
+  const FLAG_TOTAL_DISTANCE_PRESENT = 1 << 4;
+  const FLAG_RESISTANCE_LEVEL_PRESENT = 1 << 5;
+  const FLAG_INSTANT_POWER_PRESENT = 1 << 6;
+  const FLAG_AVERAGE_POWER_PRESENT = 1 << 7;
+  const FLAG_EXPENDED_ENERGY_PRESENT = 1 << 8;
+  const FLAG_HEART_RATE_PRESENT = 1 << 9;
+  const FLAG_METABOLIC_EQUIVALENT_PRESENT = 1 << 10;
+  const FLAG_ELAPSED_TIME_PRESENT = 1 << 11;
+  const FLAG_REMAINING_TIME_PRESENT = 1 << 12;
+
+  const flags = dataView.getUint16(0, true);
+  let offset = 2;
+  const canRead = (bytes) => offset + bytes <= dataView.byteLength;
+  const skip = (bytes) => {
+    offset = Math.min(offset + bytes, dataView.byteLength);
+  };
+  const readUint24LE = () => dataView.getUint8(offset) | (dataView.getUint8(offset + 1) << 8) | (dataView.getUint8(offset + 2) << 16);
+
+  let speedMps = null;
+  let cadence = null;
+  let power = null;
+  let totalDistanceMeters = null;
+
+  // Instantaneous speed is present when "More Data" is NOT set.
+  if ((flags & FLAG_MORE_DATA) === 0) {
+    if (canRead(2)) {
+      const speedKph = dataView.getUint16(offset, true) / 100;
+      speedMps = speedKph / 3.6;
+    }
+    skip(2);
+  }
+
+  if (flags & FLAG_AVERAGE_SPEED_PRESENT) skip(2);
+
+  if (flags & FLAG_INSTANT_CADENCE_PRESENT) {
+    if (canRead(2)) cadence = dataView.getUint16(offset, true) / 2;
+    skip(2);
+  }
+
+  if (flags & FLAG_AVERAGE_CADENCE_PRESENT) skip(2);
+
+  if (flags & FLAG_TOTAL_DISTANCE_PRESENT) {
+    if (canRead(3)) totalDistanceMeters = readUint24LE();
+    skip(3);
+  }
+
+  if (flags & FLAG_RESISTANCE_LEVEL_PRESENT) skip(2);
+
+  if (flags & FLAG_INSTANT_POWER_PRESENT) {
+    if (canRead(2)) power = dataView.getInt16(offset, true);
+    skip(2);
+  }
+
+  if (flags & FLAG_AVERAGE_POWER_PRESENT) skip(2);
+
+  if (flags & FLAG_EXPENDED_ENERGY_PRESENT) {
+    skip(2); // Total Energy
+    skip(2); // Energy Per Hour
+    skip(1); // Energy Per Minute
+  }
+
+  if (flags & FLAG_HEART_RATE_PRESENT) skip(1);
+  if (flags & FLAG_METABOLIC_EQUIVALENT_PRESENT) skip(1);
+  if (flags & FLAG_ELAPSED_TIME_PRESENT) skip(2);
+  if (flags & FLAG_REMAINING_TIME_PRESENT) skip(2);
+
+  return { speedMps, cadence, power, totalDistanceMeters };
+}
+
+async function connectTrainer() {
+  if (!isWebBluetoothSupported()) {
+    showToast("Web Bluetooth not supported.");
+    return;
+  }
+
+  try {
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: ["fitness_machine"] }],
+      optionalServices: ["fitness_machine"],
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService("fitness_machine");
+    const characteristic = await service.getCharacteristic("indoor_bike_data");
+    const control = await initializeTrainerControl(service);
+
+    await characteristic.startNotifications();
+    characteristic.addEventListener("characteristicvaluechanged", (event) => {
+      const value = event.target.value;
+      const parsed = parseIndoorBikeData(value);
+      state.devices.trainer.lastReading = parsed;
+    });
+
+    state.devices.trainer = {
+      connected: true,
+      name: device.name || "Trainer",
+      device,
+      server,
+      characteristic,
+      controlCharacteristic: control.characteristic,
+      controlSupported: control.supported,
+      controlGranted: control.granted,
+      lastControlError: control.error,
+      lastResistancePercent: null,
+      lastResistanceAt: 0,
+      lastReading: null,
+    };
+
+    updateTerrainState({ trainerControlStatus: getTrainerControlStatusText() });
+    showToast(control.granted ? "Trainer connected (control enabled)" : "Trainer connected (read-only)");
+    render();
+  } catch (error) {
+    console.error(error);
+    showToast("Trainer pairing cancelled");
+  }
+}
+
+async function connectHeartRateMonitor() {
+  if (!isWebBluetoothSupported()) {
+    showToast("Web Bluetooth not supported.");
+    return;
+  }
+
+  try {
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: ["heart_rate"] }],
+      optionalServices: ["heart_rate"],
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService("heart_rate");
+    const characteristic = await service.getCharacteristic("heart_rate_measurement");
+
+    await characteristic.startNotifications();
+    characteristic.addEventListener("characteristicvaluechanged", (event) => {
+      const value = event.target.value;
+      const parsed = parseHeartRateMeasurement(value);
+      state.devices.hrm.lastReading = parsed;
+    });
+
+    state.devices.hrm = {
+      connected: true,
+      name: device.name || "HRM",
+      device,
+      server,
+      characteristic,
+      lastReading: null,
+    };
+
+    showToast("Heart rate monitor connected");
+    render();
+  } catch (error) {
+    console.error(error);
+    showToast("HRM pairing cancelled");
+  }
+}
+
+function disconnectDevice(type) {
+  const entry = state.devices[type];
+  if (!entry || !entry.device) return;
+  try {
+    if (entry.characteristic) {
+      entry.characteristic.removeEventListener("characteristicvaluechanged", () => {});
+      entry.characteristic.stopNotifications().catch(() => {});
+    }
+    if (entry.server && entry.server.connected) {
+      entry.server.disconnect();
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  state.devices[type] = {
+    connected: false,
+    name: null,
+    device: null,
+    server: null,
+    characteristic: null,
+    controlCharacteristic: null,
+    controlSupported: false,
+    controlGranted: false,
+    lastControlError: null,
+    lastResistancePercent: null,
+    lastResistanceAt: 0,
+    lastReading: null,
+  };
+  if (type === "trainer") {
+    updateTerrainState({ trainerControlStatus: getTrainerControlStatusText() });
+  }
+  render();
+}
+
+// --- WebRTC signaling (WebSocket preferred, localStorage fallback) ----------------
+
+function getSignalingServerUrl() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get(SIGNALING_SERVER_QUERY_PARAM) || DEFAULT_SIGNALING_SERVER;
+  } catch {
+    return DEFAULT_SIGNALING_SERVER;
+  }
+}
+
+function isWebSocketSignalingReady() {
+  return !state.webrtc.useLocalStorage && state.webrtc.wsConnected && state.webrtc.ws?.readyState === WebSocket.OPEN;
+}
+
+function sendSignalingMessage(message) {
+  if (!isWebSocketSignalingReady()) return false;
+  try {
+    state.webrtc.ws.send(JSON.stringify(message));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sendSessionCommand(type) {
+  if (!state.session?.code || !state.user?.id) return;
+  sendSignalingMessage({
+    type,
+    session: state.session.code,
+    peerId: state.user.id,
+  });
+}
+
+function sendTelemetryToServer(userId, payload) {
+  if (!state.session?.code || !userId || !payload) return;
+  sendSignalingMessage({
+    type: "telemetry",
+    session: state.session.code,
+    peerId: userId,
+    payload,
+  });
+}
+
+function failPendingRemoteJoin(message) {
+  if (!state.webrtc.awaitingSessionState) return;
+  showToast(message || "Could not join session.");
+  state.webrtc.awaitingSessionState = false;
+  closeSignaling();
+  resetPrivateRiderStats();
+  resetPowerUpState();
+  state.user = null;
+  state.session = null;
+  state.view = "lobby";
+  clearLocalSession();
+  render();
+}
+
+function closeSignaling() {
+  if (state.webrtc.ws) {
+    try {
+      if (isWebSocketSignalingReady()) {
+        sendSignalingMessage({
+          type: "leave",
+          session: state.webrtc.code,
+          peerId: state.webrtc.peerId,
+        });
+      }
+      state.webrtc.ws.close();
+    } catch {
+      // ignore
+    }
+  }
+  state.webrtc.ws = null;
+  state.webrtc.wsConnected = false;
+  state.webrtc.awaitingSessionState = false;
+}
+
+function connectSignaling(sessionCode, peerId, isHost) {
+  if (!window.WebSocket) {
+    state.webrtc.useLocalStorage = true;
+    return;
+  }
+
+  const url = getSignalingServerUrl();
+  try {
+    const ws = new WebSocket(url);
+    state.webrtc.ws = ws;
+    state.webrtc.wsConnected = false;
+
+    ws.addEventListener("open", () => {
+      state.webrtc.wsConnected = true;
+      state.webrtc.useLocalStorage = false;
+      render();
+      sendSignalingMessage({
+        type: "join",
+        session: sessionCode,
+        peerId,
+        isHost,
+        user: state.user
+          ? { id: state.user.id, name: state.user.name, weight: state.user.weight, bikeId: normalizeBikeId(state.user.bikeId) }
+          : null,
+        sessionState: isHost ? state.session : null,
+      });
+    });
+
+    ws.addEventListener("message", (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        handleSignalingMessage(msg);
+      } catch {
+        // ignore
+      }
+    });
+
+    ws.addEventListener("close", () => {
+      state.webrtc.wsConnected = false;
+      if (state.webrtc.awaitingSessionState) {
+        failPendingRemoteJoin("Unable to join session.");
+        return;
+      }
+      render();
+    });
+
+    ws.addEventListener("error", () => {
+      if (!state.webrtc.wsConnected) {
+        if (state.webrtc.awaitingSessionState) {
+          failPendingRemoteJoin("Signaling server unreachable.");
+          return;
+        }
+        state.webrtc.useLocalStorage = true;
+        showToast("Signaling server unreachable; falling back to localStorage.");
+        const session = loadSessionFromStorage(sessionCode);
+        if (session) handleNewPeerFromSession(session);
+        render();
+      }
+    });
+  } catch (e) {
+    if (state.webrtc.awaitingSessionState) {
+      failPendingRemoteJoin("Unable to connect to signaling server.");
+      return;
+    }
+    state.webrtc.useLocalStorage = true;
+    render();
+  }
+}
+
+function sendSignalingSignal(sessionCode, targetPeerId, kind, payload) {
+  if (!sessionCode || !state.user?.id) return;
+
+  if (isWebSocketSignalingReady()) {
+    sendSignalingMessage({
+      type: "signal",
+      session: sessionCode,
+      from: state.user.id,
+      to: targetPeerId,
+      kind,
+      payload,
+    });
+    return;
+  }
+
+  // LocalStorage fallback (existing demo behavior)
+  let lsKind = kind;
+  if (kind === "ice") {
+    lsKind = state.webrtc.isHost ? "ice-to-client" : "ice-to-host";
+  }
+  const key = signalingKey(sessionCode, lsKind, targetPeerId);
+  if (lsKind === "offer" || lsKind === "answer") {
+    writeSignal(key, payload);
+  } else {
+    appendSignal(key, payload);
+  }
+}
+
+function signalingKey(sessionCode, kind, peerId) {
+  // kind: offer | answer | ice-to-host | ice-to-client
+  return `${STORAGE_PREFIX}:rtc:${sessionCode}:${kind}:${peerId}`;
+}
+
+function writeSignal(key, value) {
+  localStorage.setItem(key, JSON.stringify(value));
+}
+
+function readSignal(key) {
+  const raw = localStorage.getItem(key);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function appendSignal(key, item) {
+  const existing = readSignal(key) || [];
+  existing.push(item);
+  writeSignal(key, existing);
+}
+
+function cleanupSignaling(sessionCode) {
+  if (!state.webrtc.useLocalStorage) return;
+  try {
+    Object.keys(localStorage)
+      .filter((k) => k.startsWith(`${STORAGE_PREFIX}:rtc:${sessionCode}:`))
+      .forEach((k) => localStorage.removeItem(k));
+  } catch (e) {
+    // ignore
+  }
+}
+
+function processPendingIce(sessionCode, peerId, kind, pc) {
+  const candidates = readSignal(signalingKey(sessionCode, kind, peerId)) || [];
+  candidates.forEach((c) => {
+    pc.addIceCandidate(c).catch(() => {});
+  });
+}
+
+function closeWebRTCPeers() {
+  Object.values(state.webrtc.peers).forEach((peer) => {
+    try {
+      peer.pc?.close();
+    } catch {
+      // ignore
+    }
+  });
+  state.webrtc.peers = {};
+  closeSignaling();
+}
+
+function initWebRTC(sessionCode, isHost, options = {}) {
+  const supported = isWebRTCSupported();
+  state.webrtc.enabled = supported;
+
+  if (!supported) {
+    showToast("WebRTC not supported in this browser.");
+    return;
+  }
+
+  closeWebRTCPeers();
+  state.webrtc.code = sessionCode;
+  state.webrtc.isHost = isHost;
+  state.webrtc.peerId = state.user?.id;
+  state.webrtc.useLocalStorage = false;
+  state.webrtc.wsConnected = false;
+  state.webrtc.awaitingSessionState = !!options.awaitingSessionState;
+
+  // Clear stale signaling entries when starting a new session (fallback only).
+  cleanupSignaling(sessionCode);
+
+  connectSignaling(sessionCode, state.webrtc.peerId, isHost);
+}
+
+function createPeerConnection(sessionCode, peerId, isHost) {
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
+
+  pc.onicecandidate = (event) => {
+    if (!event.candidate) return;
+    sendSignalingSignal(sessionCode, peerId, "ice", event.candidate.toJSON());
+  };
+
+  pc.onconnectionstatechange = () => {
+    const stateObj = state.webrtc.peers[peerId];
+    if (stateObj) {
+      stateObj.connected = pc.connectionState === "connected";
+      render();
+    }
+  };
+
+  return pc;
+}
+
+function setupHostPeer(sessionCode, peerId) {
+  if (!state.webrtc.enabled) return;
+  if (state.webrtc.peers[peerId]) return;
+
+  const pc = createPeerConnection(sessionCode, peerId, true);
+  const dc = pc.createDataChannel("ridesync");
+
+  dc.onopen = () => {
+    state.webrtc.peers[peerId].connected = true;
+    render();
+  };
+
+  dc.onmessage = (event) => {
+    // When a guest sends telemetry updates, broadcast to others (simple hub).
+    try {
+      const payload = JSON.parse(event.data);
+      if (payload?.type === "telemetry" && state.webrtc.useLocalStorage) {
+        // Write to session store so UI updates.
+        updateSessionOnStorage((session) => {
+          session.telemetry = session.telemetry || {};
+          session.telemetry[payload.userId] = payload.data;
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  state.webrtc.peers[peerId] = { pc, dc, connected: false };
+
+  pc.createOffer()
+    .then((offer) => pc.setLocalDescription(offer))
+    .then(() => {
+      sendSignalingSignal(sessionCode, peerId, "offer", pc.localDescription);
+
+      // If the client already sent an answer, apply it immediately (fallback only).
+      if (state.webrtc.useLocalStorage) {
+        const existingAnswer = readSignal(signalingKey(sessionCode, "answer", peerId));
+        if (existingAnswer) {
+          pc.setRemoteDescription(existingAnswer).catch(() => {});
+        }
+
+        // Process any ICE candidates that arrived before we were ready.
+        processPendingIce(sessionCode, peerId, "ice-to-host", pc);
+      }
+    })
+    .catch((err) => console.error("WebRTC offer error", err));
+}
+
+function setupClientPeer(sessionCode, peerId) {
+  if (!state.webrtc.enabled) return;
+
+  let peer = state.webrtc.peers[peerId];
+  if (!peer) {
+    const pc = createPeerConnection(sessionCode, peerId, false);
+    peer = { pc, dc: null, connected: false, remoteSet: false };
+    state.webrtc.peers[peerId] = peer;
+
+    pc.ondatachannel = (event) => {
+      const dc = event.channel;
+      dc.onmessage = (evt) => {
+        try {
+          const payload = JSON.parse(evt.data);
+          if (payload?.type === "telemetry" && state.webrtc.useLocalStorage) {
+            updateSessionOnStorage((session) => {
+              session.telemetry = session.telemetry || {};
+              session.telemetry[payload.userId] = payload.data;
+            });
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      dc.onopen = () => {
+        peer.connected = true;
+        render();
+      };
+
+      peer.dc = dc;
+    };
+  }
+
+  // If we already processed the offer once, don't redo it.
+  if (peer.remoteSet) return;
+
+  if (state.webrtc.useLocalStorage) {
+    const offer = readSignal(signalingKey(sessionCode, "offer", peerId));
+    if (!offer) return;
+
+    peer.pc
+      .setRemoteDescription(offer)
+      .then(() => peer.pc.createAnswer())
+      .then((answer) => peer.pc.setLocalDescription(answer))
+      .then(() => {
+        sendSignalingSignal(sessionCode, peerId, "answer", peer.pc.localDescription);
+        peer.remoteSet = true;
+
+        // Process any ICE candidates that arrived before the peer was ready.
+        processPendingIce(sessionCode, peerId, "ice-to-client", peer.pc);
+      })
+      .catch((err) => console.error("WebRTC answer error", err));
+  }
+}
+
+function handleSignalingEvent(event) {
+  if (!state.webrtc.useLocalStorage) return;
+  if (!event.key || !state.session) return;
+  const code = state.session.code;
+  if (!event.key.startsWith(`${STORAGE_PREFIX}:rtc:${code}:`)) return;
+
+  const parts = event.key.split(":");
+  // key format: ridesync:rtc:<code>:<kind>:<peerId>
+  const kind = parts[4];
+  const peerId = parts[5];
+
+  if (!peerId) return;
+
+  // Host side: handle answer & client ICE
+  if (state.webrtc.isHost && kind === "answer") {
+    const answer = readSignal(event.key);
+    const peer = state.webrtc.peers[peerId];
+    if (peer && answer) {
+      peer.pc.setRemoteDescription(answer).catch(() => {});
+    }
+    return;
+  }
+
+  if (state.webrtc.isHost && kind === "ice-to-host") {
+    const candidates = readSignal(event.key) || [];
+    const peer = state.webrtc.peers[peerId];
+    if (peer) {
+      candidates.forEach((c) => {
+        peer.pc.addIceCandidate(c).catch(() => {});
+      });
+    }
+    return;
+  }
+
+  // Client side: handle offer & host ICE
+  if (!state.webrtc.isHost && kind === "offer") {
+    setupClientPeer(code, peerId);
+    return;
+  }
+
+  if (!state.webrtc.isHost && kind === "ice-to-client") {
+    const candidates = readSignal(event.key) || [];
+    const peer = state.webrtc.peers[peerId];
+    if (peer) {
+      candidates.forEach((c) => {
+        peer.pc.addIceCandidate(c).catch(() => {});
+      });
+    }
+    return;
+  }
+}
+
+function handleSignalingMessage(msg) {
+  if (!msg || !msg.session || msg.session !== state.webrtc.code) return;
+
+  if (msg.type === "session-error") {
+    if (state.webrtc.awaitingSessionState) {
+      failPendingRemoteJoin(msg.message || "Could not join session.");
+      return;
+    }
+    showToast(msg.message || "Session closed.");
+    clearLocalSession();
+    closeWebRTCPeers();
+    resetPrivateRiderStats();
+    resetPowerUpState();
+    state.user = null;
+    state.session = null;
+    state.view = "lobby";
+    render();
+    return;
+  }
+
+  if (msg.type === "session-state") {
+    if (!msg.sessionData || typeof msg.sessionData !== "object") return;
+    const nextSession = cloneJson(msg.sessionData);
+    if (!nextSession) return;
+    normalizeSessionCourse(nextSession);
+
+    state.session = nextSession;
+    saveSessionToStorage(nextSession);
+    if (nextSession.endedAt && state.view === "session") {
+      state.view = "summary";
+    }
+
+    if (state.user?.id) {
+      const me = nextSession.users?.[state.user.id];
+      if (me) {
+        state.user = {
+          ...state.user,
+          ...me,
+          id: state.user.id,
+          bikeId: normalizeBikeId(me.bikeId),
+          isHost: nextSession.hostId === state.user.id,
+        };
+        persistLocalSession(nextSession.code, state.user.id);
+        state.webrtc.awaitingSessionState = false;
+      } else if (!state.webrtc.isHost) {
+        clearLocalSession();
+        resetPrivateRiderStats();
+        resetPowerUpState();
+        state.user = null;
+        state.session = null;
+        state.view = "lobby";
+        showToast("You are no longer in this session.");
+      }
+    }
+
+    if (state.webrtc.isHost) {
+      handleNewPeerFromSession(nextSession);
+    }
+
+    render();
+    return;
+  }
+
+  if (msg.type === "peers") {
+    const { peers = [], hostId } = msg;
+    if (state.webrtc.isHost) {
+      peers.forEach((peerId) => {
+        if (peerId !== state.user?.id) {
+          setupHostPeer(msg.session, peerId);
+        }
+      });
+    } else {
+      // Guests only connect to host.
+      if (hostId && hostId !== state.user?.id) {
+        setupClientPeer(msg.session, hostId);
+      }
+    }
+    return;
+  }
+
+  if (msg.type === "peer-joined") {
+    if (state.webrtc.isHost && msg.peerId && msg.peerId !== state.user?.id) {
+      setupHostPeer(msg.session, msg.peerId);
+    }
+    return;
+  }
+
+  if (msg.type === "peer-left") {
+    const pid = msg.peerId;
+    if (pid && state.webrtc.peers[pid]) {
+      state.webrtc.peers[pid].pc?.close();
+      delete state.webrtc.peers[pid];
+      render();
+    }
+    return;
+  }
+
+  if (msg.type === "signal") {
+    const { from, kind, payload } = msg;
+    if (!from) return;
+
+    // Host receives answers/ice from guests
+    if (state.webrtc.isHost && kind === "answer") {
+      const peer = state.webrtc.peers[from];
+      if (peer && payload) {
+        peer.pc.setRemoteDescription(payload).catch(() => {});
+      }
+      return;
+    }
+
+    if (state.webrtc.isHost && kind === "ice") {
+      const peer = state.webrtc.peers[from];
+      if (peer && payload) {
+        peer.pc.addIceCandidate(payload).catch(() => {});
+      }
+      return;
+    }
+
+    // Guest receives offer/ice from host
+    if (!state.webrtc.isHost && kind === "offer") {
+      setupClientPeer(msg.session, from);
+      const peer = state.webrtc.peers[from];
+      if (peer && payload) {
+        peer.pc
+          .setRemoteDescription(payload)
+          .then(() => peer.pc.createAnswer())
+          .then((answer) => peer.pc.setLocalDescription(answer))
+          .then(() => {
+            sendSignalingSignal(msg.session, from, "answer", peer.pc.localDescription);
+            peer.remoteSet = true;
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+
+    if (!state.webrtc.isHost && kind === "ice") {
+      const peer = state.webrtc.peers[from];
+      if (peer && payload) {
+        peer.pc.addIceCandidate(payload).catch(() => {});
+      }
+      return;
+    }
+  }
+}
+
+function broadcastTelemetryOverWebRTC(userId, data) {
+  if (!state.webrtc.enabled) return;
+  Object.values(state.webrtc.peers).forEach((peer) => {
+    if (peer.dc && peer.dc.readyState === "open") {
+      peer.dc.send(JSON.stringify({ type: "telemetry", userId, data }));
+    }
+  });
+}
+
+function handleNewPeerFromSession(session) {
+  if (!state.webrtc.enabled || !state.webrtc.isHost) return;
+  const hostId = session.hostId;
+  const me = state.user?.id;
+  Object.keys(session.users || {}).forEach((userId) => {
+    if (userId === hostId) return;
+    if (userId === me) return;
+    if (!state.webrtc.peers[userId]) {
+      setupHostPeer(session.code, userId);
+    }
+  });
+}
+
+// --------------------------------------------------------------------
+
+function getTelemetrySampling() {
+  const session = getCurrentSession();
+  const user = getCurrentUser();
+  if (!session || !user) return null;
+
+  const now = currentMs();
+  const privateStats = ensurePrivateRiderStatsContext(session, user);
+  const previous = session.telemetry?.[user.id] || { distance: 0, updatedAt: now };
+  const previousTs = previous.updatedAt || previous.timestamp || now;
+  const deltaSeconds = Math.max(1, Math.round((now - previousTs) / 1000));
+
+  const trainer = state.devices.trainer;
+  const hrm = state.devices.hrm;
+
+  let power = null;
+  let cadence = null;
+  let heartRate = null;
+  let speedMps = null;
+
+  if (trainer.connected && trainer.lastReading) {
+    power = trainer.lastReading.power;
+    cadence = trainer.lastReading.cadence;
+    speedMps = trainer.lastReading.speedMps;
+  }
+
+  if (hrm.connected && hrm.lastReading) {
+    heartRate = hrm.lastReading.heartRate;
+  }
+
+  // Use mock data only when trainer/HRM are not connected.
+  const mockSeed = {
+    ...previous,
+    speedMps: Number.isFinite(privateStats?.latestSpeedMps) ? privateStats.latestSpeedMps : previous.speedMps,
+  };
+  const mock = createMockTelemetryUpdate(mockSeed, now);
+  if (!trainer.connected) {
+    power = power ?? mock.power;
+    cadence = cadence ?? mock.cadence;
+    speedMps = speedMps ?? mock.speedMps;
+  }
+  if (!hrm.connected) {
+    heartRate = heartRate ?? mock.heartRate;
+  }
+
+  return { power, cadence, heartRate, speedMps, deltaSeconds, now };
+}
+
+function createMockTelemetryUpdate(currentTelemetry, nowMs) {
+  const basePower = 220;
+  const drift = (Math.random() - 0.5) * 8;
+  const nextPower = clamp((currentTelemetry?.power ?? basePower) + drift, 60, 500);
+  const heartDrift = (Math.random() - 0.5) * 4;
+  const nextHeart = clamp((currentTelemetry?.heartRate ?? 140) + heartDrift, 80, 205);
+  const cadence = clamp((currentTelemetry?.cadence ?? 80) + (Math.random() - 0.5) * 6, 40, 120);
+  const speedMps = clamp((currentTelemetry?.speedMps ?? 9.0) + (Math.random() - 0.5) * 0.8, 4, 16);
+
+  return {
+    power: Math.round(nextPower),
+    heartRate: Math.round(nextHeart),
+    cadence: Math.round(cadence),
+    speedMps,
+    timestamp: nowMs,
+  };
+}
+
+function createSession({ hostUser, routePreset = DEFAULT_ROUTE_PRESET }) {
+  const code = makeId(6);
+  const now = currentMs();
+  const session = {
+    code,
+    hostId: hostUser.id,
+    startedAt: null,
+    endedAt: null,
+    createdAt: now,
+    users: {
+      [hostUser.id]: { id: hostUser.id, name: hostUser.name, weight: hostUser.weight, bikeId: normalizeBikeId(hostUser.bikeId) },
+    },
+    telemetry: {
+      // userId: { power, heartRate, cadence, distance, updatedAt }
+    },
+    aggregates: {
+      // userId: { sampleCount, totalPower, maxPower, totalHeartRate, totalDistance }
+    },
+    xpAwards: {
+      // userId: { earnedXp, breakdown, ... }
+    },
+    totalClimbedMeters: 0,
+    course: createCourseFromRoutePreset(routePreset),
+  };
+
+  saveSessionToStorage(session);
+  return session;
+}
+
+function createPlaceholderSession(code, user) {
+  return {
+    code,
+    hostId: null,
+    startedAt: null,
+    endedAt: null,
+    createdAt: currentMs(),
+    users: {
+      [user.id]: { id: user.id, name: user.name, weight: user.weight, bikeId: normalizeBikeId(user.bikeId) },
+    },
+    telemetry: {},
+    aggregates: {},
+    xpAwards: {},
+    totalClimbedMeters: 0,
+    course: createCourseFromRoutePreset(DEFAULT_ROUTE_PRESET),
+  };
+}
+
+function joinSession({ code, user }) {
+  const session = loadSessionFromStorage(code);
+  if (!session) return null;
+
+  if (session.endedAt) {
+    return { error: "Session already ended" };
+  }
+
+  if (!session.users) session.users = {};
+  if (!session.telemetry) session.telemetry = {};
+  if (!session.aggregates) session.aggregates = {};
+  if (!Number.isFinite(session.totalClimbedMeters)) session.totalClimbedMeters = 0;
+  normalizeSessionCourse(session);
+
+  session.users[user.id] = { id: user.id, name: user.name, weight: user.weight, bikeId: normalizeBikeId(user.bikeId) };
+
+  saveSessionToStorage(session);
+  return session;
+}
+
+function updateSessionOnStorage(mutationFn) {
+  const code = state.session?.code;
+  if (!code) return;
+  const session = loadSessionFromStorage(code);
+  if (!session) return;
+  if (!Number.isFinite(session.totalClimbedMeters)) session.totalClimbedMeters = 0;
+  normalizeSessionCourse(session);
+  mutationFn(session);
+  saveSessionToStorage(session);
+  state.session = session;
+  render();
+}
+
+function setSession(session) {
+  normalizeSessionCourse(session);
+  state.session = session;
+  render();
+}
+
+function setUser(user) {
+  if (!user || typeof user !== "object") {
+    state.user = user;
+    render();
+    return;
+  }
+  state.user = {
+    ...user,
+    bikeId: normalizeBikeId(user.bikeId),
+  };
+  render();
+}
+
+function getCurrentUser() {
+  return state.user;
+}
+
+function getCurrentSession() {
+  return state.session;
+}
+
+function canStartSession() {
+  const session = getCurrentSession();
+  const user = getCurrentUser();
+  return session && user && session.hostId === user.id && !session.startedAt;
+}
+
+function isSessionRunning() {
+  const session = getCurrentSession();
+  return session && session.startedAt && !session.endedAt;
+}
+
+function isSessionEnded() {
+  const session = getCurrentSession();
+  return session && session.endedAt;
+}
+
+function computeDistanceMeters(prevDistance, speedMps, deltaSeconds) {
+  if (speedMps == null || Number.isNaN(speedMps) || deltaSeconds <= 0) return prevDistance;
+  return prevDistance + Math.max(0, speedMps) * deltaSeconds;
+}
+
+function computeWkg(power, weight) {
+  if (!power || !weight) return null;
+  return power / weight;
+}
+
+function ensureAggregate(userId, sessionOverride = null) {
+  const session = sessionOverride || getCurrentSession();
+  if (!session) return;
+  session.aggregates = session.aggregates || {};
+  if (!session.aggregates[userId]) {
+    session.aggregates[userId] = {
+      sampleCount: 0,
+      totalPower: 0,
+      maxPower: 0,
+      totalHeartRate: 0,
+      totalDistance: 0,
+      totalClimb: 0,
+    };
+  }
+  return session.aggregates[userId];
+}
+
+function ensurePrivateRiderStatsContext(sessionInput = getCurrentSession(), userInput = getCurrentUser()) {
+  const sessionCode = sessionInput?.code || null;
+  const userId = userInput?.id || null;
+  const existing = state.privateRiderStats || createEmptyPrivateRiderStats();
+  if (existing.sessionCode !== sessionCode || existing.userId !== userId) {
+    state.privateRiderStats = createEmptyPrivateRiderStats(sessionCode, userId);
+  }
+  return state.privateRiderStats;
+}
+
+function sumTailValues(values, count) {
+  if (!Array.isArray(values) || values.length === 0 || count <= 0) return 0;
+  const fromIndex = Math.max(0, values.length - count);
+  let sum = 0;
+  for (let i = fromIndex; i < values.length; i += 1) {
+    sum += Number(values[i]) || 0;
+  }
+  return sum;
+}
+
+function updatePrivateRiderRollingPeaks(privateStats) {
+  const recent = privateStats.recentPowerSeconds;
+  PRIVATE_RIDER_PEAK_WINDOWS.forEach((windowDef) => {
+    if (recent.length < windowDef.seconds) return;
+    const windowAverage = sumTailValues(recent, windowDef.seconds) / windowDef.seconds;
+    const previousBest = privateStats.bestRollingWatts[windowDef.seconds];
+    if (!Number.isFinite(previousBest) || windowAverage > previousBest) {
+      privateStats.bestRollingWatts[windowDef.seconds] = windowAverage;
+    }
+  });
+}
+
+function pollPrivateRiderStats(privateStats, nowMs) {
+  if (!privateStats) return;
+  if (nowMs - (privateStats.lastPolledAtMs || 0) < PRIVATE_RIDER_STATS_REFRESH_MS) return;
+  privateStats.lastPolledAtMs = nowMs;
+  const avgWatts = privateStats.totalDurationSeconds > 0 ? privateStats.totalPowerSeconds / privateStats.totalDurationSeconds : null;
+  privateStats.snapshot = {
+    updatedAtMs: nowMs,
+    avgWatts,
+    speedMps: Number.isFinite(privateStats.latestSpeedMps) ? privateStats.latestSpeedMps : null,
+    bestRollingWatts: { ...privateStats.bestRollingWatts },
+    totalDurationSeconds: privateStats.totalDurationSeconds,
+  };
+}
+
+function recordPrivateRiderTelemetrySample(telemetry, sessionInput = getCurrentSession(), userInput = getCurrentUser()) {
+  const privateStats = ensurePrivateRiderStatsContext(sessionInput, userInput);
+  if (!privateStats) return;
+
+  const sampleDurationSeconds = clamp(Math.round(Number(telemetry?.deltaTimeSeconds) || 0), 1, 30);
+  const powerWatts = Math.max(0, Number(telemetry?.power) || 0);
+  const speedMps = Number(telemetry?.speedMps);
+  if (Number.isFinite(speedMps) && speedMps >= 0) {
+    privateStats.latestSpeedMps = speedMps;
+  }
+
+  for (let i = 0; i < sampleDurationSeconds; i += 1) {
+    privateStats.recentPowerSeconds.push(powerWatts);
+    if (privateStats.recentPowerSeconds.length > PRIVATE_RIDER_MAX_WINDOW_SECONDS) {
+      privateStats.recentPowerSeconds.shift();
+    }
+  }
+
+  privateStats.totalDurationSeconds += sampleDurationSeconds;
+  privateStats.totalPowerSeconds += powerWatts * sampleDurationSeconds;
+  updatePrivateRiderRollingPeaks(privateStats);
+  pollPrivateRiderStats(privateStats, Number(telemetry?.timestamp) || currentMs());
+}
+
+function getPrivateRiderStatsSnapshot(sessionInput = getCurrentSession(), userInput = getCurrentUser()) {
+  const privateStats = ensurePrivateRiderStatsContext(sessionInput, userInput);
+  if (!privateStats) return createEmptyPrivateRiderStats().snapshot;
+  pollPrivateRiderStats(privateStats, currentMs());
+  return privateStats.snapshot || createEmptyPrivateRiderStats().snapshot;
+}
+
+function resetPrivateRiderStats() {
+  state.privateRiderStats = createEmptyPrivateRiderStats();
+}
+
+function createPowerUpFromType(typeInput) {
+  const type = String(typeInput || POWER_UP_TYPE_SPEED_BOOST).trim().toLowerCase();
+  const definition = POWER_UP_TYPES[type] || POWER_UP_TYPES[POWER_UP_TYPE_SPEED_BOOST];
+  return {
+    id: `pu_${makeId(10)}`,
+    type: definition.type,
+    label: definition.label,
+    durationMs: definition.durationMs,
+    effect: {
+      speedMultiplier: definition.speedMultiplier,
+    },
+    collectedAt: currentMs(),
+  };
+}
+
+function ensurePowerUpContext(sessionInput = getCurrentSession(), userInput = getCurrentUser()) {
+  const sessionCode = sessionInput?.code || null;
+  const userId = userInput?.id || null;
+  const existing = state.powerUps || createEmptyPowerUpState();
+  if (existing.sessionCode !== sessionCode || existing.userId !== userId) {
+    // Keep inventory local to this client/session so only active usage is shared.
+    const initialDistance = Number(sessionInput?.telemetry?.[userId]?.distance) || 0;
+    state.powerUps = createEmptyPowerUpState(sessionCode, userId);
+    state.powerUps.lastPowerUpDistanceThreshold = Math.floor(Math.max(0, initialDistance) / POWER_UP_GRANT_DISTANCE_METERS);
+  }
+  return state.powerUps;
+}
+
+function resetPowerUpState() {
+  state.powerUps = createEmptyPowerUpState();
+}
+
+function getActivePowerUp(powerUpState, nowMs = currentMs()) {
+  if (!powerUpState) return null;
+  const active = powerUpState.activePowerUp;
+  if (!active) return null;
+  if (nowMs >= active.endsAtMs) {
+    powerUpState.activePowerUp = null;
+    return null;
+  }
+  return active;
+}
+
+function serializeActivePowerUp(activePowerUp) {
+  if (!activePowerUp) return null;
+  return {
+    type: activePowerUp.type,
+    label: activePowerUp.label,
+    startedAtMs: activePowerUp.startedAtMs,
+    durationMs: activePowerUp.durationMs,
+    endsAtMs: activePowerUp.endsAtMs,
+  };
+}
+
+function applyPowerUpEffects(baseSpeedMps, activePowerUp) {
+  const speed = Number(baseSpeedMps);
+  if (!Number.isFinite(speed)) return 0;
+  if (!activePowerUp) return speed;
+  if (activePowerUp.type === POWER_UP_TYPE_SPEED_BOOST) {
+    const multiplier = Number(activePowerUp.effect?.speedMultiplier) || 1;
+    return speed * multiplier;
+  }
+  return speed;
+}
+
+function grantPowerUpsFromDistance(powerUpState, currentDistanceMeters) {
+  if (!powerUpState) return;
+  const distanceThreshold = Math.floor(Math.max(0, Number(currentDistanceMeters) || 0) / POWER_UP_GRANT_DISTANCE_METERS);
+  if (distanceThreshold <= powerUpState.lastPowerUpDistanceThreshold) return;
+
+  const thresholdsCrossed = distanceThreshold - powerUpState.lastPowerUpDistanceThreshold;
+  for (let i = 0; i < thresholdsCrossed; i += 1) {
+    if (powerUpState.powerUpQueue.length >= POWER_UP_QUEUE_MAX) continue;
+    powerUpState.powerUpQueue.push(createPowerUpFromType(POWER_UP_TYPE_SPEED_BOOST));
+  }
+  powerUpState.lastPowerUpDistanceThreshold = distanceThreshold;
+}
+
+function useNextPowerUp(powerUpState, nowMs = currentMs()) {
+  if (!powerUpState) return { ok: false, error: "Power-up state unavailable." };
+  if (getActivePowerUp(powerUpState, nowMs)) {
+    return { ok: false, error: "A power-up is already active." };
+  }
+  if (!Array.isArray(powerUpState.powerUpQueue) || powerUpState.powerUpQueue.length === 0) {
+    return { ok: false, error: "No power-ups available." };
+  }
+
+  const next = powerUpState.powerUpQueue.shift();
+  const durationMs = Math.max(1000, Number(next.durationMs) || 10000);
+  powerUpState.activePowerUp = {
+    ...next,
+    startedAtMs: nowMs,
+    durationMs,
+    endsAtMs: nowMs + durationMs,
+  };
+  return { ok: true, powerUp: powerUpState.activePowerUp };
+}
+
+function formatActivePowerUpLabel(activePowerUp, nowMs = currentMs()) {
+  if (!activePowerUp) return "--";
+  const endsAtMs = Number(activePowerUp.endsAtMs);
+  if (!Number.isFinite(endsAtMs) || nowMs >= endsAtMs) return "--";
+  const remainingSeconds = Math.max(1, Math.ceil((endsAtMs - nowMs) / 1000));
+  const label = activePowerUp.label || "POWER-UP";
+  return `${label} (${remainingSeconds}s)`;
+}
+
+function addTelemetrySample(userId, telemetry, distance) {
+  updateSessionOnStorage((session) => {
+    session.telemetry = session.telemetry || {};
+    const previousEntry = session.telemetry?.[userId] || null;
+    const previousUpdatedAt = Number(previousEntry?.updatedAt) || Number(telemetry.timestamp) || currentMs();
+    const explicitDeltaSeconds = Number(telemetry.deltaTimeSeconds);
+    const deltaTimeSeconds =
+      Number.isFinite(explicitDeltaSeconds) && explicitDeltaSeconds > 0
+        ? explicitDeltaSeconds
+        : Math.max(0, (Number(telemetry.timestamp) - previousUpdatedAt) / 1000);
+    const effectiveGrade = Number.isFinite(telemetry.effectiveGrade)
+      ? telemetry.effectiveGrade
+      : Number.isFinite(telemetry.grade)
+        ? telemetry.grade
+        : 0;
+    const climbDelta = calculateElevationGainMeters(telemetry.speedMps, effectiveGrade, deltaTimeSeconds);
+    session.telemetry[userId] = {
+      power: telemetry.power,
+      heartRate: telemetry.heartRate,
+      cadence: telemetry.cadence,
+      grade: telemetry.grade ?? null,
+      effectiveGrade: telemetry.effectiveGrade ?? null,
+      resistancePercent: telemetry.resistancePercent ?? null,
+      resistanceLabel: telemetry.resistanceLabel ?? null,
+      activePowerUp: telemetry.activePowerUp ?? null,
+      distance,
+      updatedAt: telemetry.timestamp,
+    };
+
+    const agg = ensureAggregate(userId, session);
+    agg.sampleCount += 1;
+    agg.totalPower += telemetry.power;
+    agg.maxPower = Math.max(agg.maxPower, telemetry.power);
+    agg.totalHeartRate += telemetry.heartRate;
+    agg.totalDistance = distance;
+    agg.totalClimb = (agg.totalClimb || 0) + climbDelta;
+    session.totalClimbedMeters = Object.values(session.aggregates).reduce((total, value) => total + (Number(value?.totalClimb) || 0), 0);
+  });
+
+  const payload = {
+    power: telemetry.power,
+    heartRate: telemetry.heartRate,
+    cadence: telemetry.cadence,
+    speedMps: telemetry.speedMps ?? null,
+    grade: telemetry.grade ?? null,
+    effectiveGrade: telemetry.effectiveGrade ?? null,
+    resistancePercent: telemetry.resistancePercent ?? null,
+    resistanceLabel: telemetry.resistanceLabel ?? null,
+    activePowerUp: telemetry.activePowerUp ?? null,
+    distance,
+    timestamp: telemetry.timestamp,
+  };
+
+  // Prefer server-backed telemetry across devices; keep WebRTC path for local fallback.
+  if (isWebSocketSignalingReady()) {
+    sendTelemetryToServer(userId, payload);
+  } else {
+    broadcastTelemetryOverWebRTC(userId, payload);
+  }
+}
+
+function computeSummaryForUser(userId) {
+  const session = getCurrentSession();
+  if (!session) return null;
+  const agg = session.aggregates?.[userId];
+  if (!agg || agg.sampleCount === 0) return null;
+
+  return {
+    avgPower: agg.totalPower / agg.sampleCount,
+    maxPower: agg.maxPower,
+    avgHeartRate: agg.totalHeartRate / agg.sampleCount,
+    totalDistance: agg.totalDistance,
+    totalClimbMeters: agg.totalClimb || 0,
+  };
+}
+
+function computeSessionSummary() {
+  const session = getCurrentSession();
+  if (!session) return null;
+
+  const endedAt = session.endedAt || currentMs();
+  const durationSec = Math.round((endedAt - (session.startedAt || endedAt)) / 1000);
+
+  const users = Object.values(session.users || {});
+  const participants = users.map((user) => {
+    const summary = computeSummaryForUser(user.id) || {};
+    return {
+      id: user.id,
+      name: user.name,
+      weight: user.weight,
+      avgPower: summary.avgPower || 0,
+      maxPower: summary.maxPower || 0,
+      avgHeartRate: summary.avgHeartRate || 0,
+      totalDistance: summary.totalDistance || 0,
+      totalClimbMeters: summary.totalClimbMeters || 0,
+    };
+  });
+  const computedSessionClimbMeters = participants.reduce((total, participant) => total + (Number(participant.totalClimbMeters) || 0), 0);
+  const totalClimbedMeters = Number.isFinite(session.totalClimbedMeters) ? session.totalClimbedMeters : computedSessionClimbMeters;
+
+  return {
+    code: session.code,
+    hostId: session.hostId,
+    startedAt: session.startedAt,
+    endedAt: session.endedAt || currentMs(),
+    durationSec,
+    totalClimbedMeters,
+    xpAwards: cloneJson(session.xpAwards || {}),
+    participants,
+  };
+}
+
+function computeSummaryRollup(summary) {
+  const participants = Array.isArray(summary?.participants) ? summary.participants : [];
+  let totalDistanceMeters = 0;
+  let totalClimbMeters = null;
+  let heartRateSum = 0;
+  let heartRateCount = 0;
+
+  participants.forEach((participant) => {
+    const distance = Number(participant?.totalDistance);
+    if (Number.isFinite(distance) && distance > 0) {
+      totalDistanceMeters += distance;
+    }
+
+    const climb = Number(participant?.totalClimbMeters);
+    if (Number.isFinite(climb) && climb >= 0) {
+      totalClimbMeters = (totalClimbMeters || 0) + climb;
+    }
+
+    const avgHeartRate = Number(participant?.avgHeartRate);
+    if (Number.isFinite(avgHeartRate) && avgHeartRate > 0) {
+      heartRateSum += avgHeartRate;
+      heartRateCount += 1;
+    }
+  });
+
+  const summaryTotalClimb = Number(summary?.totalClimbedMeters);
+  if (Number.isFinite(summaryTotalClimb) && summaryTotalClimb >= 0) {
+    totalClimbMeters = summaryTotalClimb;
+  }
+
+  return {
+    totalDistanceMeters,
+    averageHeartRate: heartRateCount > 0 ? heartRateSum / heartRateCount : null,
+    totalClimbMeters,
+  };
+}
+
+function applySessionXpForCurrentUser(summary) {
+  const userId = state.account.userId;
+  const session = getCurrentSession();
+  if (!summary || !userId || !session) return null;
+  const latestSession = loadSessionFromStorage(session.code) || session;
+
+  latestSession.xpAwards = latestSession.xpAwards || {};
+  if (latestSession.xpAwards[userId]) {
+    summary.xpAwards = summary.xpAwards || {};
+    summary.xpAwards[userId] = latestSession.xpAwards[userId];
+    state.session = latestSession;
+    return latestSession.xpAwards[userId];
+  }
+
+  const participant = (summary.participants || []).find((item) => item.id === userId);
+  if (!participant) return null;
+
+  const profiles = loadProfiles();
+  const existingProfile = profiles[userId];
+  if (!existingProfile) return null;
+
+  const applied = applySessionXpToProfile(existingProfile, summary, participant);
+  const updatedProfile = {
+    ...applied.profile,
+    updatedAt: currentMs(),
+  };
+  profiles[userId] = updatedProfile;
+  saveProfiles(profiles);
+  upsertPublicProfile(updatedProfile);
+
+  const xpAward = {
+    ...applied.xpAward,
+    userId,
+    sessionCode: summary.code,
+  };
+  latestSession.xpAwards[userId] = xpAward;
+  saveSessionToStorage(latestSession);
+  state.session = latestSession;
+
+  summary.xpAwards = summary.xpAwards || {};
+  summary.xpAwards[userId] = xpAward;
+  return xpAward;
+}
+
+function persistSessionSummary(summaryInput = null) {
+  const summary = summaryInput || computeSessionSummary();
+  if (!summary) return;
+
+  const existing = loadSummaries();
+  const filtered = existing.filter((item) => item.code !== summary.code);
+  filtered.unshift(summary);
+  saveSummaries(filtered.slice(0, 20));
+  return summary;
+}
+
+function startSession() {
+  updateSessionOnStorage((session) => {
+    if (!session.startedAt) {
+      session.startedAt = currentMs();
+      session.endedAt = null;
+    }
+  });
+  sendSessionCommand("session-start");
+  state.simulation.lastSmoothedGrade = 0;
+  showToast("Session started");
+}
+
+function endSession() {
+  updateSessionOnStorage((session) => {
+    if (session.startedAt && !session.endedAt) {
+      session.endedAt = currentMs();
+    }
+  });
+  sendSessionCommand("session-end");
+  const summary = computeSessionSummary();
+  if (summary) {
+    applySessionXpForCurrentUser(summary);
+    persistSessionSummary(summary);
+  } else {
+    persistSessionSummary();
+  }
+  if (state.webrtc.code) {
+    cleanupSignaling(state.webrtc.code);
+  }
+  closeWebRTCPeers();
+  state.view = "summary";
+  state.simulation.lastSmoothedGrade = 0;
+  showToast("Session ended");
+  render();
+}
+
+function leaveSession() {
+  const session = getCurrentSession();
+  const user = getCurrentUser();
+  if (!session || !user) return;
+
+  updateSessionOnStorage((s) => {
+    delete s.users?.[user.id];
+    delete s.telemetry?.[user.id];
+    delete s.aggregates?.[user.id];
+  });
+
+  clearLocalSession();
+  closeWebRTCPeers();
+  resetPrivateRiderStats();
+  resetPowerUpState();
+  state.user = null;
+  state.session = null;
+  state.view = "lobby";
+  state.simulation.lastSmoothedGrade = 0;
+  render();
+}
+
+function pollTelemetry() {
+  const session = getCurrentSession();
+  const user = getCurrentUser();
+  if (!session || !user) return;
+
+  const now = currentMs();
+  const previous = session.telemetry?.[user.id] || { distance: 0, timestamp: now };
+  const sample = getTelemetrySampling();
+  if (!sample) return;
+
+  const courseSegments = getCourseSegments(session);
+  const previousDistance = Number(previous.distance) || 0;
+  const gradeContext = getCourseGradeContext(previousDistance, courseSegments);
+  const gradientScale = clamp(state.simulation.gradientScale, 0, 1);
+  const currentGrade = gradeContext.currentGrade;
+  const targetEffectiveGrade = currentGrade * gradientScale;
+  const smoothedGrade = smoothToward(
+    Number.isFinite(state.simulation.lastSmoothedGrade) ? state.simulation.lastSmoothedGrade : targetEffectiveGrade,
+    targetEffectiveGrade,
+    state.simulation.gradeSmoothing,
+    sample.deltaSeconds,
+  );
+  state.simulation.lastSmoothedGrade = smoothedGrade;
+
+  const power = sample.power ?? previous.power ?? 0;
+  const heartRate = sample.heartRate ?? previous.heartRate ?? 0;
+  const cadence = sample.cadence ?? previous.cadence ?? 0;
+  const privateStats = ensurePrivateRiderStatsContext(session, user);
+  const powerUpState = ensurePowerUpContext(session, user);
+  const activePowerUp = getActivePowerUp(powerUpState, now);
+  const previousSpeed = Number.isFinite(privateStats?.latestSpeedMps) ? privateStats.latestSpeedMps : sample.speedMps ?? 6;
+  const targetSpeed = computeTargetSpeedFromPowerAndGrade(power, smoothedGrade, user.weight, user.bikeId);
+  const speedAfterPhysics = smoothToward(previousSpeed, targetSpeed, state.simulation.speedSmoothing, sample.deltaSeconds);
+  const speedMps = applyPowerUpEffects(speedAfterPhysics, activePowerUp);
+  const resistancePercent = mapGradeToResistancePercent(smoothedGrade);
+  const resistanceLabel = getResistanceFeelLabel(resistancePercent);
+  const trainerControlStatus = getTrainerControlStatusText();
+  const activePowerUpPayload = serializeActivePowerUp(activePowerUp);
+
+  const telemetry = {
+    power,
+    heartRate,
+    cadence,
+    speedMps,
+    grade: currentGrade,
+    effectiveGrade: smoothedGrade,
+    resistancePercent,
+    resistanceLabel,
+    activePowerUp: activePowerUpPayload,
+    deltaTimeSeconds: sample.deltaSeconds,
+    timestamp: now,
+  };
+
+  const distance = computeDistanceMeters(previousDistance, speedMps, sample.deltaSeconds);
+  grantPowerUpsFromDistance(powerUpState, distance);
+  updateTerrainState({
+    currentGrade,
+    effectiveGrade: smoothedGrade,
+    nextGrade: gradeContext.nextGrade,
+    distanceToNext: gradeContext.distanceToNext,
+    routeDistance: gradeContext.routeDistance,
+    resistancePercent,
+    resistanceLabel,
+    trainerControlStatus,
+  });
+
+  void sendResistanceToTrainer(smoothedGrade);
+  // Keep rider peak-power/speed stats local only. Do not sync these to shared session data.
+  recordPrivateRiderTelemetrySample(telemetry, session, user);
+  addTelemetrySample(user.id, telemetry, distance);
+}
+
+function syncSessionFromStorage(event) {
+  if (!event.key) return;
+
+  // Process localStorage-based WebRTC signaling only when the fallback is in use.
+  if (state.webrtc.useLocalStorage) {
+    handleSignalingEvent(event);
+  }
+
+  if (!state.session) return;
+  const expectedKey = SESSION_STORE_KEY(state.session.code);
+  if (event.key !== expectedKey) return;
+  if (!event.newValue) return;
+  const wasRunningBeforeUpdate = !!(state.session.startedAt && !state.session.endedAt);
+
+  const updated = safeJsonParse(event.newValue);
+  if (!updated) return;
+  if (!Number.isFinite(updated.totalClimbedMeters)) {
+    updated.totalClimbedMeters = 0;
+  }
+  normalizeSessionCourse(updated);
+
+  state.session = updated;
+
+  // Ensure each participant can get their own local XP award when the session transitions to ended.
+  if (updated.endedAt && wasRunningBeforeUpdate) {
+    const summary = computeSessionSummary();
+    if (summary) {
+      applySessionXpForCurrentUser(summary);
+      persistSessionSummary(summary);
+    }
+  }
+
+  // If the session just ended, move to the summary screen.
+  if (updated.endedAt && state.view === "session") {
+    state.view = "summary";
+  }
+
+  // When host detects a new participant, start the WebRTC handshake.
+  if (state.webrtc.useLocalStorage) {
+    handleNewPeerFromSession(updated);
+  }
+  render();
+}
+
+function render() {
+  const session = getCurrentSession();
+  const user = getCurrentUser();
+
+  // Keep the pairing screen independent of whether a session exists.
+  if (state.view !== "pairing" && (!session || !user)) {
+    state.view = "lobby";
+  }
+
+  if (state.view === "lobby") {
+    renderLobby();
+  } else if (state.view === "session") {
+    renderSession();
+  } else if (state.view === "summary") {
+    renderSummary();
+  } else if (state.view === "pairing") {
+    renderPairing();
+  }
+}
+
+function openPairing(returnView = "lobby") {
+  state.pairingReturnView = returnView;
+  state.view = "pairing";
+  render();
+}
+
+function makePlaceholderGeneratedRoute(distanceKm, hilliness) {
+  const resolvedDistanceKm = normalizeGeneratedRouteDistanceKm(distanceKm);
+  const totalDistanceMeters = Math.round(resolvedDistanceKm * 1000);
+  const resolvedHilliness = normalizeGeneratedHilliness(hilliness);
+  return ensureRoutePresetShape(
+    {
+      id: GENERATED_ROUTE_ID,
+      name: GENERATED_ROUTE_NAME,
+      country: GENERATED_ROUTE_COUNTRY,
+      distanceKm: resolvedDistanceKm,
+      elevationGainM: 0,
+      totalDescentM: 0,
+      startElevationM: 0,
+      summitElevationM: 0,
+      avgGradientPct: 0,
+      maxGradientPct: 0,
+      totalDistanceMeters,
+      courseSegments: [{ startDistance: 0, endDistance: totalDistanceMeters, grade: 0 }],
+      elevationProfile: [
+        { distanceFromStartM: 0, elevationM: 0, gradientPct: 0 },
+        { distanceFromStartM: totalDistanceMeters, elevationM: 0, gradientPct: 0 },
+      ],
+      hillinessPreset: resolvedHilliness,
+    },
+    DEFAULT_ROUTE_PRESET,
+  );
+}
+
+function generateLobbyRouteDraft(distanceKmInput, hillinessInput) {
+  const resolvedDistanceKm = normalizeGeneratedRouteDistanceKm(distanceKmInput);
+  const resolvedHilliness = normalizeGeneratedHilliness(hillinessInput);
+  const generatedRoute = createGeneratedRoutePreset({
+    distanceKm: resolvedDistanceKm,
+    hilliness: resolvedHilliness,
+    id: GENERATED_ROUTE_ID,
+    name: GENERATED_ROUTE_NAME,
+    country: GENERATED_ROUTE_COUNTRY,
+  });
+  if (!generatedRoute) return null;
+
+  const validation = validateGeneratedRoute(generatedRoute, resolvedDistanceKm, resolvedHilliness);
+  generatedRoute._validation = validation;
+  state.lobby.generatedRouteDistanceKm = resolvedDistanceKm;
+  state.lobby.generatedRouteHilliness = resolvedHilliness;
+  state.lobby.generatedRouteDraft = generatedRoute;
+  return generatedRoute;
+}
+
+function getLobbyGeneratedPreviewRoute() {
+  const draft = state.lobby.generatedRouteDraft ? ensureRoutePresetShape(state.lobby.generatedRouteDraft) : null;
+  if (draft) return draft;
+  const confirmed = state.lobby.generatedRouteConfirmed ? ensureRoutePresetShape(state.lobby.generatedRouteConfirmed) : null;
+  if (confirmed) return confirmed;
+  return makePlaceholderGeneratedRoute(state.lobby.generatedRouteDistanceKm, state.lobby.generatedRouteHilliness);
+}
+
+function getLobbySelectedRoute(routeSelectionModeInput = null) {
+  const routeSelectionMode = normalizeRouteSelectionMode(routeSelectionModeInput ?? state.lobby.routeSelectionMode);
+  if (routeSelectionMode === "generated") {
+    return getLobbyGeneratedPreviewRoute();
+  }
+  const selectedRouteId =
+    state.lobby.selectedRouteId && state.lobby.selectedRouteId !== GENERATED_ROUTE_ID
+      ? state.lobby.selectedRouteId
+      : DEFAULT_ROUTE_PRESET.id;
+  return getRoutePresetById(selectedRouteId);
+}
+
+function renderLobby() {
+  const summaries = loadSummaries();
+  const profile = getCurrentAccountProfile();
+  const loggedIn = isAuthenticated() && !!profile;
+  const bluetoothSupported = isWebBluetoothSupported();
+  const defaultName = profile?.displayName || "";
+  const defaultWeightKg = profile?.weightKg != null && Number.isFinite(profile.weightKg) ? formatNumber(profile.weightKg, 1).replace(/\.0$/, "") : "";
+  const identityLockedAttr = loggedIn ? 'readonly aria-readonly="true" class="locked-identity-field"' : "";
+  const identityLockedHint = loggedIn
+    ? `<div class="small" style="margin-top:8px;">Signed in account values are locked here. Use Account > Edit profile to change them.</div>`
+    : "";
+  state.lobby.selectedBikeId = normalizeBikeId(state.lobby.selectedBikeId || DEFAULT_BIKE_ID);
+  const selectedBikeId = normalizeBikeId(state.lobby.selectedBikeId);
+  const bikeOptionsHtml = buildBikeOptionsHtml(selectedBikeId);
+  const selectedBikeDetailsHtml = renderBikeDetailsHtml(selectedBikeId);
+  const legacyGeneratedSelected = state.lobby.selectedRouteId === GENERATED_ROUTE_ID;
+  state.lobby.selectedRouteId =
+    state.lobby.selectedRouteId && state.lobby.selectedRouteId !== GENERATED_ROUTE_ID ? state.lobby.selectedRouteId : DEFAULT_ROUTE_PRESET.id;
+  state.lobby.routeSelectionMode =
+    state.lobby.routeSelectionMode != null
+      ? normalizeRouteSelectionMode(state.lobby.routeSelectionMode)
+      : legacyGeneratedSelected
+        ? "generated"
+        : "preset";
+  state.lobby.generatedRouteDistanceKm = normalizeGeneratedRouteDistanceKm(state.lobby.generatedRouteDistanceKm);
+  state.lobby.generatedRouteHilliness = normalizeGeneratedHilliness(state.lobby.generatedRouteHilliness);
+  const routeSelectionMode = normalizeRouteSelectionMode(state.lobby.routeSelectionMode);
+  if (
+    routeSelectionMode === "generated" &&
+    !state.lobby.generatedRouteDraft &&
+    !state.lobby.generatedRouteConfirmed &&
+    ROUTE_GENERATOR_SERVICE?.generateRoutePreset
+  ) {
+    generateLobbyRouteDraft(state.lobby.generatedRouteDistanceKm, state.lobby.generatedRouteHilliness);
+  }
+  const selectedRoute = getLobbySelectedRoute(routeSelectionMode);
+  const selectedRoutePreviewHtml = renderRoutePresetPreview(selectedRoute);
+  const isGeneratedSelected = routeSelectionMode === "generated";
+  const generatedDraft = state.lobby.generatedRouteDraft ? ensureRoutePresetShape(state.lobby.generatedRouteDraft) : null;
+  const generatedConfirmed = state.lobby.generatedRouteConfirmed ? ensureRoutePresetShape(state.lobby.generatedRouteConfirmed) : null;
+  const generatedDistanceKm = normalizeGeneratedRouteDistanceKm(state.lobby.generatedRouteDistanceKm);
+  const generatedHilliness = normalizeGeneratedHilliness(state.lobby.generatedRouteHilliness);
+  const generatedOptionsHtml = GENERATED_HILLINESS_KEYS.map(
+    (key) => `<option value="${key}" ${key === generatedHilliness ? "selected" : ""}>${escapeHtml(getGeneratedHillinessLabel(key))}</option>`,
+  ).join("");
+  const generatedDraftMatchesInputs =
+    !!generatedDraft &&
+    Math.abs((Number(generatedDraft.distanceKm) || 0) - generatedDistanceKm) < 0.01 &&
+    normalizeGeneratedHilliness(generatedDraft.hillinessPreset) === generatedHilliness;
+  const generatedValidation =
+    generatedDraft?._validation || (generatedDraft ? validateGeneratedRoute(generatedDraft, generatedDistanceKm, generatedHilliness) : null);
+  const generatedConfirmMatchesDraft =
+    generatedDraft &&
+    generatedConfirmed &&
+    generatedDraft.generatedAt &&
+    generatedConfirmed.generatedAt &&
+    generatedDraft.generatedAt === generatedConfirmed.generatedAt;
+  const generatedStatus = !ROUTE_GENERATOR_SERVICE?.generateRoutePreset
+    ? "Route generator service is unavailable. Ensure route-generator.js is loaded."
+    : generatedValidation && !generatedValidation.valid
+      ? `Validation: ${generatedValidation.errors[0] || "Generated route failed validation."}`
+      : generatedDraft && !generatedDraftMatchesInputs
+        ? "Inputs changed. Click Regenerate to update the route preview."
+        : generatedDraft && !generatedConfirmMatchesDraft
+          ? "Preview ready. Click Use Generated Route to confirm."
+          : generatedConfirmed
+            ? "Generated route confirmed and ready for session start."
+            : "Generate a route, review the profile, then confirm.";
+  const createRouteOptions = ROUTE_PRESETS.map(
+    (route) =>
+      `<option value="${route.id}" ${route.id === state.lobby.selectedRouteId ? "selected" : ""}>${escapeHtml(route.name)} (${escapeHtml(route.country)})</option>`,
+  ).join("");
+  const profileAge = profile ? (profile.age != null ? profile.age : computeAgeFromDob(profile.dateOfBirth)) : null;
+  const profileHeightText = profile ? formatProfileHeight(profile) : "--";
+  const profileHeightUnit = profile?.heightUnit === "ft_in" ? "ft_in" : "cm";
+  const profileHeightCmValue = profile?.heightCm != null && Number.isFinite(profile.heightCm)
+    ? formatNumber(profile.heightCm, 1).replace(/\.0$/, "")
+    : profile?.height != null && Number.isFinite(profile.height) && profileHeightUnit === "cm"
+      ? formatNumber(profile.height, 1).replace(/\.0$/, "")
+      : "";
+  const profileTotalInches = profile?.height != null && Number.isFinite(profile.height) ? profile.height : null;
+  const profileHeightFeetValue = profile?.heightFeet != null && Number.isFinite(profile.heightFeet)
+    ? String(Math.floor(profile.heightFeet))
+    : profileTotalInches != null
+      ? String(Math.floor(profileTotalInches / 12))
+      : "";
+  const profileHeightInchesValue = profile?.heightInches != null && Number.isFinite(profile.heightInches)
+    ? formatNumber(profile.heightInches, 1).replace(/\.0$/, "")
+    : profileTotalInches != null
+      ? formatNumber(profileTotalInches - Math.floor(profileTotalInches / 12) * 12, 1).replace(/\.0$/, "")
+      : "";
+  const profileProgress = profile ? getProgressToNextLevel(profile.totalXp) : null;
+  const profileLevel = profileProgress?.currentLevel || 1;
+  const profileNextLevel = profileProgress?.nextLevel || Math.min(MAX_PLAYER_LEVEL, profileLevel + 1);
+  const profileXpInLevel = profileProgress?.currentXp || 0;
+  const profileXpRequired = profileProgress?.xpRequiredForNextLevel || getXpRequiredForLevelTransition(1);
+  const profileProgressPercent = profileProgress?.levelProgressPercent || 0;
+  const isMaxProfileLevel = !!profileProgress?.isMaxLevel;
+
+  let accountCard = "";
+  if (!loggedIn) {
+    accountCard = `
+      <div class="card">
+        <h2>Account</h2>
+        <p class="small">Create an account or log in. This basic MVP stores account data locally.</p>
+        <div class="flex" style="gap:12px;flex-wrap:wrap;">
+          <div style="flex:1;min-width:240px;">
+            <label class="label">Email</label>
+            <input id="authEmail" placeholder="you@example.com" type="email" />
+          </div>
+          <div style="flex:1;min-width:240px;">
+            <label class="label">Password</label>
+            <input id="authPassword" placeholder="min 6 characters" type="password" />
+          </div>
+        </div>
+        <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap;">
+          <button id="signupBtn">Sign up</button>
+          <button id="loginBtn" class="secondary">Log in</button>
+          <button id="resetBtn" class="secondary">Reset password</button>
+        </div>
+      </div>
+    `;
+  } else {
+    const friendContext = getFriendContext(state.account.userId);
+    const incomingRows = friendContext.incoming
+      .map((req) => {
+        const from = friendContext.getProfile(req.fromUserId) || { displayName: "Rider", email: "" };
+        return `
+          <tr>
+            <td>${escapeHtml(from.displayName)}</td>
+            <td>${escapeHtml(from.email || "")}</td>
+            <td>
+              <button class="secondary" data-accept-request="${req.id}">Accept</button>
+              <button class="secondary" data-reject-request="${req.id}" style="margin-left:6px;">Reject</button>
+            </td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    const outgoingRows = friendContext.outgoing
+      .map((req) => {
+        const to = friendContext.getProfile(req.toUserId) || { displayName: "Rider", email: "" };
+        return `
+          <tr>
+            <td>${escapeHtml(to.displayName)}</td>
+            <td>${escapeHtml(to.email || "")}</td>
+            <td><button class="secondary" data-cancel-request="${req.id}">Cancel</button></td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    const friendRows = friendContext.friendIds
+      .map((friendUserId) => {
+        const friend = friendContext.getProfile(friendUserId) || { displayName: "Rider", email: "" };
+        return `
+          <tr>
+            <td>${escapeHtml(friend.displayName)}</td>
+            <td>${escapeHtml(friend.email || "")}</td>
+            <td><button class="secondary" data-remove-friend="${friendUserId}">Remove</button></td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    const searchResults = searchUsers(state.account.friendSearchQuery, state.account.userId);
+    const searchRows = searchResults
+      .map(
+        (p) => `
+          <tr>
+            <td>${escapeHtml(p.displayName || "Rider")}</td>
+            <td>${escapeHtml(p.email || "")}</td>
+            <td><button class="secondary" data-send-request="${p.userId}">Add</button></td>
+          </tr>
+        `,
+      )
+      .join("");
+
+    const avatarCoreHtml = profile.profilePhotoUrl
+      ? `<img src="${escapeHtml(profile.profilePhotoUrl)}" alt="Profile avatar" style="width:64px;height:64px;border-radius:50%;object-fit:cover;" />`
+      : `<div class="code" style="width:64px;height:64px;border-radius:50%;display:flex;align-items:center;justify-content:center;">${escapeHtml(
+          (profile.displayName || "R").slice(0, 2).toUpperCase(),
+        )}</div>`;
+    const avatarHtml = `
+      <div class="profile-avatar-shell">
+        ${avatarCoreHtml}
+        <div class="profile-level-badge">Lv ${profileLevel}</div>
+      </div>
+    `;
+
+    accountCard = `
+      <div class="card">
+        <div class="flex-space">
+          <div>
+            <h2>Account</h2>
+            <div class="small">${escapeHtml(profile.email)}</div>
+          </div>
+          <button id="logoutBtn" class="secondary">Log out</button>
+        </div>
+
+        <div class="flex" style="gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;">
+          ${avatarHtml}
+          <div>
+            <div><strong>${escapeHtml(profile.displayName || "Rider")}</strong></div>
+            <div class="small">
+              Age: ${profileAge ?? "--"} | Weight: ${profile.weight ?? "--"} ${escapeHtml(profile.weightUnit || "kg")} | Height: ${escapeHtml(profileHeightText)}
+            </div>
+            <div class="small" style="margin-top:6px;"><strong>Level ${profileLevel}</strong></div>
+            <div class="level-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(
+              profileProgressPercent,
+            )}">
+              <div class="level-progress-fill" style="width:${formatNumber(profileProgressPercent, 2)}%;"></div>
+            </div>
+            <div class="small">
+              ${
+                isMaxProfileLevel
+                  ? `Max level reached (${MAX_PLAYER_LEVEL})`
+                  : `${formatNumber(profileXpInLevel, 0)} / ${formatNumber(profileXpRequired, 0)} XP to Level ${profileNextLevel}`
+              }
+            </div>
+            <div class="small">Total XP: ${formatNumber(profileProgress?.totalXp || 0, 0)}</div>
+          </div>
+        </div>
+
+        <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap;">
+          <button id="toggleProfileBtn" class="secondary">${state.account.showProfileEditor ? "Hide profile editor" : "Edit profile"}</button>
+          <button id="toggleFriendsBtn" class="secondary">${state.account.showFriendsPanel ? "Hide friends" : "Manage friends"}</button>
+        </div>
+
+        ${
+          state.account.showProfileEditor
+            ? `
+          <div class="card" style="margin-top:12px;">
+            <h2>Edit Profile</h2>
+            <div class="flex" style="gap:12px;flex-wrap:wrap;">
+              <div style="flex:1;min-width:220px;">
+                <label class="label">Display name</label>
+                <input id="profileDisplayName" value="${escapeHtml(profile.displayName || "")}" />
+              </div>
+              <div style="flex:1;min-width:120px;">
+                <label class="label">Date of birth</label>
+                <input id="profileDob" type="date" value="${escapeHtml(profile.dateOfBirth || "")}" />
+              </div>
+            </div>
+            <div class="flex" style="gap:12px;flex-wrap:wrap;margin-top:10px;">
+              <div style="flex:1;min-width:160px;">
+                <label class="label">Weight</label>
+                <input id="profileWeight" type="number" min="1" step="0.1" value="${profile.weight ?? ""}" />
+              </div>
+              <div style="flex:1;min-width:120px;">
+                <label class="label">Weight unit</label>
+                <select id="profileWeightUnit">
+                  <option value="kg" ${profile.weightUnit === "kg" ? "selected" : ""}>kg</option>
+                  <option value="lb" ${profile.weightUnit === "lb" ? "selected" : ""}>lb</option>
+                </select>
+              </div>
+              <div style="flex:1;min-width:120px;">
+                <label class="label">Height unit</label>
+                <select id="profileHeightUnit">
+                  <option value="cm" ${profileHeightUnit === "cm" ? "selected" : ""}>cm</option>
+                  <option value="ft_in" ${profileHeightUnit === "ft_in" ? "selected" : ""}>ft_in</option>
+                </select>
+              </div>
+              <div id="profileHeightCmWrap" style="flex:1;min-width:160px;${profileHeightUnit === "cm" ? "" : "display:none;"}">
+                <label class="label">Height (cm)</label>
+                <input id="profileHeightCm" type="number" min="1" step="0.1" value="${escapeHtml(profileHeightCmValue)}" />
+              </div>
+              <div id="profileHeightFtWrap" style="flex:1;min-width:130px;${profileHeightUnit === "ft_in" ? "" : "display:none;"}">
+                <label class="label">Height (ft)</label>
+                <input id="profileHeightFeet" type="number" min="0" step="1" value="${escapeHtml(profileHeightFeetValue)}" />
+              </div>
+              <div id="profileHeightInWrap" style="flex:1;min-width:130px;${profileHeightUnit === "ft_in" ? "" : "display:none;"}">
+                <label class="label">Height (in)</label>
+                <input id="profileHeightInches" type="number" min="0" max="11.9" step="0.1" value="${escapeHtml(profileHeightInchesValue)}" />
+              </div>
+            </div>
+            <div class="small" style="margin-top:8px;">Age is calculated automatically from date of birth.</div>
+            <div style="margin-top:10px;">
+              <label class="label">Profile picture (jpg/png/webp)</label>
+              <input id="profilePhotoInput" type="file" accept="image/jpeg,image/png,image/webp" />
+            </div>
+            <div style="margin-top:12px;">
+              <button id="saveProfileBtn">Save profile</button>
+            </div>
+          </div>
+        `
+            : ""
+        }
+
+        ${
+          state.account.showFriendsPanel
+            ? `
+          <div class="card" style="margin-top:12px;">
+            <h2>Friends</h2>
+            <div class="flex" style="gap:8px;flex-wrap:wrap;">
+              <input id="friendSearchInput" placeholder="Search by email or display name" value="${escapeHtml(state.account.friendSearchQuery)}" />
+              <button id="friendSearchBtn" class="secondary">Search</button>
+            </div>
+            <table class="table" style="margin-top:10px;">
+              <thead><tr><th>Search Results</th><th>Email</th><th></th></tr></thead>
+              <tbody>${searchRows || "<tr><td colspan='3' class='small'>No matches.</td></tr>"}</tbody>
+            </table>
+
+            <table class="table" style="margin-top:14px;">
+              <thead><tr><th>Incoming Requests</th><th>Email</th><th></th></tr></thead>
+              <tbody>${incomingRows || "<tr><td colspan='3' class='small'>No incoming requests.</td></tr>"}</tbody>
+            </table>
+
+            <table class="table" style="margin-top:14px;">
+              <thead><tr><th>Outgoing Requests</th><th>Email</th><th></th></tr></thead>
+              <tbody>${outgoingRows || "<tr><td colspan='3' class='small'>No outgoing requests.</td></tr>"}</tbody>
+            </table>
+
+            <table class="table" style="margin-top:14px;">
+              <thead><tr><th>Friends</th><th>Email</th><th></th></tr></thead>
+              <tbody>${friendRows || "<tr><td colspan='3' class='small'>No friends yet.</td></tr>"}</tbody>
+            </table>
+          </div>
+        `
+            : ""
+        }
+      </div>
+    `;
+  }
+
+  const defaultLobbySection = loggedIn ? "create" : "account";
+  state.lobby.activeSection = normalizeLobbySection(state.lobby.activeSection, defaultLobbySection);
+  const activeLobbySection = state.lobby.activeSection;
+  const lobbyMenuSections = [
+    { id: "account", label: "Account" },
+    { id: "create", label: "Create a session" },
+    { id: "join", label: "Join a session" },
+    { id: "devices", label: "Devices" },
+  ];
+  const lobbyMenuHtml = `
+    <div class="card lobby-menu-card">
+      <div class="lobby-menu" role="tablist" aria-label="Lobby sections">
+        ${lobbyMenuSections
+          .map(
+            (section) => `
+          <button
+            type="button"
+            class="secondary lobby-menu-btn ${activeLobbySection === section.id ? "is-active" : ""}"
+            data-lobby-section="${section.id}"
+            aria-pressed="${activeLobbySection === section.id ? "true" : "false"}"
+          >
+            ${escapeHtml(section.label)}
+          </button>
+        `,
+          )
+          .join("")}
+      </div>
+    </div>
+  `;
+  const createSessionCard = `
+    <div class="card">
+      <h2>Create a session</h2>
+      <p class="small">Share the code with your friends to join. With signaling enabled, this works across devices.</p>
+      <div class="flex" style="gap:12px;flex-wrap:wrap;">
+        <div style="flex:1;min-width:240px;">
+          <label class="label">Your name</label>
+          <input id="createName" placeholder="e.g. Hugh" value="${escapeHtml(defaultName)}" ${identityLockedAttr} />
+        </div>
+        <div style="flex:1;min-width:240px;">
+          <label class="label">Your weight (kg, optional)</label>
+          <input id="createWeight" placeholder="e.g. 75" type="number" min="1" value="${escapeHtml(defaultWeightKg)}" ${identityLockedAttr} />
+        </div>
+      </div>
+      <div class="flex" style="gap:12px;flex-wrap:wrap;margin-top:12px;">
+        <div style="flex:1;min-width:260px;">
+          <label class="label">Route type</label>
+          <div class="route-source-toggle" style="margin-top:8px;">
+            <label class="route-source-option">
+              <input id="routeModePreset" type="radio" name="routeMode" value="preset" ${routeSelectionMode === "preset" ? "checked" : ""} />
+              Preset routes
+            </label>
+            <label class="route-source-option">
+              <input id="routeModeGenerated" type="radio" name="routeMode" value="generated" ${routeSelectionMode === "generated" ? "checked" : ""} />
+              Generated route
+            </label>
+          </div>
+        </div>
+        ${
+          routeSelectionMode === "preset"
+            ? `
+        <div style="flex:1;min-width:260px;">
+          <label class="label">Map preset</label>
+          <select id="createRoute">${createRouteOptions}</select>
+        </div>
+        `
+            : ""
+        }
+      </div>
+      ${identityLockedHint}
+      ${
+        isGeneratedSelected
+          ? `
+      <div class="generated-route-controls" style="margin-top:12px;">
+        <div class="flex" style="gap:12px;flex-wrap:wrap;align-items:flex-end;">
+          <div style="flex:1;min-width:170px;">
+            <label class="label">Total route distance (km)</label>
+            <input id="generatedRouteDistance" type="number" min="2" max="300" step="0.1" value="${escapeHtml(
+              generatedDistanceKm.toFixed(1).replace(/\.0$/, ""),
+            )}" />
+          </div>
+          <div style="flex:1;min-width:170px;">
+            <label class="label">Hilliness</label>
+            <select id="generatedRouteHilliness">${generatedOptionsHtml}</select>
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <button id="regenerateRouteBtn" class="secondary">Regenerate</button>
+            <button id="confirmGeneratedRouteBtn">Use Generated Route</button>
+          </div>
+        </div>
+        <div id="generatedRouteStatus" class="small" style="margin-top:8px;">${escapeHtml(generatedStatus)}</div>
+      </div>
+      `
+          : ""
+      }
+      <div id="createRouteMeta" class="small" style="margin-top:8px;">
+        ${escapeHtml(formatRoutePresetMeta(selectedRoute))}
+      </div>
+      <div id="createRouteProfile" class="elevation-profile-card" style="margin-top:10px;">
+        ${selectedRoutePreviewHtml}
+      </div>
+      <div style="margin-top:12px;max-width:320px;">
+        <label class="label">Bike choice</label>
+        <select id="createBike">${bikeOptionsHtml}</select>
+      </div>
+      <div class="bike-choice-card" style="margin-top:12px;">
+        ${selectedBikeDetailsHtml}
+      </div>
+      <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap;">
+        <button id="createBtn">Create session</button>
+      </div>
+    </div>
+  `;
+  const joinSessionCard = `
+    <div class="card">
+      <h2>Join a session</h2>
+      <div class="flex" style="gap:12px;flex-wrap:wrap;">
+        <div style="flex:1;min-width:220px;">
+          <label class="label">Session code</label>
+          <input id="joinCode" placeholder="ABC123" maxlength="6" />
+        </div>
+        <div style="flex:1;min-width:220px;">
+          <label class="label">Your name</label>
+          <input id="joinName" placeholder="e.g. Alex" value="${escapeHtml(defaultName)}" ${identityLockedAttr} />
+        </div>
+        <div style="flex:1;min-width:220px;">
+          <label class="label">Your weight (kg, optional)</label>
+          <input id="joinWeight" placeholder="e.g. 70" type="number" min="1" value="${escapeHtml(defaultWeightKg)}" ${identityLockedAttr} />
+        </div>
+        <div style="flex:1;min-width:220px;">
+          <label class="label">Bike choice</label>
+          <select id="joinBike">${bikeOptionsHtml}</select>
+        </div>
+      </div>
+      ${identityLockedHint}
+      <div class="bike-choice-card" style="margin-top:12px;">
+        ${selectedBikeDetailsHtml}
+      </div>
+      <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap;">
+        <button id="joinBtn" class="secondary">Join session</button>
+      </div>
+    </div>
+  `;
+  const devicesCard = `
+    <div class="card">
+      <h2>Devices</h2>
+      <p class="small">Connect a trainer and/or heart rate monitor to use real telemetry.</p>
+      ${!bluetoothSupported ? "<p class='small'>This browser does not support Web Bluetooth.</p>" : ""}
+      <div class="flex" style="gap:12px; flex-wrap:wrap;">
+        <div style="flex:1; min-width:220px;">
+          <div class="small">Trainer</div>
+          ${
+            state.devices.trainer.connected
+              ? `
+          <div class="code">${escapeHtml(state.devices.trainer.name || "Trainer")}</div>
+          <button id="disconnectTrainerInline" class="secondary" style="margin-top:8px;width:100%;">Disconnect trainer</button>
+          `
+              : bluetoothSupported
+                ? `<button id="connectTrainerInline" class="secondary" style="margin-top:8px;width:100%;">Not connected - Pair trainer</button>`
+                : `<div class="code">Not connected</div>`
+          }
+        </div>
+        <div style="flex:1; min-width:220px;">
+          <div class="small">Heart rate</div>
+          ${
+            state.devices.hrm.connected
+              ? `
+          <div class="code">${escapeHtml(state.devices.hrm.name || "Heart rate monitor")}</div>
+          <button id="disconnectHrmInline" class="secondary" style="margin-top:8px;width:100%;">Disconnect HRM</button>
+          `
+              : bluetoothSupported
+                ? `<button id="connectHrmInline" class="secondary" style="margin-top:8px;width:100%;">Not connected - Pair HRM</button>`
+                : `<div class="code">Not connected</div>`
+          }
+        </div>
+      </div>
+    </div>
+  `;
+
+  appEl.innerHTML = `
+    ${lobbyMenuHtml}
+    ${activeLobbySection === "account" ? accountCard : ""}
+    ${activeLobbySection === "create" ? createSessionCard : ""}
+    ${activeLobbySection === "join" ? joinSessionCard : ""}
+    ${activeLobbySection === "devices" ? devicesCard : ""}
+    <div class="card">
+      <h2>Recent sessions</h2>
+      <p class="small">Tap a code to reopen a completed summary.</p>
+      ${summaries.length === 0 ? "<p class='small'>No completed sessions yet.</p>" : ""}
+      <table class="table">
+        <thead>
+          <tr><th>Code</th><th>When</th><th>Participants</th><th>Duration</th><th>Total Distance</th><th>Avg HR</th><th>Total Climb</th></tr>
+        </thead>
+        <tbody>
+          ${summaries
+            .map((s) => {
+              const when = new Date(s.startedAt).toLocaleString();
+              const duration = formatDuration(s.durationSec);
+              const count = s.participants?.length || 0;
+              const rollup = computeSummaryRollup(s);
+              const totalDistance = formatDistanceKmFloor(rollup.totalDistanceMeters);
+              const averageHeartRate = rollup.averageHeartRate != null ? `${Math.round(rollup.averageHeartRate)} bpm` : "--";
+              const totalClimb = rollup.totalClimbMeters != null ? formatClimbedMeters(rollup.totalClimbMeters) : "--";
+              return `
+                <tr class="clickable" data-code="${s.code}">
+                  <td><span class="code">${s.code}</span></td>
+                  <td>${when}</td>
+                  <td>${count}</td>
+                  <td>${duration}</td>
+                  <td>${totalDistance}</td>
+                  <td>${averageHeartRate}</td>
+                  <td>${totalClimb}</td>
+                </tr>
+              `;
+            })
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+
+  document.querySelectorAll("[data-lobby-section]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const nextSection = normalizeLobbySection(btn.getAttribute("data-lobby-section"), activeLobbySection);
+      if (nextSection === state.lobby.activeSection) return;
+      state.lobby.activeSection = nextSection;
+      render();
+    });
+  });
+
+  const authEmailEl = document.getElementById("authEmail");
+  if (authEmailEl) {
+    const signupBtn = document.getElementById("signupBtn");
+    const loginBtn = document.getElementById("loginBtn");
+    const resetBtn = document.getElementById("resetBtn");
+    signupBtn?.addEventListener("click", () => {
+      const email = authEmailEl.value.trim();
+      const password = document.getElementById("authPassword").value;
+      const result = signUpWithEmail(email, password);
+      if (result.error) {
+        showToast(result.error);
+        return;
+      }
+      showToast("Account created and logged in.");
+      render();
+    });
+    loginBtn?.addEventListener("click", () => {
+      const email = authEmailEl.value.trim();
+      const password = document.getElementById("authPassword").value;
+      const result = logInWithEmail(email, password);
+      if (result.error) {
+        showToast(result.error);
+        return;
+      }
+      showToast("Logged in.");
+      render();
+    });
+    resetBtn?.addEventListener("click", () => {
+      const result = sendPasswordReset(authEmailEl.value.trim());
+      showToast(result.error || result.message);
+    });
+  }
+
+  const logoutBtn = document.getElementById("logoutBtn");
+  if (logoutBtn) {
+    logoutBtn.addEventListener("click", () => {
+      clearAuthenticatedUser();
+      showToast("Logged out.");
+      render();
+    });
+  }
+
+  const toggleProfileBtn = document.getElementById("toggleProfileBtn");
+  if (toggleProfileBtn) {
+    toggleProfileBtn.addEventListener("click", () => {
+      state.account.showProfileEditor = !state.account.showProfileEditor;
+      render();
+    });
+  }
+
+  const toggleFriendsBtn = document.getElementById("toggleFriendsBtn");
+  if (toggleFriendsBtn) {
+    toggleFriendsBtn.addEventListener("click", () => {
+      state.account.showFriendsPanel = !state.account.showFriendsPanel;
+      render();
+    });
+  }
+
+  const saveProfileBtn = document.getElementById("saveProfileBtn");
+  if (saveProfileBtn) {
+    saveProfileBtn.addEventListener("click", () => {
+      const result = updateProfile({
+        displayName: document.getElementById("profileDisplayName").value,
+        dateOfBirth: document.getElementById("profileDob").value,
+        weight: document.getElementById("profileWeight").value,
+        weightUnit: document.getElementById("profileWeightUnit").value,
+        heightCm: document.getElementById("profileHeightCm")?.value ?? "",
+        heightFeet: document.getElementById("profileHeightFeet")?.value ?? "",
+        heightInches: document.getElementById("profileHeightInches")?.value ?? "",
+        heightUnit: document.getElementById("profileHeightUnit").value,
+      });
+      if (result.error) {
+        showToast(result.error);
+        return;
+      }
+      showToast("Profile saved.");
+      render();
+    });
+  }
+
+  const profileHeightUnitEl = document.getElementById("profileHeightUnit");
+  if (profileHeightUnitEl) {
+    const profileHeightCmWrap = document.getElementById("profileHeightCmWrap");
+    const profileHeightFtWrap = document.getElementById("profileHeightFtWrap");
+    const profileHeightInWrap = document.getElementById("profileHeightInWrap");
+    const syncHeightInputs = () => {
+      const isImperial = profileHeightUnitEl.value === "ft_in";
+      if (profileHeightCmWrap) profileHeightCmWrap.style.display = isImperial ? "none" : "";
+      if (profileHeightFtWrap) profileHeightFtWrap.style.display = isImperial ? "" : "none";
+      if (profileHeightInWrap) profileHeightInWrap.style.display = isImperial ? "" : "none";
+    };
+    syncHeightInputs();
+    profileHeightUnitEl.addEventListener("change", syncHeightInputs);
+  }
+
+  const profilePhotoInput = document.getElementById("profilePhotoInput");
+  if (profilePhotoInput) {
+    profilePhotoInput.addEventListener("change", async (event) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      const allowed = ["image/jpeg", "image/png", "image/webp"];
+      if (!allowed.includes(file.type)) {
+        showToast("Only jpg, png, and webp are supported.");
+        return;
+      }
+      if (file.size > 5 * 1024 * 1024) {
+        showToast("Image must be 5MB or smaller.");
+        return;
+      }
+      try {
+        const dataUrl = await fileToResizedDataUrl(file, 512, 0.85);
+        const profiles = loadProfiles();
+        const profile = profiles[state.account.userId];
+        if (!profile) return;
+        profile.profilePhotoUrl = dataUrl;
+        profile.updatedAt = currentMs();
+        profiles[state.account.userId] = profile;
+        saveProfiles(profiles);
+        upsertPublicProfile(profile);
+        showToast("Profile picture updated.");
+        render();
+      } catch {
+        showToast("Image upload failed.");
+      }
+    });
+  }
+
+  const friendSearchBtn = document.getElementById("friendSearchBtn");
+  if (friendSearchBtn) {
+    friendSearchBtn.addEventListener("click", () => {
+      state.account.friendSearchQuery = document.getElementById("friendSearchInput").value.trim();
+      render();
+    });
+  }
+
+  document.querySelectorAll("[data-send-request]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const result = sendFriendRequest(btn.getAttribute("data-send-request"));
+      showToast(result.error || "Friend request sent.");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-accept-request]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const result = acceptFriendRequest(btn.getAttribute("data-accept-request"));
+      showToast(result.error || "Friend request accepted.");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-reject-request]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const result = rejectFriendRequest(btn.getAttribute("data-reject-request"));
+      showToast(result.error || "Friend request rejected.");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-cancel-request]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const result = cancelFriendRequest(btn.getAttribute("data-cancel-request"));
+      showToast(result.error || "Friend request cancelled.");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-remove-friend]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const result = removeFriend(btn.getAttribute("data-remove-friend"));
+      showToast(result.error || "Friend removed.");
+      render();
+    });
+  });
+
+  const routeModePresetEl = document.getElementById("routeModePreset");
+  if (routeModePresetEl) {
+    routeModePresetEl.addEventListener("change", () => {
+      if (!routeModePresetEl.checked) return;
+      state.lobby.routeSelectionMode = "preset";
+      render();
+    });
+  }
+
+  const routeModeGeneratedEl = document.getElementById("routeModeGenerated");
+  if (routeModeGeneratedEl) {
+    routeModeGeneratedEl.addEventListener("change", () => {
+      if (!routeModeGeneratedEl.checked) return;
+      state.lobby.routeSelectionMode = "generated";
+      if (!state.lobby.generatedRouteDraft && !state.lobby.generatedRouteConfirmed && ROUTE_GENERATOR_SERVICE?.generateRoutePreset) {
+        generateLobbyRouteDraft(state.lobby.generatedRouteDistanceKm, state.lobby.generatedRouteHilliness);
+      }
+      render();
+    });
+  }
+
+  const createBikeEl = document.getElementById("createBike");
+  if (createBikeEl) {
+    createBikeEl.addEventListener("change", () => {
+      state.lobby.selectedBikeId = normalizeBikeId(createBikeEl.value);
+      render();
+    });
+  }
+
+  const joinBikeEl = document.getElementById("joinBike");
+  if (joinBikeEl) {
+    joinBikeEl.addEventListener("change", () => {
+      state.lobby.selectedBikeId = normalizeBikeId(joinBikeEl.value);
+      render();
+    });
+  }
+
+  const createRouteEl = document.getElementById("createRoute");
+  if (createRouteEl) {
+    createRouteEl.addEventListener("change", () => {
+      const selectedValue = createRouteEl.value || DEFAULT_ROUTE_PRESET.id;
+      state.lobby.selectedRouteId = selectedValue;
+      render();
+    });
+  }
+
+  const generatedRouteDistanceEl = document.getElementById("generatedRouteDistance");
+  if (generatedRouteDistanceEl) {
+    generatedRouteDistanceEl.addEventListener("change", () => {
+      state.lobby.generatedRouteDistanceKm = normalizeGeneratedRouteDistanceKm(generatedRouteDistanceEl.value);
+      render();
+    });
+  }
+
+  const generatedRouteHillinessEl = document.getElementById("generatedRouteHilliness");
+  if (generatedRouteHillinessEl) {
+    generatedRouteHillinessEl.addEventListener("change", () => {
+      state.lobby.generatedRouteHilliness = normalizeGeneratedHilliness(generatedRouteHillinessEl.value);
+      render();
+    });
+  }
+
+  const regenerateRouteBtn = document.getElementById("regenerateRouteBtn");
+  if (regenerateRouteBtn) {
+    regenerateRouteBtn.addEventListener("click", () => {
+      if (!ROUTE_GENERATOR_SERVICE?.generateRoutePreset) {
+        showToast("Route generator unavailable.");
+        return;
+      }
+      const distanceKm = normalizeGeneratedRouteDistanceKm(document.getElementById("generatedRouteDistance")?.value);
+      const hilliness = normalizeGeneratedHilliness(document.getElementById("generatedRouteHilliness")?.value);
+      const generated = generateLobbyRouteDraft(distanceKm, hilliness);
+      if (!generated) {
+        showToast("Failed to generate route.");
+        return;
+      }
+      const validation = generated._validation || validateGeneratedRoute(generated, distanceKm, hilliness);
+      if (!validation.valid) {
+        showToast(validation.errors[0] || "Generated route failed validation.");
+      } else {
+        showToast("Generated a new route preview.");
+      }
+      render();
+    });
+  }
+
+  const confirmGeneratedRouteBtn = document.getElementById("confirmGeneratedRouteBtn");
+  if (confirmGeneratedRouteBtn) {
+    confirmGeneratedRouteBtn.addEventListener("click", () => {
+      if (!ROUTE_GENERATOR_SERVICE?.generateRoutePreset) {
+        showToast("Route generator unavailable.");
+        return;
+      }
+      const distanceKm = normalizeGeneratedRouteDistanceKm(document.getElementById("generatedRouteDistance")?.value);
+      const hilliness = normalizeGeneratedHilliness(document.getElementById("generatedRouteHilliness")?.value);
+      const needsRegenerate =
+        !state.lobby.generatedRouteDraft ||
+        Math.abs((Number(state.lobby.generatedRouteDraft.distanceKm) || 0) - distanceKm) >= 0.01 ||
+        normalizeGeneratedHilliness(state.lobby.generatedRouteDraft.hillinessPreset) !== hilliness;
+      const draft = needsRegenerate ? generateLobbyRouteDraft(distanceKm, hilliness) : state.lobby.generatedRouteDraft;
+      if (!draft) {
+        showToast("No generated route to confirm.");
+        return;
+      }
+      const validation = draft._validation || validateGeneratedRoute(draft, distanceKm, hilliness);
+      if (!validation.valid) {
+        showToast(validation.errors[0] || "Generated route failed validation.");
+        return;
+      }
+      state.lobby.generatedRouteConfirmed = cloneJson(draft);
+      state.lobby.routeSelectionMode = "generated";
+      showToast("Generated route confirmed.");
+      render();
+    });
+  }
+
+  const createBtn = document.getElementById("createBtn");
+  if (createBtn) {
+    createBtn.addEventListener("click", () => {
+      const name = document.getElementById("createName").value.trim();
+      const weight = Number(document.getElementById("createWeight").value.trim());
+      const bikeId = normalizeBikeId(document.getElementById("createBike")?.value || state.lobby.selectedBikeId);
+      state.lobby.selectedBikeId = bikeId;
+      const routeSelectionMode = normalizeRouteSelectionMode(state.lobby.routeSelectionMode);
+      let routePreset = null;
+      if (routeSelectionMode === "generated") {
+        const confirmed = state.lobby.generatedRouteConfirmed ? ensureRoutePresetShape(state.lobby.generatedRouteConfirmed) : null;
+        if (!confirmed) {
+          showToast("Generate and confirm a route first.");
+          return;
+        }
+        const activeDraft = state.lobby.generatedRouteDraft ? ensureRoutePresetShape(state.lobby.generatedRouteDraft) : null;
+        const previewDiffersFromConfirmed =
+          activeDraft &&
+          activeDraft.generatedAt &&
+          confirmed.generatedAt &&
+          activeDraft.generatedAt !== confirmed.generatedAt;
+        if (previewDiffersFromConfirmed) {
+          showToast("Confirm the latest generated route before creating the session.");
+          return;
+        }
+        const settingsDrifted =
+          Math.abs((Number(confirmed.distanceKm) || 0) - normalizeGeneratedRouteDistanceKm(state.lobby.generatedRouteDistanceKm)) >= 0.01 ||
+          normalizeGeneratedHilliness(confirmed.hillinessPreset) !== normalizeGeneratedHilliness(state.lobby.generatedRouteHilliness);
+        if (settingsDrifted) {
+          showToast("Regenerate and confirm to match the current generated-route settings.");
+          return;
+        }
+        const validation =
+          confirmed._validation ||
+          validateGeneratedRoute(confirmed, state.lobby.generatedRouteDistanceKm, state.lobby.generatedRouteHilliness);
+        if (!validation.valid) {
+          showToast(validation.errors[0] || "Generated route is invalid. Regenerate and confirm again.");
+          return;
+        }
+        routePreset = confirmed;
+      } else {
+        const routeId = document.getElementById("createRoute")?.value || state.lobby.selectedRouteId || DEFAULT_ROUTE_PRESET.id;
+        routePreset = getRoutePresetById(routeId);
+        state.lobby.selectedRouteId = routeId;
+      }
+      const accountProfile = getCurrentAccountProfile();
+      const resolvedName = name || accountProfile?.displayName || "";
+      const resolvedWeight = Number.isFinite(weight) ? weight : Number.isFinite(accountProfile?.weightKg) ? accountProfile.weightKg : null;
+      const user = createUser({
+        id: state.account.userId,
+        name: resolvedName,
+        weight: resolvedWeight,
+        bikeId,
+        isHost: true,
+      });
+      const session = createSession({ hostUser: user, routePreset });
+      persistLocalSession(session.code, user.id);
+      setUser(user);
+      setSession(session);
+      initWebRTC(session.code, true);
+      state.view = "session";
+      render();
+    });
+  }
+
+  const joinBtn = document.getElementById("joinBtn");
+  if (joinBtn) {
+    joinBtn.addEventListener("click", () => {
+      const code = document.getElementById("joinCode").value.trim().toUpperCase();
+      const name = document.getElementById("joinName").value.trim();
+      const weight = Number(document.getElementById("joinWeight").value.trim());
+      const bikeId = normalizeBikeId(document.getElementById("joinBike")?.value || state.lobby.selectedBikeId);
+      state.lobby.selectedBikeId = bikeId;
+
+      if (!code) {
+        showToast("Enter a session code to join.");
+        return;
+      }
+
+      const accountProfile = getCurrentAccountProfile();
+      const resolvedName = name || accountProfile?.displayName || "";
+      const resolvedWeight = Number.isFinite(weight) ? weight : Number.isFinite(accountProfile?.weightKg) ? accountProfile.weightKg : null;
+      const user = createUser({
+        id: state.account.userId,
+        name: resolvedName,
+        weight: resolvedWeight,
+        bikeId,
+        isHost: false,
+      });
+      const result = joinSession({ code, user });
+      if (result?.error) {
+        showToast(result.error);
+        return;
+      }
+
+      // If the session exists locally, keep the original flow.
+      if (result) {
+        persistLocalSession(code, user.id);
+        setUser(user);
+        setSession(result);
+        initWebRTC(code, false);
+        state.view = "session";
+        render();
+        return;
+      }
+
+      // Cross-device path: connect to signaling server and wait for session-state.
+      setUser(user);
+      setSession(createPlaceholderSession(code, user));
+      initWebRTC(code, false, { awaitingSessionState: true });
+      state.view = "session";
+      showToast("Trying to join via signaling server...");
+      render();
+    });
+  }
+
+  const connectTrainerInlineBtn = document.getElementById("connectTrainerInline");
+  if (connectTrainerInlineBtn) {
+    connectTrainerInlineBtn.addEventListener("click", () => connectTrainer());
+  }
+
+  const connectHrmInlineBtn = document.getElementById("connectHrmInline");
+  if (connectHrmInlineBtn) {
+    connectHrmInlineBtn.addEventListener("click", () => connectHeartRateMonitor());
+  }
+
+  const disconnectTrainerInlineBtn = document.getElementById("disconnectTrainerInline");
+  if (disconnectTrainerInlineBtn) {
+    disconnectTrainerInlineBtn.addEventListener("click", () => disconnectDevice("trainer"));
+  }
+
+  const disconnectHrmInlineBtn = document.getElementById("disconnectHrmInline");
+  if (disconnectHrmInlineBtn) {
+    disconnectHrmInlineBtn.addEventListener("click", () => disconnectDevice("hrm"));
+  }
+}
+
+function renderPairing() {
+  const trainer = state.devices.trainer;
+  const hrm = state.devices.hrm;
+  const supported = isWebBluetoothSupported();
+  const returnView = state.pairingReturnView === "session" && state.session && state.user ? "session" : "lobby";
+  const backLabel = returnView === "session" ? "Back to session" : "Back to lobby";
+
+  appEl.innerHTML = `
+    <div class="card">
+      <div class="flex-space">
+        <div>
+          <h2>Pair devices</h2>
+          <div class="small">Use Bluetooth to connect a trainer and/or heart rate monitor.</div>
+        </div>
+        <button id="backFromPairing" class="secondary">${backLabel}</button>
+      </div>
+
+      ${!supported ? "<p class='small'>This browser does not support Web Bluetooth.</p>" : ""}
+
+      <div class="card" style="margin-top:12px;">
+        <h2>Trainer</h2>
+        <div class="small">${trainer.connected ? `Connected: ${trainer.name}` : "Not connected"}</div>
+        <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap;">
+          ${trainer.connected ? `<button id="disconnectTrainer" class="secondary">Disconnect</button>` : `<button id="connectTrainer">Pair trainer</button>`}
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px;">
+        <h2>Heart rate</h2>
+        <div class="small">${hrm.connected ? `Connected: ${hrm.name}` : "Not connected"}</div>
+        <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap;">
+          ${hrm.connected ? `<button id="disconnectHrm" class="secondary">Disconnect</button>` : `<button id="connectHrm">Pair HRM</button>`}
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.getElementById("backFromPairing").addEventListener("click", () => {
+    state.view = returnView;
+    render();
+  });
+
+  if (supported) {
+    const connectTrainerBtn = document.getElementById("connectTrainer");
+    if (connectTrainerBtn) {
+      connectTrainerBtn.addEventListener("click", () => connectTrainer());
+    }
+
+    const connectHrmBtn = document.getElementById("connectHrm");
+    if (connectHrmBtn) {
+      connectHrmBtn.addEventListener("click", () => connectHeartRateMonitor());
+    }
+
+    const disconnectTrainerBtn = document.getElementById("disconnectTrainer");
+    if (disconnectTrainerBtn) {
+      disconnectTrainerBtn.addEventListener("click", () => disconnectDevice("trainer"));
+    }
+
+    const disconnectHrmBtn = document.getElementById("disconnectHrm");
+    if (disconnectHrmBtn) {
+      disconnectHrmBtn.addEventListener("click", () => disconnectDevice("hrm"));
+    }
+  }
+}
+
+function renderSession() {
+  const session = getCurrentSession();
+  const user = getCurrentUser();
+  if (!session || !user) {
+    state.view = "lobby";
+    render();
+    return;
+  }
+  normalizeSessionCourse(session);
+  user.bikeId = normalizeBikeId(user.bikeId);
+
+  const now = currentMs();
+  const startedAt = session.startedAt;
+  const durationSec = startedAt ? Math.round((now - startedAt) / 1000) : 0;
+  const timerLabel = startedAt ? formatDuration(durationSec) : "00:00";
+
+  const users = Object.values(session.users || {});
+
+  const telemetry = session.telemetry || {};
+
+  const connectedPeers = Object.values(state.webrtc.peers).filter((p) => p.connected).length;
+  let webrtcStatus = "WebRTC not supported";
+  if (state.webrtc.enabled) {
+    if (state.webrtc.useLocalStorage) {
+      webrtcStatus = `${connectedPeers} peer${connectedPeers === 1 ? "" : "s"} connected (localStorage)`;
+    } else if (state.webrtc.wsConnected) {
+      webrtcStatus = `${connectedPeers} peer${connectedPeers === 1 ? "" : "s"} connected (signaling)`;
+    } else {
+      webrtcStatus = `connecting signaling...`;
+    }
+  }
+
+  const rows = users
+    .map((u) => {
+      const t = telemetry[u.id] || {};
+      const distance = t.distance || 0;
+      const climbMeters = Number(session.aggregates?.[u.id]?.totalClimb) || 0;
+      const wkg = computeWkg(t.power, u.weight);
+      const isMe = user.id === u.id;
+      const gradeFromDistance = getCourseGradeContext(distance, getCourseSegments(session)).currentGrade;
+      return {
+        ...u,
+        power: t.power || 0,
+        heartRate: t.heartRate || 0,
+        cadence: t.cadence || 0,
+        activePowerUp: t.activePowerUp || null,
+        distance,
+        climbMeters,
+        grade: Number.isFinite(t.grade) ? t.grade : gradeFromDistance,
+        wkg,
+        isMe,
+      };
+    })
+    .sort((a, b) => b.distance - a.distance);
+  const currentRider = rows.find((row) => row.id === user.id) || rows[0] || null;
+  const currentDistanceMeters = currentRider ? currentRider.distance : 0;
+  const sessionRoute = getSessionRoute(session);
+  const routeDistanceMeters = normalizeCourseDistance(currentDistanceMeters, getCourseSegments(session));
+  const currentElevationMeters = getElevationAtDistance(sessionRoute, routeDistanceMeters);
+  const next500mGradient = getAverageGradientAhead(sessionRoute, routeDistanceMeters, 500);
+  const remainingDistanceMeters = getRemainingDistance(sessionRoute, routeDistanceMeters);
+  const remainingClimbMeters = getRemainingClimb(sessionRoute, routeDistanceMeters);
+  const routeDistanceKm = Number.isFinite(Number(sessionRoute.distanceKm))
+    ? Number(sessionRoute.distanceKm)
+    : (Number(sessionRoute.totalDistanceMeters) || 0) / 1000;
+  const routeProfile = buildRouteProfileFromSegments(getCourseSegments(session));
+  const elevationProfileHtml = renderElevationProfile({
+    routeProfile,
+    distanceTraveledMeters: currentDistanceMeters,
+    width: 560,
+    height: 120,
+  });
+
+  const telemetryZoneParticipants = rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    heartRate: row.heartRate,
+    watts: row.power,
+  }));
+  const hasLiveTelemetry = telemetryZoneParticipants.some((participant) => participant.heartRate > 0 || participant.watts > 0);
+  const zoneParticipants = hasLiveTelemetry ? telemetryZoneParticipants : getMockTelemetryParticipants();
+  const zoneStatusLabel = hasLiveTelemetry
+    ? "Live values. Colors only: green (low), yellow (medium), red (high)."
+    : "No live values yet. Showing mock participant data for testing.";
+  const terrain = state.simulation.terrain;
+  const gradientScalePct = Math.round(clamp(state.simulation.gradientScale, 0, 1) * 100);
+  const currentGradeText = formatSignedPercent(terrain.currentGrade, 1);
+  const effectiveGradeText = formatSignedPercent(terrain.effectiveGrade, 1);
+  const nextGradeText = formatSignedPercent(terrain.nextGrade, 1);
+  const distanceToNextText =
+    terrain.distanceToNext == null || Number.isNaN(terrain.distanceToNext) ? "--" : `${Math.max(0, Math.round(terrain.distanceToNext))}m`;
+  const routeLength = getCourseLengthMeters(getCourseSegments(session));
+  const routeDistanceText = `${Math.round(terrain.routeDistance || 0)}m / ${Math.round(routeLength)}m`;
+  const sessionClimbedText = formatClimbedMeters(session.totalClimbedMeters || 0);
+  const privateRiderStats = getPrivateRiderStatsSnapshot(session, user);
+  const sessionAvgWattsText = Number.isFinite(privateRiderStats.avgWatts) ? `${Math.round(privateRiderStats.avgWatts)} W` : "--";
+  const privateSpeedText = formatSpeedMpsAsKph(privateRiderStats.speedMps);
+  const currentBike = getBikeById(user.bikeId);
+  const sessionBikeOptionsHtml = buildBikeOptionsHtml(currentBike.id);
+  const bikeSwitchAllowed = !isSessionRunning() || canSwitchBikeAtSpeed(privateRiderStats.speedMps);
+  const bikeSwitchReason = bikeSwitchAllowed
+    ? "Bike can be changed now."
+    : `Slow to ${BIKE_SWITCH_SPEED_LIMIT_KPH.toFixed(1)} km/h or less to change bikes during a ride.`;
+  const powerUpState = ensurePowerUpContext(session, user);
+  const activePowerUp = getActivePowerUp(powerUpState, now);
+  const canActivatePowerUp = powerUpState.powerUpQueue.length > 0 && !activePowerUp;
+  const activePowerUpText = formatActivePowerUpLabel(activePowerUp, now);
+  const powerUpSlotsHtml = Array.from({ length: POWER_UP_QUEUE_MAX }, (_, index) => {
+    const queued = powerUpState.powerUpQueue[index];
+    return `<div class="powerup-slot ${queued ? "filled" : ""}">${queued ? escapeHtml(queued.label) : "EMPTY"}</div>`;
+  }).join("");
+  const privatePeakRows = PRIVATE_RIDER_PEAK_WINDOWS.map((windowDef) => {
+    const peakValue = privateRiderStats.bestRollingWatts?.[windowDef.seconds];
+    return `
+      <tr>
+        <td>${windowDef.label}</td>
+        <td>${Number.isFinite(peakValue) ? `${Math.round(peakValue)} W` : "--"}</td>
+      </tr>
+    `;
+  }).join("");
+
+  appEl.innerHTML = `
+    <div class="card">
+      <div class="flex-space">
+        <div>
+          <h2>Session <span class="code">${session.code}</span></h2>
+          <div class="small">${session.users ? Object.keys(session.users).length : 0} rider(s)</div>
+          <div class="small">${escapeHtml(sessionRoute.name || "Route")} (${escapeHtml(sessionRoute.country || "Unknown")}) • ${routeDistanceKm.toFixed(1)} km</div>
+        </div>
+        <div class="flex" style="align-items:center; gap:12px;">
+          <div class="small">Timer</div>
+          <div class="code">${timerLabel}</div>
+          <button id="leaveBtn" class="secondary">Leave</button>
+        </div>
+      </div>
+
+      <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap;">
+        <div style="flex:1; min-width:220px;">
+          <label class="label">Your role</label>
+          <div class="code">${user.isHost ? "Host" : "Guest"}</div>
+        </div>
+        <div style="flex:1; min-width:220px;">
+          <label class="label">Your name</label>
+          <div class="code">${user.name}</div>
+        </div>
+        <div style="flex:1; min-width:220px;">
+          <label class="label">Your weight</label>
+          <div class="code">${user.weight ? `${user.weight} kg` : "--"}</div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+        <button id="copyCodeBtn" class="secondary">Copy code</button>
+        <button id="pairSessionBtn" class="secondary">Pair devices</button>
+        ${canStartSession() ? `<button id="startBtn">Start session</button>` : ""}
+        ${isSessionRunning() && user.isHost ? `<button id="endBtn" class="danger">End session</button>` : ""}
+        <div class="small" style="margin-left:auto;">${isSessionRunning() ? "Running" : session.endedAt ? "Ended" : "Waiting"}</div>
+      </div>
+
+      <div class="small" style="margin-top:8px;">
+        Trainer: ${state.devices.trainer.connected ? state.devices.trainer.name : "Not connected"} | HR: ${state.devices.hrm.connected ? state.devices.hrm.name : "Not connected"}
+      </div>
+      <div class="small" style="margin-top:4px;">WebRTC: ${webrtcStatus}</div>
+
+      <div class="terrain-panel" style="margin-top:12px;">
+        <div class="terrain-grid">
+          <div>
+            <div class="small">Current grade</div>
+            <div class="grade-readout ${getGradeColorClass(terrain.currentGrade)}">${currentGradeText}</div>
+          </div>
+          <div>
+            <div class="small">Effective grade</div>
+            <div class="grade-readout ${getGradeColorClass(terrain.effectiveGrade)}">${effectiveGradeText}</div>
+          </div>
+          <div>
+            <div class="small">Lookahead</div>
+            <div class="grade-next">${nextGradeText} in ${distanceToNextText}</div>
+          </div>
+          <div>
+            <div class="small">Resistance feel</div>
+            <div class="resistance-readout ${getResistanceFeelClass(terrain.resistanceLabel)}">
+              ${terrain.resistanceLabel || "--"} (${Math.round(terrain.resistancePercent || 0)}%)
+            </div>
+          </div>
+        </div>
+        <div class="small" style="margin-top:8px;">Route position: ${routeDistanceText}</div>
+        <div class="small" style="margin-top:2px;">
+          Elevation: ${Math.round(currentElevationMeters)}m | Next 500m: ${formatSignedPercent(next500mGradient, 1)} | Remaining: ${formatDistanceKmFloor(
+            remainingDistanceMeters,
+          )} / ${Math.round(remainingClimbMeters)}m climb
+        </div>
+        <div class="small" style="margin-top:2px;">${sessionClimbedText}</div>
+        <div class="small" style="margin-top:2px;">Trainer control: ${escapeHtml(terrain.trainerControlStatus || "--")}</div>
+        <div style="margin-top:10px;">
+          <label class="label" for="gradientScaleRange">Gradient scale (${gradientScalePct}%)</label>
+          <input id="gradientScaleRange" type="range" min="0" max="100" step="5" value="${gradientScalePct}" />
+        </div>
+      </div>
+
+      <div class="elevation-profile-card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">Route Side View</h2>
+        <div class="small">Live progress along the route elevation profile.</div>
+        ${elevationProfileHtml}
+      </div>
+
+      <div class="card private-rider-stats-card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">Your Private Rider Stats</h2>
+        <div class="small">Visible only to you. Refreshed every 5 seconds.</div>
+        <div class="flex" style="margin-top:10px; gap:12px; flex-wrap:wrap;">
+          <div style="flex:1;min-width:180px;">
+            <label class="label">Session average power</label>
+            <div class="code">${sessionAvgWattsText}</div>
+          </div>
+          <div style="flex:1;min-width:180px;">
+            <label class="label">Current speed</label>
+            <div class="code">${privateSpeedText}</div>
+          </div>
+        </div>
+        <table class="table" style="margin-top:12px;">
+          <thead>
+            <tr>
+              <th>Peak Window</th>
+              <th>Best Avg Watts</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${privatePeakRows}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="bike-choice-card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">Bike Selection</h2>
+        <div class="small">Choose your bike before a ride, or during a ride only at low speed.</div>
+        <div class="flex" style="gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:10px;">
+          <div style="flex:1;min-width:240px;">
+            <label class="label">Current bike</label>
+            <select id="sessionBikeSelect">${sessionBikeOptionsHtml}</select>
+          </div>
+          <div>
+            <button id="applySessionBikeBtn" class="secondary" ${bikeSwitchAllowed ? "" : "disabled"}>Apply Bike</button>
+          </div>
+        </div>
+        <div class="small" style="margin-top:8px;">${escapeHtml(bikeSwitchReason)}</div>
+        <div class="small" style="margin-top:8px;"><strong>${escapeHtml(currentBike.name)}</strong> - ${escapeHtml(currentBike.description)}</div>
+        <div class="small" style="margin-top:2px;">Pros: ${escapeHtml(currentBike.pros)}</div>
+        <div class="small" style="margin-top:2px;">Cons: ${escapeHtml(currentBike.cons)}</div>
+      </div>
+
+      <div class="card powerup-card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">Power-Ups</h2>
+        <div class="small">Gain 1 BOOST every ${Math.round(POWER_UP_GRANT_DISTANCE_METERS / 1000)} km. Queue is FIFO (left slot is used first).</div>
+        <div class="powerup-slots" style="margin-top:10px;">
+          ${powerUpSlotsHtml}
+        </div>
+        <div class="small" style="margin-top:8px;">Active: ${escapeHtml(activePowerUpText)}</div>
+        <div style="margin-top:10px;">
+          <button id="activatePowerUpBtn" ${canActivatePowerUp ? "" : "disabled"}>Activate Next Power-Up</button>
+        </div>
+        <div class="small" style="margin-top:8px;">Other riders can see active usage only, not your inventory.</div>
+      </div>
+
+      <div style="margin-top:18px;">
+        <h2 style="margin-bottom:8px;">Participant Telemetry Zones (MVP)</h2>
+        <div class="small">${zoneStatusLabel}</div>
+        <div class="telemetry-zone-grid telemetry-zone-header" style="margin-top:10px;">
+          <div>Participant</div>
+          <div>Heart Rate</div>
+          <div>Watts</div>
+        </div>
+        <div class="telemetry-zone-list">
+          ${renderTelemetryZoneRows(zoneParticipants)}
+        </div>
+      </div>
+
+      <table class="table" style="margin-top: 16px;">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Watts</th>
+            <th>W/kg</th>
+            <th>HR</th>
+            <th>Grade</th>
+            <th>Power-Up</th>
+            <th>Distance / Climb</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (row) => `
+            <tr class="${row.isMe ? "highlight" : ""}">
+              <td>${row.name}</td>
+              <td>${row.power ? `${row.power}W` : "--"}</td>
+              <td>${row.wkg ? formatNumber(row.wkg, 1) : "--"}</td>
+              <td>${row.heartRate ? `${row.heartRate} bpm` : "--"}</td>
+              <td><span class="grade-chip ${getGradeColorClass(row.grade)}">${formatSignedPercent(row.grade, 1)}</span></td>
+              <td>${escapeHtml(formatActivePowerUpLabel(row.activePowerUp, now))}</td>
+              <td>${formatDistanceKmFloor(row.distance)} | ${Math.round(row.climbMeters)} m climbed</td>
+            </tr>
+          `,
+            )
+            .join("")}
+        </tbody>
+      </table>
+
+      <div class="small" style="margin-top: 16px;">
+        <strong>Note:</strong> This demo uses mock telemetry and WebSocket signaling (with localStorage fallback).
+      </div>
+    </div>
+  `;
+
+  document.getElementById("leaveBtn").addEventListener("click", () => {
+    leaveSession();
+  });
+
+  const copyBtn = document.getElementById("copyCodeBtn");
+  copyBtn.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(session.code);
+      showToast("Code copied");
+    } catch {
+      showToast("Copy failed");
+    }
+  });
+
+  document.getElementById("pairSessionBtn").addEventListener("click", () => {
+    openPairing("session");
+  });
+
+  const activatePowerUpBtn = document.getElementById("activatePowerUpBtn");
+  if (activatePowerUpBtn) {
+    activatePowerUpBtn.addEventListener("click", () => {
+      const powerUpRuntime = ensurePowerUpContext(session, user);
+      const activation = useNextPowerUp(powerUpRuntime, currentMs());
+      if (!activation.ok) {
+        showToast(activation.error || "Could not activate power-up.");
+        render();
+        return;
+      }
+      showToast(`${activation.powerUp.label} activated for ${Math.round(activation.powerUp.durationMs / 1000)}s.`);
+      render();
+    });
+  }
+
+  const applySessionBikeBtn = document.getElementById("applySessionBikeBtn");
+  if (applySessionBikeBtn) {
+    applySessionBikeBtn.addEventListener("click", () => {
+      const nextBikeId = normalizeBikeId(document.getElementById("sessionBikeSelect")?.value || user.bikeId);
+      const latestPrivateStats = getPrivateRiderStatsSnapshot(session, user);
+      const canSwitchNow = !isSessionRunning() || canSwitchBikeAtSpeed(latestPrivateStats.speedMps);
+      if (!canSwitchNow) {
+        showToast(`Bike can only be changed at ${BIKE_SWITCH_SPEED_LIMIT_KPH.toFixed(1)} km/h or less.`);
+        render();
+        return;
+      }
+      if (normalizeBikeId(user.bikeId) === nextBikeId) {
+        showToast("Bike already selected.");
+        return;
+      }
+
+      state.user = {
+        ...state.user,
+        bikeId: nextBikeId,
+      };
+      state.lobby.selectedBikeId = nextBikeId;
+      updateSessionOnStorage((sessionState) => {
+        sessionState.users = sessionState.users || {};
+        const existingUser = sessionState.users[user.id] || {};
+        sessionState.users[user.id] = {
+          id: user.id,
+          name: existingUser.name || user.name,
+          weight: existingUser.weight ?? user.weight ?? null,
+          bikeId: nextBikeId,
+        };
+      });
+      showToast(`${getBikeById(nextBikeId).name} selected.`);
+    });
+  }
+
+  const gradientScaleRange = document.getElementById("gradientScaleRange");
+  if (gradientScaleRange) {
+    const applyScale = () => {
+      const next = Number(gradientScaleRange.value);
+      state.simulation.gradientScale = clamp(next / 100, 0, 1);
+    };
+    gradientScaleRange.addEventListener("input", applyScale);
+    gradientScaleRange.addEventListener("change", () => {
+      applyScale();
+      render();
+    });
+  }
+
+  if (canStartSession()) {
+    document.getElementById("startBtn").addEventListener("click", () => {
+      startSession();
+    });
+  }
+
+  if (isSessionRunning() && user.isHost) {
+    document.getElementById("endBtn").addEventListener("click", () => {
+      endSession();
+    });
+  }
+}
+
+function renderSummary() {
+  const session = getCurrentSession();
+  if (!session) {
+    state.view = "lobby";
+    render();
+    return;
+  }
+
+  const summaries = loadSummaries();
+  const selected = summaries.find((s) => s.code === session.code);
+  if (!selected) {
+    // If we don't have a saved summary, attempt to compute from the live session data
+    const computed = computeSessionSummary();
+    if (computed) {
+      renderSummaryFromData(computed);
+      return;
+    }
+    state.view = "lobby";
+    render();
+    return;
+  }
+
+  renderSummaryFromData(selected);
+}
+
+function renderSummaryFromData(summary) {
+  const rows = summary.participants
+    .map((u) => {
+      return `
+        <tr>
+          <td>${u.name}</td>
+          <td>${u.maxPower ? `${Math.round(u.maxPower)}W` : "--"}</td>
+          <td>${u.avgPower ? `${Math.round(u.avgPower)}W` : "--"}</td>
+          <td>${u.avgHeartRate ? `${Math.round(u.avgHeartRate)} bpm` : "--"}</td>
+          <td>${formatDistanceKmFloor(u.totalDistance)}</td>
+          <td>${Number.isFinite(u.totalClimbMeters) && u.totalClimbMeters >= 0 ? `${Math.round(u.totalClimbMeters)} m` : "--"}</td>
+        </tr>
+      `;
+    })
+    .join("");
+  const viewerProfileId = state.account.userId || state.user?.id || null;
+  const viewerXpAward = viewerProfileId && summary?.xpAwards ? summary.xpAwards[viewerProfileId] : null;
+  const xpSummaryHtml = viewerXpAward
+    ? `
+      <div class="card" style="margin-top:14px;">
+        <h2>Experience Earned</h2>
+        <div class="small"><strong>+${formatNumber(viewerXpAward.earnedXp, 0)} XP</strong> this session</div>
+        <div class="small" style="margin-top:8px;">Time ridden: +${formatNumber(viewerXpAward.breakdown?.durationXp || 0, 0)} XP</div>
+        <div class="small">Distance: +${formatNumber(viewerXpAward.breakdown?.distanceXp || 0, 0)} XP</div>
+        <div class="small">Climb: +${formatNumber(viewerXpAward.breakdown?.climbXp || 0, 0)} XP</div>
+        <div class="small" style="margin-top:8px;">
+          Level ${viewerXpAward.beforeLevel} -> Level ${viewerXpAward.afterLevel}
+          ${
+            viewerXpAward.levelsGained > 0
+              ? `(+${viewerXpAward.levelsGained} level${viewerXpAward.levelsGained === 1 ? "" : "s"})`
+              : ""
+          }
+        </div>
+      </div>
+    `
+    : `
+      <div class="card" style="margin-top:14px;">
+        <h2>Experience Earned</h2>
+        <div class="small">No XP summary is available for this session/user.</div>
+      </div>
+    `;
+
+  appEl.innerHTML = `
+    <div class="card">
+      <div class="flex-space">
+        <div>
+          <h2>Session summary <span class="code">${summary.code}</span></h2>
+          <div class="small">Duration: ${formatDuration(summary.durationSec)}</div>
+          <div class="small">${formatClimbedMeters(summary.totalClimbedMeters)}</div>
+        </div>
+        <button id="backBtn" class="secondary">Back to lobby</button>
+      </div>
+
+      ${xpSummaryHtml}
+
+      <table class="table" style="margin-top:16px;">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Max power</th>
+            <th>Avg power</th>
+            <th>Avg HR</th>
+            <th>Distance (KM)</th>
+            <th>Climb (m)</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+    </div>
+  `;
+
+  document.getElementById("backBtn").addEventListener("click", () => {
+    state.view = "lobby";
+    resetPrivateRiderStats();
+    resetPowerUpState();
+    state.session = null;
+    state.user = null;
+    clearLocalSession();
+    render();
+  });
+}
+
+function loadExistingSession() {
+  const saved = loadLocalSession();
+  if (!saved.code || !saved.userId) return false;
+
+  const session = loadSessionFromStorage(saved.code);
+  if (!session) return false;
+  const userRecord = session.users?.[saved.userId];
+  if (!userRecord) return false;
+  normalizeSessionCourse(session);
+  if (!Number.isFinite(session.totalClimbedMeters)) {
+    session.totalClimbedMeters = 0;
+  }
+  saveSessionToStorage(session);
+
+  state.session = session;
+  state.user = { ...userRecord, id: userRecord.id, bikeId: normalizeBikeId(userRecord.bikeId), isHost: saved.userId === session.hostId };
+  state.view = "session";
+  initWebRTC(session.code, state.user.isHost);
+  return true;
+}
+
+function startLoop() {
+  if (state.timer) return;
+  state.lastTick = currentMs();
+
+  const step = () => {
+    const session = getCurrentSession();
+    if (session && isSessionRunning()) {
+      pollTelemetry();
+    }
+
+    if (state.view === "session") {
+      render();
+    }
+
+    state.timer = window.setTimeout(step, 1000);
+  };
+
+  step();
+}
+
+function init() {
+  window.addEventListener("storage", syncSessionFromStorage);
+  restoreAuthSession();
+  const progressionValidation = validateProgressionMath();
+  if (!progressionValidation.valid) {
+    console.warn("Progression validation issues:", progressionValidation.issues);
+  }
+
+  if (!loadExistingSession()) {
+    state.view = "lobby";
+  }
+
+  render();
+  startLoop();
+}
+
+init();
+
+

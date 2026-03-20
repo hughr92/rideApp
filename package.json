@@ -1,0 +1,13 @@
+{
+  "name": "ridesync-signaling",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal WebSocket signaling server for RideSync WebRTC demo.",
+  "main": "signaling-server.js",
+  "scripts": {
+    "start": "node signaling-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.13.0"
+  }
+}

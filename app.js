@@ -78,6 +78,21 @@ const LEVEL_CURVE_CONFIG = Object.freeze({
 const POWER_UP_GRANT_DISTANCE_METERS = 1000;
 const POWER_UP_QUEUE_MAX = 2;
 const POWER_UP_TYPE_SPEED_BOOST = "speed_boost";
+const FTP_MIN_WATTS = 50;
+const FTP_MAX_WATTS = 600;
+const MAX_SESSION_BOTS = 3;
+const BOT_DEFAULT_WEIGHT_KG = 75;
+const BOT_DIFFICULTY_LEVELS = Object.freeze([
+  Object.freeze({ level: 1, label: "Level 1", ftpWatts: 120 }),
+  Object.freeze({ level: 2, label: "Level 2", ftpWatts: 140 }),
+  Object.freeze({ level: 3, label: "Level 3", ftpWatts: 160 }),
+  Object.freeze({ level: 4, label: "Level 4", ftpWatts: 180 }),
+  Object.freeze({ level: 5, label: "Level 5", ftpWatts: 200 }),
+  Object.freeze({ level: 6, label: "Level 6", ftpWatts: 230 }),
+  Object.freeze({ level: 7, label: "Level 7", ftpWatts: 260 }),
+  Object.freeze({ level: 8, label: "Level 8", ftpWatts: 300 }),
+  Object.freeze({ level: 9, label: "Level 9", ftpWatts: 340 }),
+]);
 const POWER_UP_TYPES = Object.freeze({
   [POWER_UP_TYPE_SPEED_BOOST]: Object.freeze({
     type: POWER_UP_TYPE_SPEED_BOOST,
@@ -86,6 +101,27 @@ const POWER_UP_TYPES = Object.freeze({
     speedMultiplier: 1.05,
   }),
 });
+const SIDE_SCROLL_VISIBLE_WINDOW_METERS = 100;
+const SIDE_SCROLL_SVG_WIDTH = 760;
+const SIDE_SCROLL_SVG_HEIGHT = 220;
+const SIDE_SCROLL_TERRAIN_SAMPLE_COUNT = 96;
+const TELEMETRY_POLL_INTERVAL_MS = 1000;
+const SIDE_SCROLL_RENDER_TARGET_FPS = 24;
+const SIDE_SCROLL_RENDER_INTERVAL_MS = Math.round(1000 / SIDE_SCROLL_RENDER_TARGET_FPS);
+const SIDE_SCROLL_MAX_EXTRAPOLATION_MS = 1400;
+const SIDE_SCROLL_HORIZON_Y_RATIO = 0.72;
+const SIDE_SCROLL_TERRAIN_TOP_RATIO = 0.7;
+const SIDE_SCROLL_TERRAIN_BOTTOM_MARGIN_PX = 12;
+const SIDE_SCROLL_RIDER_ACCENTS = Object.freeze([
+  "#4dd2ff",
+  "#ffd166",
+  "#95e06c",
+  "#ff8aa7",
+  "#ffb36b",
+  "#78d2b6",
+  "#b9a0ff",
+  "#84a9ff",
+]);
 
 // Progression math is kept centralized so balancing can be tuned in one place.
 function normalizeXpValue(value) {
@@ -157,11 +193,52 @@ function getProgressToNextLevel(totalXpInput) {
   };
 }
 
+function validateFtp(valueInput, { allowNull = true } = {}) {
+  if (valueInput == null || valueInput === "") {
+    return allowNull ? { valid: true, value: null } : { valid: false, error: "FTP is required." };
+  }
+  const parsed = Number(valueInput);
+  if (!Number.isFinite(parsed)) {
+    return { valid: false, error: "FTP must be a number." };
+  }
+  if (parsed <= 0) {
+    return { valid: false, error: "FTP must be greater than 0." };
+  }
+  const rounded = Math.round(parsed);
+  if (rounded < FTP_MIN_WATTS || rounded > FTP_MAX_WATTS) {
+    return { valid: false, error: `FTP must be between ${FTP_MIN_WATTS} and ${FTP_MAX_WATTS} W.` };
+  }
+  return { valid: true, value: rounded };
+}
+
+function getUserFtp(profileInput) {
+  const profile = profileInput && typeof profileInput === "object" ? profileInput : {};
+  const validation = validateFtp(profile.ftpWatts, { allowNull: true });
+  return validation.valid ? validation.value : null;
+}
+
+function updateUserFtp(profileInput, ftpWattsInput, updatedAtMs = currentMs()) {
+  const profile = profileInput && typeof profileInput === "object" ? profileInput : {};
+  const validation = validateFtp(ftpWattsInput, { allowNull: true });
+  if (!validation.valid) {
+    return { ok: false, error: validation.error, profile };
+  }
+  return {
+    ok: true,
+    profile: {
+      ...profile,
+      ftpWatts: validation.value,
+      updatedAt: updatedAtMs,
+    },
+  };
+}
+
 function withProfileProgression(profileInput) {
   const profile = profileInput && typeof profileInput === "object" ? profileInput : {};
   const progression = getProgressToNextLevel(profile.totalXp);
   return {
     ...profile,
+    ftpWatts: getUserFtp(profile),
     currentLevel: progression.currentLevel,
     currentXp: progression.currentXp,
     totalXp: progression.totalXp,
@@ -284,6 +361,15 @@ function createEmptyPowerUpState(sessionCode = null, userId = null) {
   };
 }
 
+function createEmptyFtpProposalState(sessionCode = null, userId = null) {
+  return {
+    sessionCode,
+    userId,
+    pendingProposal: null,
+    lastDeclinedCandidateWatts: null,
+  };
+}
+
 let state = {
   view: "lobby", // "lobby" | "session" | "summary" | "pairing"
   pairingReturnView: "lobby",
@@ -297,6 +383,7 @@ let state = {
     selectedRouteId: null,
     routeSelectionMode: "preset",
     selectedBikeId: DEFAULT_BIKE_ID,
+    botDrafts: [],
     activeSection: null,
     generatedRouteDraft: null,
     generatedRouteConfirmed: null,
@@ -359,8 +446,13 @@ let state = {
       trainerControlStatus: "No trainer",
     },
   },
+  visualLoop: {
+    sideScrollRafId: null,
+    lastSideScrollFrameAt: 0,
+  },
   privateRiderStats: createEmptyPrivateRiderStats(),
   powerUps: createEmptyPowerUpState(),
+  ftp: createEmptyFtpProposalState(),
 };
 
 function makeId(len = 6) {
@@ -545,6 +637,7 @@ function buildDefaultProfile({ id, email }) {
     heightInches: null,
     weightKg: null,
     heightCm: null,
+    ftpWatts: null,
     profilePhotoUrl: "",
     createdAt: now,
     updatedAt: now,
@@ -572,6 +665,7 @@ function clearAuthenticatedUser() {
   state.account.showProfileEditor = false;
   state.account.showFriendsPanel = false;
   state.account.friendSearchQuery = "";
+  resetFtpProposalState();
   localStorage.removeItem(AUTH_SESSION_KEY);
 }
 
@@ -648,8 +742,10 @@ function updateProfile(profileUpdate) {
   const heightCmInput = profileUpdate.heightCm === "" ? null : Number(profileUpdate.heightCm);
   const heightFeetInput = profileUpdate.heightFeet === "" ? null : Number(profileUpdate.heightFeet);
   const heightInchesInput = profileUpdate.heightInches === "" ? null : Number(profileUpdate.heightInches);
+  const ftpInput = profileUpdate.ftpWatts ?? "";
   const weightUnit = profileUpdate.weightUnit === "lb" ? "lb" : "kg";
   const heightUnit = profileUpdate.heightUnit === "ft_in" ? "ft_in" : "cm";
+  const ftpValidation = validateFtp(ftpInput, { allowNull: true });
 
   if (displayName.length < 2 || displayName.length > 24) {
     return { error: "Display name must be 2-24 characters." };
@@ -659,6 +755,9 @@ function updateProfile(profileUpdate) {
   }
   if (weight != null && (!Number.isFinite(weight) || weight <= 0)) {
     return { error: "Weight must be greater than 0." };
+  }
+  if (!ftpValidation.valid) {
+    return { error: ftpValidation.error };
   }
 
   let height = null;
@@ -705,6 +804,7 @@ function updateProfile(profileUpdate) {
     heightInches,
     weightKg,
     heightCm,
+    ftpWatts: ftpValidation.value,
     updatedAt: currentMs(),
   });
   saveProfiles(profiles);
@@ -950,6 +1050,171 @@ function canSwitchBikeAtSpeed(speedMps) {
   const speedKph = Number(speedMps) * 3.6;
   if (!Number.isFinite(speedKph) || speedKph < 0) return true;
   return speedKph <= BIKE_SWITCH_SPEED_LIMIT_KPH;
+}
+
+function normalizeBotDifficultyLevel(levelInput) {
+  const level = Math.round(Number(levelInput));
+  if (!Number.isFinite(level)) return BOT_DIFFICULTY_LEVELS[0].level;
+  return clamp(level, BOT_DIFFICULTY_LEVELS[0].level, BOT_DIFFICULTY_LEVELS[BOT_DIFFICULTY_LEVELS.length - 1].level);
+}
+
+function getBotDifficultyConfig(levelInput) {
+  const normalizedLevel = normalizeBotDifficultyLevel(levelInput);
+  return BOT_DIFFICULTY_LEVELS.find((entry) => entry.level === normalizedLevel) || BOT_DIFFICULTY_LEVELS[0];
+}
+
+function buildBotDifficultyOptionsHtml(selectedLevelInput) {
+  const selectedLevel = normalizeBotDifficultyLevel(selectedLevelInput);
+  return BOT_DIFFICULTY_LEVELS.map(
+    (entry) =>
+      `<option value="${entry.level}" ${entry.level === selectedLevel ? "selected" : ""}>${escapeHtml(entry.label)} - ${entry.ftpWatts} W FTP</option>`,
+  ).join("");
+}
+
+function createBotDraft(index, difficultyLevelInput = 4) {
+  const difficulty = getBotDifficultyConfig(difficultyLevelInput);
+  const safeIndex = Math.max(1, Number(index) || 1);
+  return {
+    id: `bot_draft_${safeIndex}_${makeId(4)}`.toLowerCase(),
+    name: `Bot ${safeIndex}`,
+    difficultyLevel: difficulty.level,
+    ftpWatts: difficulty.ftpWatts,
+  };
+}
+
+function normalizeBotDrafts(draftsInput) {
+  const drafts = Array.isArray(draftsInput) ? draftsInput : [];
+  return drafts
+    .slice(0, MAX_SESSION_BOTS)
+    .map((draft, index) => {
+      const difficulty = getBotDifficultyConfig(draft?.difficultyLevel);
+      return {
+        id: String(draft?.id || `bot_draft_${index + 1}_${makeId(3)}`).toLowerCase(),
+        name: String(draft?.name || `Bot ${index + 1}`),
+        difficultyLevel: difficulty.level,
+        ftpWatts: difficulty.ftpWatts,
+      };
+    });
+}
+
+function getNextBotName(draftsInput) {
+  const drafts = Array.isArray(draftsInput) ? draftsInput : [];
+  for (let index = 1; index <= MAX_SESSION_BOTS; index += 1) {
+    const candidate = `Bot ${index}`;
+    if (!drafts.some((draft) => String(draft?.name || "").toLowerCase() === candidate.toLowerCase())) {
+      return candidate;
+    }
+  }
+  return `Bot ${drafts.length + 1}`;
+}
+
+function addBotDraft(difficultyLevelInput = 4) {
+  const currentDrafts = normalizeBotDrafts(state.lobby.botDrafts);
+  if (currentDrafts.length >= MAX_SESSION_BOTS) {
+    return { ok: false, error: `You can add up to ${MAX_SESSION_BOTS} bots.` };
+  }
+  const difficulty = getBotDifficultyConfig(difficultyLevelInput);
+  const next = createBotDraft(currentDrafts.length + 1, difficulty.level);
+  next.name = getNextBotName(currentDrafts);
+  state.lobby.botDrafts = [...currentDrafts, next];
+  return { ok: true, bot: next };
+}
+
+function removeBotDraft(botDraftId) {
+  const currentDrafts = normalizeBotDrafts(state.lobby.botDrafts);
+  const nextDrafts = currentDrafts.filter((draft) => draft.id !== botDraftId);
+  if (nextDrafts.length === currentDrafts.length) {
+    return { ok: false, error: "Bot not found." };
+  }
+  state.lobby.botDrafts = nextDrafts;
+  return { ok: true };
+}
+
+function updateBotDraftDifficulty(botDraftId, difficultyLevelInput) {
+  const difficulty = getBotDifficultyConfig(difficultyLevelInput);
+  let updated = false;
+  state.lobby.botDrafts = normalizeBotDrafts(state.lobby.botDrafts).map((draft) => {
+    if (draft.id !== botDraftId) return draft;
+    updated = true;
+    return {
+      ...draft,
+      difficultyLevel: difficulty.level,
+      ftpWatts: difficulty.ftpWatts,
+    };
+  });
+  return updated ? { ok: true } : { ok: false, error: "Bot not found." };
+}
+
+function createBotRider(botDraftInput, index) {
+  const draft = botDraftInput && typeof botDraftInput === "object" ? botDraftInput : {};
+  const difficulty = getBotDifficultyConfig(draft.difficultyLevel);
+  const safeName = String(draft.name || `Bot ${index + 1}`).trim() || `Bot ${index + 1}`;
+  return {
+    id: String(draft.id || `bot_${makeId(8)}`).toLowerCase(),
+    name: safeName,
+    weight: BOT_DEFAULT_WEIGHT_KG,
+    bikeId: DEFAULT_BIKE_ID,
+    isBot: true,
+    difficultyLevel: difficulty.level,
+    ftpWatts: difficulty.ftpWatts,
+  };
+}
+
+function addBotToSession(session, botInput) {
+  const sessionState = session && typeof session === "object" ? session : null;
+  if (!sessionState) return { ok: false, error: "Session unavailable." };
+  if (!sessionState.users) sessionState.users = {};
+  const existingBots = Object.values(sessionState.users).filter((participant) => participant?.isBot);
+  if (existingBots.length >= MAX_SESSION_BOTS) {
+    return { ok: false, error: `You can add up to ${MAX_SESSION_BOTS} bots.` };
+  }
+
+  const bot = createBotRider(botInput, existingBots.length);
+  sessionState.users[bot.id] = bot;
+  sessionState.telemetry = sessionState.telemetry || {};
+  sessionState.aggregates = sessionState.aggregates || {};
+  if (!sessionState.telemetry[bot.id]) {
+    sessionState.telemetry[bot.id] = {
+      power: 0,
+      heartRate: 0,
+      cadence: 0,
+      speedMps: 0,
+      grade: 0,
+      effectiveGrade: 0,
+      resistancePercent: null,
+      resistanceLabel: null,
+      activePowerUp: null,
+      distance: 0,
+      updatedAt: currentMs(),
+    };
+  }
+  ensureAggregate(bot.id, sessionState);
+  return { ok: true, bot };
+}
+
+function removeBotFromSession(session, botId) {
+  const sessionState = session && typeof session === "object" ? session : null;
+  if (!sessionState) return { ok: false, error: "Session unavailable." };
+  const participant = sessionState.users?.[botId];
+  if (!participant?.isBot) return { ok: false, error: "Bot not found." };
+  delete sessionState.users[botId];
+  delete sessionState.telemetry?.[botId];
+  delete sessionState.aggregates?.[botId];
+  return { ok: true };
+}
+
+function updateBotDifficulty(session, botId, difficultyLevelInput) {
+  const sessionState = session && typeof session === "object" ? session : null;
+  if (!sessionState) return { ok: false, error: "Session unavailable." };
+  const participant = sessionState.users?.[botId];
+  if (!participant?.isBot) return { ok: false, error: "Bot not found." };
+  const difficulty = getBotDifficultyConfig(difficultyLevelInput);
+  sessionState.users[botId] = {
+    ...participant,
+    difficultyLevel: difficulty.level,
+    ftpWatts: difficulty.ftpWatts,
+  };
+  return { ok: true };
 }
 
 function clamp(value, min, max) {
@@ -2187,6 +2452,411 @@ function renderElevationProfile({ routeProfile, distanceTraveledMeters, width = 
   `;
 }
 
+function hashStringForColor(value) {
+  const input = String(value || "");
+  let hash = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    hash = (hash << 5) - hash + input.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+function getSideScrollRiderAccentColor(riderId, isLocal = false) {
+  if (isLocal) return "#f5f6ff";
+  const index = hashStringForColor(riderId) % SIDE_SCROLL_RIDER_ACCENTS.length;
+  return SIDE_SCROLL_RIDER_ACCENTS[index];
+}
+
+function mapRouteDistanceToScreenX(relativeDistanceMeters, visibleDistanceWindowMeters, width, horizontalPadding = 24) {
+  const halfWindow = Math.max(1, Number(visibleDistanceWindowMeters) / 2);
+  const clampedDistance = clamp(Number(relativeDistanceMeters) || 0, -halfWindow, halfWindow);
+  const safeWidth = Math.max(2, Number(width) || 2);
+  const usableWidth = Math.max(1, safeWidth - horizontalPadding * 2);
+  const ratio = (clampedDistance + halfWindow) / (halfWindow * 2);
+  return horizontalPadding + ratio * usableWidth;
+}
+
+function mapElevationToSideScrollY(elevationMeters, scaling) {
+  if (!scaling) return 0;
+  const centeredOffset = (Number(elevationMeters) - Number(scaling.centerElevation)) * Number(scaling.pxPerMeter);
+  const y = Number(scaling.centerY) - centeredOffset;
+  return clamp(y, Number(scaling.minY), Number(scaling.maxY));
+}
+
+function sampleTerrainInVisibleWindow({
+  centerDistanceMeters,
+  visibleDistanceWindowMeters,
+  courseSegments,
+  startElevationMeters = 0,
+  width = SIDE_SCROLL_SVG_WIDTH,
+  height = SIDE_SCROLL_SVG_HEIGHT,
+  horizontalPadding = 24,
+  sampleCount = SIDE_SCROLL_TERRAIN_SAMPLE_COUNT,
+}) {
+  const segments = Array.isArray(courseSegments) && courseSegments.length > 0 ? courseSegments : DEFAULT_COURSE_SEGMENTS;
+  const halfWindow = Math.max(1, Number(visibleDistanceWindowMeters) / 2);
+  const sampleTotal = Math.max(10, Math.round(Number(sampleCount) || SIDE_SCROLL_TERRAIN_SAMPLE_COUNT));
+  const routeLength = Math.max(1, getCourseLengthMeters(segments));
+  const terrainTopY = Math.round(height * SIDE_SCROLL_TERRAIN_TOP_RATIO);
+  const terrainBottomY = Math.max(terrainTopY + 24, height - SIDE_SCROLL_TERRAIN_BOTTOM_MARGIN_PX);
+  const terrainHeight = Math.max(1, terrainBottomY - terrainTopY);
+
+  const rawPoints = [];
+  for (let index = 0; index < sampleTotal; index += 1) {
+    const ratio = sampleTotal <= 1 ? 0 : index / (sampleTotal - 1);
+    const relativeDistance = lerp(-halfWindow, halfWindow, ratio);
+    const routeDistance = normalizeCourseDistance((Number(centerDistanceMeters) || 0) + relativeDistance, segments);
+    const x = mapRouteDistanceToScreenX(relativeDistance, halfWindow * 2, width, horizontalPadding);
+    const elevation = getElevationAtDistanceFromSegments(segments, startElevationMeters, routeDistance);
+    rawPoints.push({
+      x,
+      routeDistance,
+      relativeDistance,
+      elevation,
+    });
+  }
+
+  let minElevation = Number(rawPoints[0]?.elevation) || 0;
+  let maxElevation = minElevation;
+  rawPoints.forEach((point) => {
+    minElevation = Math.min(minElevation, point.elevation);
+    maxElevation = Math.max(maxElevation, point.elevation);
+  });
+
+  const elevationRange = Math.max(maxElevation - minElevation, 1);
+  const centerElevation = (minElevation + maxElevation) / 2;
+  const centerY = terrainTopY + terrainHeight / 2;
+  const basePxPerMeter = terrainHeight / elevationRange;
+  // Clamp exaggeration so rolling terrain is readable without becoming cartoonishly steep.
+  const pxPerMeter = clamp(basePxPerMeter * 1.18, 1.2, 8);
+  const scaling = {
+    centerElevation,
+    centerY,
+    minY: terrainTopY + 2,
+    maxY: terrainBottomY - 2,
+    pxPerMeter,
+  };
+
+  const points = rawPoints.map((point) => ({
+    ...point,
+    y: mapElevationToSideScrollY(point.elevation, scaling),
+  }));
+
+  return {
+    points,
+    terrainTopY,
+    terrainBottomY,
+    scaling,
+    routeLength,
+  };
+}
+
+function buildTerrainPaths(points, baselineY) {
+  if (!Array.isArray(points) || points.length < 2) {
+    return { linePath: "", fillPath: "" };
+  }
+  const linePath = buildSmoothCurvePath(points);
+  const first = points[0];
+  const last = points[points.length - 1];
+  const fillPath = `${linePath} L ${last.x.toFixed(2)} ${baselineY.toFixed(2)} L ${first.x.toFixed(2)} ${baselineY.toFixed(2)} Z`;
+  return { linePath, fillPath };
+}
+
+function smoothTerrainPoints(pointsInput, passes = 2) {
+  const source = Array.isArray(pointsInput) ? pointsInput : [];
+  if (source.length < 3) return source;
+
+  let points = source.map((point) => ({ ...point }));
+  const totalPasses = clamp(Math.round(Number(passes) || 0), 0, 4);
+  for (let pass = 0; pass < totalPasses; pass += 1) {
+    const previousPass = points;
+    points = previousPass.map((point, index) => {
+      if (index === 0 || index === previousPass.length - 1) {
+        return { ...point };
+      }
+      const prev = previousPass[index - 1];
+      const next = previousPass[index + 1];
+      return {
+        ...point,
+        y: prev.y * 0.2 + point.y * 0.6 + next.y * 0.2,
+      };
+    });
+  }
+  return points;
+}
+
+function buildSmoothCurvePath(pointsInput) {
+  const points = Array.isArray(pointsInput) ? pointsInput : [];
+  if (points.length === 0) return "";
+  if (points.length === 1) {
+    return `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
+  }
+  if (points.length === 2) {
+    return `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)} L ${points[1].x.toFixed(2)} ${points[1].y.toFixed(2)}`;
+  }
+
+  let path = `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const current = points[index];
+    const next = points[index + 1];
+    const controlX = current.x;
+    const controlY = current.y;
+    const endX = (current.x + next.x) / 2;
+    const endY = (current.y + next.y) / 2;
+    path += ` Q ${controlX.toFixed(2)} ${controlY.toFixed(2)} ${endX.toFixed(2)} ${endY.toFixed(2)}`;
+  }
+  const last = points[points.length - 1];
+  path += ` T ${last.x.toFixed(2)} ${last.y.toFixed(2)}`;
+  return path;
+}
+
+function getTerrainPointAtX(pointsInput, xInput) {
+  const points = Array.isArray(pointsInput) ? pointsInput : [];
+  if (points.length === 0) return { y: 0, slopeDeg: 0 };
+  if (points.length === 1) return { y: points[0].y, slopeDeg: 0 };
+  const x = Number(xInput) || 0;
+  for (let index = 1; index < points.length; index += 1) {
+    const p1 = points[index - 1];
+    const p2 = points[index];
+    if (x <= p2.x) {
+      const span = Math.max(1e-6, p2.x - p1.x);
+      const t = clamp((x - p1.x) / span, 0, 1);
+      const y = lerp(p1.y, p2.y, t);
+      const slopeDeg = (Math.atan2(p2.y - p1.y, p2.x - p1.x) * 180) / Math.PI;
+      return { y, slopeDeg };
+    }
+  }
+  const last = points[points.length - 1];
+  const prev = points[points.length - 2];
+  const slopeDeg = (Math.atan2(last.y - prev.y, last.x - prev.x) * 180) / Math.PI;
+  return { y: last.y, slopeDeg };
+}
+
+function filterVisibleRiders({ participants, localPlayer, visibleDistanceWindowMeters }) {
+  const riders = Array.isArray(participants) ? participants : [];
+  const localDistance = Number(localPlayer?.distanceTraveled) || 0;
+  const halfWindow = Math.max(1, Number(visibleDistanceWindowMeters) / 2);
+
+  return riders
+    .map((rider) => {
+      const riderDistance = Number(rider?.distanceTraveled) || 0;
+      const relativeDistance = riderDistance - localDistance;
+      const clampedRelativeDistance = clamp(relativeDistance, -halfWindow, halfWindow);
+      const beyondVisibleWindow = Math.max(0, Math.abs(relativeDistance) - halfWindow);
+      const edgeFade = rider.isLocal ? 1 : 1 - clamp(beyondVisibleWindow / halfWindow, 0, 0.65);
+      return {
+        ...rider,
+        relativeDistance,
+        clampedRelativeDistance,
+        edgeFade,
+      };
+    })
+    .sort((a, b) => {
+      if (a.isLocal && !b.isLocal) return 1;
+      if (!a.isLocal && b.isLocal) return -1;
+      return a.distanceTraveled - b.distanceTraveled;
+    });
+}
+
+function getPredictedTelemetryDistanceMeters(telemetryInput, nowMs = currentMs()) {
+  const telemetry = telemetryInput && typeof telemetryInput === "object" ? telemetryInput : {};
+  const baseDistance = Math.max(0, Number(telemetry.distance) || 0);
+  const speedMps = Number(telemetry.speedMps);
+  if (!Number.isFinite(speedMps) || speedMps <= 0) return baseDistance;
+  const updatedAt = Number(telemetry.updatedAt) || Number(telemetry.timestamp) || nowMs;
+  const lookaheadMs = clamp(Math.max(0, nowMs - updatedAt), 0, SIDE_SCROLL_MAX_EXTRAPOLATION_MS);
+  return baseDistance + speedMps * (lookaheadMs / 1000);
+}
+
+function buildSessionSideScrollViewHtml(session, user, { predictMotion = true, nowMs = currentMs() } = {}) {
+  if (!session || !user) {
+    return `<div class="small elevation-profile-empty">Waiting for session data.</div>`;
+  }
+
+  const telemetry = session.telemetry || {};
+  const courseSegments = getCourseSegments(session);
+  const sessionRoute = getSessionRoute(session);
+  const riders = Object.values(session.users || {})
+    .map((participant) => {
+      const telemetryEntry = telemetry[participant.id] || {};
+      const measuredDistance = Number(telemetryEntry.distance) || 0;
+      const distanceTraveled = predictMotion
+        ? getPredictedTelemetryDistanceMeters(telemetryEntry, nowMs)
+        : measuredDistance;
+      const isLocal = participant.id === user.id;
+      return {
+        id: participant.id,
+        name: participant.name || "Rider",
+        distanceTraveled,
+        isLocal,
+        accentColor: getSideScrollRiderAccentColor(participant.id, isLocal),
+      };
+    })
+    .sort((a, b) => b.distanceTraveled - a.distanceTraveled);
+
+  if (riders.length === 0) {
+    return `<div class="small elevation-profile-empty">Waiting for participant positions.</div>`;
+  }
+
+  const localRider = riders.find((rider) => rider.id === user.id) || riders[0];
+  const localRouteDistanceMeters = normalizeCourseDistance(localRider.distanceTraveled, courseSegments);
+
+  return SideScrollRaceView({
+    localPlayer: {
+      id: user.id,
+      name: user.name || localRider.name || "You",
+      distanceTraveled: localRider.distanceTraveled,
+      isLocal: true,
+      accentColor: getSideScrollRiderAccentColor(user.id, true),
+    },
+    participants: riders,
+    localRouteDistanceMeters,
+    courseSegments,
+    startElevationMeters: Number(sessionRoute.startElevationM) || 0,
+    visibleDistanceWindowMeters: SIDE_SCROLL_VISIBLE_WINDOW_METERS,
+    width: SIDE_SCROLL_SVG_WIDTH,
+    height: SIDE_SCROLL_SVG_HEIGHT,
+  });
+}
+
+function updateSessionSideScrollMount({ predictMotion = true, nowMs = currentMs() } = {}) {
+  if (state.view !== "session") return false;
+  const mount = document.getElementById("sessionSideScrollMount");
+  if (!mount) return false;
+  const session = getCurrentSession();
+  const user = getCurrentUser();
+  if (!session || !user) return false;
+  mount.innerHTML = buildSessionSideScrollViewHtml(session, user, { predictMotion, nowMs });
+  return true;
+}
+
+function TerrainProfileRenderer({ terrainPoints, width, height, centerX }) {
+  if (!Array.isArray(terrainPoints) || terrainPoints.length < 2) return "";
+  const baselineY = Math.max(0, Number(height) - 4);
+  const { linePath, fillPath } = buildTerrainPaths(terrainPoints, baselineY);
+  const first = terrainPoints[0];
+  const last = terrainPoints[terrainPoints.length - 1];
+  return `
+    <g class="sidescroll-terrain-layer">
+      <path class="sidescroll-terrain-fill" d="${fillPath}"></path>
+      <path class="sidescroll-terrain-line" d="${linePath}"></path>
+      <line class="sidescroll-center-line" x1="${centerX.toFixed(2)}" y1="0" x2="${centerX.toFixed(2)}" y2="${height.toFixed(2)}"></line>
+      <line class="sidescroll-edge-line" x1="${first.x.toFixed(2)}" y1="0" x2="${first.x.toFixed(2)}" y2="${height.toFixed(2)}"></line>
+      <line class="sidescroll-edge-line" x1="${last.x.toFixed(2)}" y1="0" x2="${last.x.toFixed(2)}" y2="${height.toFixed(2)}"></line>
+    </g>
+  `;
+}
+
+function RiderVisual({ rider, x, y, slopeDeg }) {
+  const safeName = escapeHtml(rider?.name || "Rider");
+  const isLocal = !!rider?.isLocal;
+  const accent = rider?.accentColor || getSideScrollRiderAccentColor(rider?.id, isLocal);
+  const opacity = clamp(Number(rider?.edgeFade) || 1, 0.35, 1);
+  const tilt = clamp(Number(slopeDeg) || 0, -10, 10);
+
+  return `
+    <g class="sidescroll-rider ${isLocal ? "is-local" : ""}" transform="translate(${x.toFixed(2)} ${y.toFixed(2)})" style="opacity:${opacity.toFixed(2)};">
+      <g class="sidescroll-rider-bob">
+        ${
+          isLocal
+            ? '<circle class="sidescroll-local-halo" cx="0" cy="-8" r="18"></circle>'
+            : ""
+        }
+        <g class="sidescroll-bike" transform="rotate(${tilt.toFixed(2)} 0 -6)">
+          <circle class="sidescroll-wheel sidescroll-wheel-spin" cx="-12" cy="-6" r="6"></circle>
+          <circle class="sidescroll-wheel sidescroll-wheel-spin" cx="12" cy="-6" r="6"></circle>
+          <line class="sidescroll-frame" x1="-12" y1="-6" x2="12" y2="-6" stroke="${accent}"></line>
+          <line class="sidescroll-frame" x1="-12" y1="-6" x2="-1" y2="-17" stroke="${accent}"></line>
+          <line class="sidescroll-frame" x1="-1" y1="-17" x2="12" y2="-6" stroke="${accent}"></line>
+          <line class="sidescroll-frame" x1="-1" y1="-17" x2="-4" y2="-21" stroke="${accent}"></line>
+          <line class="sidescroll-frame" x1="-1" y1="-17" x2="3" y2="-23" stroke="${accent}"></line>
+          <line class="sidescroll-frame" x1="3" y1="-23" x2="8" y2="-16" stroke="${accent}"></line>
+          <circle cx="3" cy="-26" r="4.5" fill="${accent}"></circle>
+        </g>
+        <text class="sidescroll-rider-name ${isLocal ? "is-local" : ""}" x="0" y="-40" text-anchor="middle">${safeName}</text>
+      </g>
+    </g>
+  `;
+}
+
+function SideScrollRaceView({
+  localPlayer,
+  participants,
+  localRouteDistanceMeters,
+  courseSegments,
+  startElevationMeters = 0,
+  visibleDistanceWindowMeters = SIDE_SCROLL_VISIBLE_WINDOW_METERS,
+  width = SIDE_SCROLL_SVG_WIDTH,
+  height = SIDE_SCROLL_SVG_HEIGHT,
+}) {
+  const safeLocalPlayer = localPlayer && typeof localPlayer === "object" ? localPlayer : null;
+  const safeParticipants = Array.isArray(participants) ? participants : [];
+  if (!safeLocalPlayer || safeParticipants.length === 0) {
+    return `<div class="small elevation-profile-empty">Waiting for participant positions.</div>`;
+  }
+
+  const windowMeters = Math.max(20, Number(visibleDistanceWindowMeters) || SIDE_SCROLL_VISIBLE_WINDOW_METERS);
+  const halfWindow = windowMeters / 2;
+  const centerX = width / 2;
+  const terrain = sampleTerrainInVisibleWindow({
+    centerDistanceMeters: localRouteDistanceMeters,
+    visibleDistanceWindowMeters: windowMeters,
+    courseSegments,
+    startElevationMeters,
+    width,
+    height,
+  });
+  const smoothedTerrainPoints = smoothTerrainPoints(terrain.points, 2);
+  const terrainLayerSvg = TerrainProfileRenderer({
+    terrainPoints: smoothedTerrainPoints,
+    width,
+    height,
+    centerX,
+  });
+  const riders = filterVisibleRiders({
+    participants: safeParticipants,
+    localPlayer: safeLocalPlayer,
+    visibleDistanceWindowMeters: windowMeters,
+  });
+
+  const ridersSvg = riders
+    .map((rider) => {
+      const x = mapRouteDistanceToScreenX(rider.clampedRelativeDistance, windowMeters, width);
+      const terrainPoint = getTerrainPointAtX(smoothedTerrainPoints, x);
+      return RiderVisual({
+        rider,
+        x,
+        y: terrainPoint.y,
+        slopeDeg: terrainPoint.slopeDeg,
+      });
+    })
+    .join("");
+
+  // This prototype renderer is intentionally self-contained so final art/camera can replace it later.
+  return `
+    <div class="sidescroll-view">
+      <svg viewBox="0 0 ${width} ${height}" aria-label="Side-scrolling race view">
+        <rect class="sidescroll-sky" x="0" y="0" width="${width}" height="${height}"></rect>
+        <rect
+          class="sidescroll-horizon"
+          x="0"
+          y="${Math.round(height * SIDE_SCROLL_HORIZON_Y_RATIO)}"
+          width="${width}"
+          height="${Math.round(height * (1 - SIDE_SCROLL_HORIZON_Y_RATIO))}"
+        ></rect>
+        ${terrainLayerSvg}
+        ${ridersSvg}
+        <text class="sidescroll-center-label" x="${centerX.toFixed(2)}" y="18" text-anchor="middle">YOU</text>
+      </svg>
+      <div class="sidescroll-meta">
+        <span>Window: ${Math.round(halfWindow)}m behind / ${Math.round(halfWindow)}m ahead</span>
+        <span>Center rider stays fixed</span>
+      </div>
+    </div>
+  `;
+}
+
 function lerp(fromValue, toValue, factor) {
   return fromValue + (toValue - fromValue) * factor;
 }
@@ -2702,6 +3372,7 @@ function failPendingRemoteJoin(message) {
   closeSignaling();
   resetPrivateRiderStats();
   resetPowerUpState();
+  resetFtpProposalState();
   state.user = null;
   state.session = null;
   state.view = "lobby";
@@ -3095,6 +3766,7 @@ function handleSignalingMessage(msg) {
     closeWebRTCPeers();
     resetPrivateRiderStats();
     resetPowerUpState();
+    resetFtpProposalState();
     state.user = null;
     state.session = null;
     state.view = "lobby";
@@ -3130,6 +3802,7 @@ function handleSignalingMessage(msg) {
         clearLocalSession();
         resetPrivateRiderStats();
         resetPowerUpState();
+        resetFtpProposalState();
         state.user = null;
         state.session = null;
         state.view = "lobby";
@@ -3242,8 +3915,10 @@ function handleNewPeerFromSession(session) {
   const hostId = session.hostId;
   const me = state.user?.id;
   Object.keys(session.users || {}).forEach((userId) => {
+    const participant = session.users?.[userId];
     if (userId === hostId) return;
     if (userId === me) return;
+    if (participant?.isBot) return;
     if (!state.webrtc.peers[userId]) {
       setupHostPeer(session.code, userId);
     }
@@ -3317,7 +3992,96 @@ function createMockTelemetryUpdate(currentTelemetry, nowMs) {
   };
 }
 
-function createSession({ hostUser, routePreset = DEFAULT_ROUTE_PRESET }) {
+function getBotBaseEffortFraction(levelInput) {
+  const level = normalizeBotDifficultyLevel(levelInput);
+  const progress = (level - 1) / Math.max(BOT_DIFFICULTY_LEVELS.length - 1, 1);
+  return lerp(0.72, 0.9, progress);
+}
+
+function simulateBotPower({ bot, previousTelemetry, currentGradePercent, nowMs, deltaSeconds }) {
+  const ftpWatts = Math.max(1, Number(bot?.ftpWatts) || getBotDifficultyConfig(bot?.difficultyLevel).ftpWatts);
+  const previousPower = Math.max(0, Number(previousTelemetry?.power) || ftpWatts * 0.72);
+  const baseFraction = getBotBaseEffortFraction(bot?.difficultyLevel);
+  const grade = Number(currentGradePercent) || 0;
+  const phase = (nowMs / 1000) * 0.12 + (hashStringForColor(bot?.id || bot?.name || "bot") % 360) * (Math.PI / 180);
+  const variation = Math.sin(phase) * 0.018;
+  const terrainAdjustment = clamp(grade * 0.003, -0.045, 0.06);
+  const targetFraction = clamp(baseFraction + variation + terrainAdjustment, 0.62, 1.02);
+  const targetPower = ftpWatts * targetFraction;
+  const smoothedPower = smoothToward(previousPower, targetPower, 0.42, deltaSeconds);
+  return Math.max(40, Math.round(smoothedPower));
+}
+
+function simulateBotTelemetry({ bot, previousTelemetry, courseSegments, nowMs, deltaSeconds }) {
+  const previousDistance = Number(previousTelemetry?.distance) || 0;
+  const gradeContext = getCourseGradeContext(previousDistance, courseSegments);
+  const currentGrade = Number(gradeContext.currentGrade) || 0;
+  const gradientScale = clamp(state.simulation.gradientScale, 0, 1);
+  const effectiveGrade = currentGrade * gradientScale;
+  const power = simulateBotPower({
+    bot,
+    previousTelemetry,
+    currentGradePercent: effectiveGrade,
+    nowMs,
+    deltaSeconds,
+  });
+  const ftpWatts = Math.max(1, Number(bot?.ftpWatts) || getBotDifficultyConfig(bot?.difficultyLevel).ftpWatts);
+  const powerRatio = clamp(power / ftpWatts, 0.5, 1.15);
+  const cadenceWave = Math.sin((nowMs / 1000) * 0.16 + (hashStringForColor(bot?.id || "bot") % 90)) * 1.8;
+  const cadence = clamp(76 + powerRatio * 13 + cadenceWave, 58, 102);
+  const heartRate = clamp(98 + powerRatio * 78, 92, 194);
+
+  const previousSpeed = Number(previousTelemetry?.speedMps);
+  const fallbackSpeed = computeTargetSpeedFromPowerAndGrade(power, effectiveGrade, bot?.weight ?? BOT_DEFAULT_WEIGHT_KG, bot?.bikeId);
+  const initialSpeed = Number.isFinite(previousSpeed) && previousSpeed >= 0 ? previousSpeed : fallbackSpeed;
+  const targetSpeed = computeTargetSpeedFromPowerAndGrade(power, effectiveGrade, bot?.weight ?? BOT_DEFAULT_WEIGHT_KG, bot?.bikeId);
+  const speedMps = smoothToward(initialSpeed, targetSpeed, state.simulation.speedSmoothing, deltaSeconds);
+  const resistancePercent = mapGradeToResistancePercent(effectiveGrade);
+  const resistanceLabel = getResistanceFeelLabel(resistancePercent);
+  const distance = computeDistanceMeters(previousDistance, speedMps, deltaSeconds);
+
+  return {
+    telemetry: {
+      power,
+      heartRate: Math.round(heartRate),
+      cadence: Math.round(cadence),
+      speedMps,
+      grade: currentGrade,
+      effectiveGrade,
+      resistancePercent,
+      resistanceLabel,
+      activePowerUp: null,
+      deltaTimeSeconds: deltaSeconds,
+      timestamp: nowMs,
+    },
+    distance,
+  };
+}
+
+function simulateBotsForCurrentSession(deltaSeconds, nowMs) {
+  const session = getCurrentSession();
+  const user = getCurrentUser();
+  if (!session || !user || !user.isHost || !isSessionRunning()) return;
+
+  const participants = Object.values(session.users || {});
+  const bots = participants.filter((participant) => participant?.isBot);
+  if (bots.length === 0) return;
+
+  const courseSegments = getCourseSegments(session);
+  bots.forEach((bot) => {
+    const previousTelemetry = session.telemetry?.[bot.id] || { distance: 0, updatedAt: nowMs - TELEMETRY_POLL_INTERVAL_MS };
+    const { telemetry, distance } = simulateBotTelemetry({
+      bot,
+      previousTelemetry,
+      courseSegments,
+      nowMs,
+      deltaSeconds,
+    });
+    addTelemetrySample(bot.id, telemetry, distance);
+  });
+}
+
+function createSession({ hostUser, routePreset = DEFAULT_ROUTE_PRESET, botConfigs = [] }) {
   const code = makeId(6);
   const now = currentMs();
   const session = {
@@ -3341,6 +4105,10 @@ function createSession({ hostUser, routePreset = DEFAULT_ROUTE_PRESET }) {
     totalClimbedMeters: 0,
     course: createCourseFromRoutePreset(routePreset),
   };
+
+  normalizeBotDrafts(botConfigs).forEach((botDraft) => {
+    addBotToSession(session, botDraft);
+  });
 
   saveSessionToStorage(session);
   return session;
@@ -3580,6 +4348,122 @@ function resetPowerUpState() {
   state.powerUps = createEmptyPowerUpState();
 }
 
+function ensureFtpProposalContext(sessionInput = getCurrentSession(), userInput = getCurrentUser()) {
+  const sessionCode = sessionInput?.code || null;
+  const scopedUserId = state.account.userId || userInput?.id || null;
+  const existing = state.ftp || createEmptyFtpProposalState();
+  if (existing.sessionCode !== sessionCode || existing.userId !== scopedUserId) {
+    state.ftp = createEmptyFtpProposalState(sessionCode, scopedUserId);
+  }
+  return state.ftp;
+}
+
+function resetFtpProposalState() {
+  state.ftp = createEmptyFtpProposalState();
+}
+
+function getFtpCandidateFromRollingEfforts(bestRollingWattsInput) {
+  const peaks = bestRollingWattsInput && typeof bestRollingWattsInput === "object" ? bestRollingWattsInput : {};
+  const candidates = [];
+
+  // Keep this helper centralized so future FTP systems (zones/workouts/scaling) can swap in richer logic.
+  const peak60m = Number(peaks[3600]);
+  const peak40m = Number(peaks[2400]);
+  const peak20m = Number(peaks[1200]);
+
+  if (Number.isFinite(peak60m) && peak60m > 0) {
+    candidates.push({ ftpWatts: Math.round(peak60m), sourceLabel: "Best 60m effort" });
+  }
+  if (Number.isFinite(peak40m) && peak40m > 0) {
+    candidates.push({ ftpWatts: Math.round(peak40m * 0.98), sourceLabel: "Best 40m effort (estimated)" });
+  }
+  if (Number.isFinite(peak20m) && peak20m > 0) {
+    candidates.push({ ftpWatts: Math.round(peak20m * 0.95), sourceLabel: "Best 20m effort (estimated)" });
+  }
+
+  if (candidates.length === 0) return null;
+  return candidates.reduce((best, entry) => (entry.ftpWatts > best.ftpWatts ? entry : best), candidates[0]);
+}
+
+function evaluateFtpProposalFromCurrentEffort(sessionInput = getCurrentSession(), userInput = getCurrentUser()) {
+  const session = sessionInput;
+  const user = userInput;
+  if (!session || !user || !state.account.userId) return null;
+
+  const profile = getCurrentAccountProfile();
+  const currentFtp = getUserFtp(profile);
+  if (!Number.isFinite(currentFtp) || currentFtp <= 0) return null;
+
+  const privateStats = ensurePrivateRiderStatsContext(session, user);
+  const candidate = getFtpCandidateFromRollingEfforts(privateStats?.bestRollingWatts);
+  if (!candidate) return null;
+
+  const candidateValidation = validateFtp(candidate.ftpWatts, { allowNull: false });
+  if (!candidateValidation.valid) return null;
+  const candidateFtpWatts = candidateValidation.value;
+  if (candidateFtpWatts <= currentFtp) return null;
+
+  const ftpState = ensureFtpProposalContext(session, user);
+  if (
+    Number.isFinite(ftpState.lastDeclinedCandidateWatts) &&
+    candidateFtpWatts <= Number(ftpState.lastDeclinedCandidateWatts) + 2
+  ) {
+    return ftpState.pendingProposal;
+  }
+
+  const existing = ftpState.pendingProposal;
+  if (existing && candidateFtpWatts <= Number(existing.candidateFtpWatts) + 2) {
+    return existing;
+  }
+
+  ftpState.pendingProposal = {
+    candidateFtpWatts,
+    previousFtpWatts: currentFtp,
+    sourceLabel: candidate.sourceLabel,
+    detectedAtMs: currentMs(),
+  };
+  showToast(`New FTP candidate detected: ${candidateFtpWatts} W.`);
+  return ftpState.pendingProposal;
+}
+
+function getPendingFtpProposal(sessionInput = getCurrentSession(), userInput = getCurrentUser()) {
+  const ftpState = ensureFtpProposalContext(sessionInput, userInput);
+  return ftpState.pendingProposal || null;
+}
+
+function acceptPendingFtpProposal(sessionInput = getCurrentSession(), userInput = getCurrentUser()) {
+  if (!state.account.userId) {
+    return { ok: false, error: "Log in to save FTP to your profile." };
+  }
+  const ftpState = ensureFtpProposalContext(sessionInput, userInput);
+  const proposal = ftpState.pendingProposal;
+  if (!proposal) return { ok: false, error: "No FTP update is pending." };
+
+  const profiles = loadProfiles();
+  const existingProfile = profiles[state.account.userId];
+  if (!existingProfile) return { ok: false, error: "Profile not found." };
+
+  const updated = updateUserFtp(withProfileProgression(existingProfile), proposal.candidateFtpWatts, currentMs());
+  if (!updated.ok) return { ok: false, error: updated.error || "Could not update FTP." };
+
+  profiles[state.account.userId] = withProfileProgression(updated.profile);
+  saveProfiles(profiles);
+  upsertPublicProfile(profiles[state.account.userId]);
+
+  ftpState.pendingProposal = null;
+  ftpState.lastDeclinedCandidateWatts = Number(proposal.candidateFtpWatts);
+  return { ok: true, ftpWatts: proposal.candidateFtpWatts };
+}
+
+function declinePendingFtpProposal(sessionInput = getCurrentSession(), userInput = getCurrentUser()) {
+  const ftpState = ensureFtpProposalContext(sessionInput, userInput);
+  const proposal = ftpState.pendingProposal;
+  if (!proposal) return { ok: false, error: "No FTP update is pending." };
+  ftpState.lastDeclinedCandidateWatts = Number(proposal.candidateFtpWatts);
+  ftpState.pendingProposal = null;
+  return { ok: true };
+}
+
 function getActivePowerUp(powerUpState, nowMs = currentMs()) {
   if (!powerUpState) return null;
   const active = powerUpState.activePowerUp;
@@ -3675,6 +4559,7 @@ function addTelemetrySample(userId, telemetry, distance) {
       power: telemetry.power,
       heartRate: telemetry.heartRate,
       cadence: telemetry.cadence,
+      speedMps: telemetry.speedMps ?? null,
       grade: telemetry.grade ?? null,
       effectiveGrade: telemetry.effectiveGrade ?? null,
       resistancePercent: telemetry.resistancePercent ?? null,
@@ -3889,6 +4774,7 @@ function endSession() {
     cleanupSignaling(state.webrtc.code);
   }
   closeWebRTCPeers();
+  resetFtpProposalState();
   state.view = "summary";
   state.simulation.lastSmoothedGrade = 0;
   showToast("Session ended");
@@ -3910,6 +4796,7 @@ function leaveSession() {
   closeWebRTCPeers();
   resetPrivateRiderStats();
   resetPowerUpState();
+  resetFtpProposalState();
   state.user = null;
   state.session = null;
   state.view = "lobby";
@@ -3986,7 +4873,10 @@ function pollTelemetry() {
   void sendResistanceToTrainer(smoothedGrade);
   // Keep rider peak-power/speed stats local only. Do not sync these to shared session data.
   recordPrivateRiderTelemetrySample(telemetry, session, user);
+  evaluateFtpProposalFromCurrentEffort(session, user);
   addTelemetrySample(user.id, telemetry, distance);
+  // Host simulates bot riders so all clients receive shared pacing/challenge telemetry.
+  simulateBotsForCurrentSession(sample.deltaSeconds, now);
 }
 
 function syncSessionFromStorage(event) {
@@ -4033,6 +4923,40 @@ function syncSessionFromStorage(event) {
   render();
 }
 
+function stopSessionSideScrollRenderLoop() {
+  if (state.visualLoop?.sideScrollRafId != null) {
+    window.cancelAnimationFrame(state.visualLoop.sideScrollRafId);
+  }
+  state.visualLoop.sideScrollRafId = null;
+  state.visualLoop.lastSideScrollFrameAt = 0;
+}
+
+function startSessionSideScrollRenderLoop() {
+  if (state.view !== "session") {
+    stopSessionSideScrollRenderLoop();
+    return;
+  }
+  if (state.visualLoop?.sideScrollRafId != null) return;
+
+  const tick = (frameAtMs) => {
+    if (state.view !== "session") {
+      stopSessionSideScrollRenderLoop();
+      return;
+    }
+
+    const lastFrameAt = Number(state.visualLoop.lastSideScrollFrameAt) || 0;
+    if (lastFrameAt === 0 || frameAtMs - lastFrameAt >= SIDE_SCROLL_RENDER_INTERVAL_MS) {
+      updateSessionSideScrollMount({ predictMotion: true, nowMs: currentMs() });
+      state.visualLoop.lastSideScrollFrameAt = frameAtMs;
+    }
+
+    state.visualLoop.sideScrollRafId = window.requestAnimationFrame(tick);
+  };
+
+  state.visualLoop.lastSideScrollFrameAt = 0;
+  state.visualLoop.sideScrollRafId = window.requestAnimationFrame(tick);
+}
+
 function render() {
   const session = getCurrentSession();
   const user = getCurrentUser();
@@ -4043,12 +4967,15 @@ function render() {
   }
 
   if (state.view === "lobby") {
+    stopSessionSideScrollRenderLoop();
     renderLobby();
   } else if (state.view === "session") {
     renderSession();
   } else if (state.view === "summary") {
+    stopSessionSideScrollRenderLoop();
     renderSummary();
   } else if (state.view === "pairing") {
+    stopSessionSideScrollRenderLoop();
     renderPairing();
   }
 }
@@ -4134,6 +5061,7 @@ function renderLobby() {
   const bluetoothSupported = isWebBluetoothSupported();
   const defaultName = profile?.displayName || "";
   const defaultWeightKg = profile?.weightKg != null && Number.isFinite(profile.weightKg) ? formatNumber(profile.weightKg, 1).replace(/\.0$/, "") : "";
+  const accountGradientScalePct = Math.round(clamp(state.simulation.gradientScale, 0, 1) * 100);
   const identityLockedAttr = loggedIn ? 'readonly aria-readonly="true" class="locked-identity-field"' : "";
   const identityLockedHint = loggedIn
     ? `<div class="small" style="margin-top:8px;">Signed in account values are locked here. Use Account > Edit profile to change them.</div>`
@@ -4195,6 +5123,36 @@ function renderLobby() {
           : generatedConfirmed
             ? "Generated route confirmed and ready for session start."
             : "Generate a route, review the profile, then confirm.";
+  state.lobby.botDrafts = normalizeBotDrafts(state.lobby.botDrafts);
+  const botDrafts = state.lobby.botDrafts;
+  const canAddMoreBots = botDrafts.length < MAX_SESSION_BOTS;
+  const botRowsHtml = botDrafts
+    .map((botDraft) => {
+      const difficultyOptions = buildBotDifficultyOptionsHtml(botDraft.difficultyLevel);
+      return `
+        <div class="card" style="margin-top:10px;">
+          <div class="flex-space">
+            <div>
+              <div><strong>${escapeHtml(botDraft.name)}</strong></div>
+              <div class="small">Pacing rider | FTP target updates with difficulty.</div>
+            </div>
+            <button type="button" class="secondary" data-remove-bot-draft="${botDraft.id}">Remove</button>
+          </div>
+          <div class="flex" style="gap:12px;flex-wrap:wrap;margin-top:10px;">
+            <div style="flex:1;min-width:220px;">
+              <label class="label">Difficulty</label>
+              <select data-bot-difficulty-id="${botDraft.id}">${difficultyOptions}</select>
+            </div>
+            <div style="flex:1;min-width:160px;">
+              <label class="label">FTP</label>
+              <div class="code">${Math.round(Number(botDraft.ftpWatts) || 0)} W</div>
+            </div>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+  const addBotButtonText = canAddMoreBots ? `Add Bot (${botDrafts.length}/${MAX_SESSION_BOTS})` : `Bots full (${MAX_SESSION_BOTS}/${MAX_SESSION_BOTS})`;
   const createRouteOptions = ROUTE_PRESETS.map(
     (route) =>
       `<option value="${route.id}" ${route.id === state.lobby.selectedRouteId ? "selected" : ""}>${escapeHtml(route.name)} (${escapeHtml(route.country)})</option>`,
@@ -4218,6 +5176,8 @@ function renderLobby() {
     : profileTotalInches != null
       ? formatNumber(profileTotalInches - Math.floor(profileTotalInches / 12) * 12, 1).replace(/\.0$/, "")
       : "";
+  const profileFtpWatts = profile ? getUserFtp(profile) : null;
+  const profileFtpInputValue = profileFtpWatts != null ? String(profileFtpWatts) : "";
   const profileProgress = profile ? getProgressToNextLevel(profile.totalXp) : null;
   const profileLevel = profileProgress?.currentLevel || 1;
   const profileNextLevel = profileProgress?.nextLevel || Math.min(MAX_PLAYER_LEVEL, profileLevel + 1);
@@ -4246,6 +5206,14 @@ function renderLobby() {
           <button id="signupBtn">Sign up</button>
           <button id="loginBtn" class="secondary">Log in</button>
           <button id="resetBtn" class="secondary">Reset password</button>
+        </div>
+        <div class="card" style="margin-top:12px;">
+          <h2>Simulation Settings</h2>
+          <div class="small">Controls how strongly route grade affects simulated resistance and speed.</div>
+          <div style="margin-top:10px;">
+            <label class="label" for="accountGradientScaleRange">Gradient scale (<span id="accountGradientScaleValue">${accountGradientScalePct}%</span>)</label>
+            <input id="accountGradientScaleRange" type="range" min="0" max="100" step="5" value="${accountGradientScalePct}" />
+          </div>
         </div>
       </div>
     `;
@@ -4335,6 +5303,7 @@ function renderLobby() {
             <div class="small">
               Age: ${profileAge ?? "--"} | Weight: ${profile.weight ?? "--"} ${escapeHtml(profile.weightUnit || "kg")} | Height: ${escapeHtml(profileHeightText)}
             </div>
+            <div class="small">FTP: ${profileFtpWatts != null ? `${profileFtpWatts} W` : "Set your FTP"}</div>
             <div class="small" style="margin-top:6px;"><strong>Level ${profileLevel}</strong></div>
             <div class="level-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(
               profileProgressPercent,
@@ -4357,6 +5326,15 @@ function renderLobby() {
           <button id="toggleFriendsBtn" class="secondary">${state.account.showFriendsPanel ? "Hide friends" : "Manage friends"}</button>
         </div>
 
+        <div class="card" style="margin-top:12px;">
+          <h2>Simulation Settings</h2>
+          <div class="small">Controls how strongly route grade affects simulated resistance and speed.</div>
+          <div style="margin-top:10px;">
+            <label class="label" for="accountGradientScaleRange">Gradient scale (<span id="accountGradientScaleValue">${accountGradientScalePct}%</span>)</label>
+            <input id="accountGradientScaleRange" type="range" min="0" max="100" step="5" value="${accountGradientScalePct}" />
+          </div>
+        </div>
+
         ${
           state.account.showProfileEditor
             ? `
@@ -4376,6 +5354,12 @@ function renderLobby() {
               <div style="flex:1;min-width:160px;">
                 <label class="label">Weight</label>
                 <input id="profileWeight" type="number" min="1" step="0.1" value="${profile.weight ?? ""}" />
+              </div>
+              <div style="flex:1;min-width:160px;">
+                <label class="label">FTP (W)</label>
+                <input id="profileFtpWatts" type="number" min="${FTP_MIN_WATTS}" max="${FTP_MAX_WATTS}" step="1" value="${escapeHtml(
+                  profileFtpInputValue,
+                )}" />
               </div>
               <div style="flex:1;min-width:120px;">
                 <label class="label">Weight unit</label>
@@ -4404,6 +5388,7 @@ function renderLobby() {
                 <input id="profileHeightInches" type="number" min="0" max="11.9" step="0.1" value="${escapeHtml(profileHeightInchesValue)}" />
               </div>
             </div>
+            <div class="small" style="margin-top:8px;">Functional Threshold Power - the maximum power you can theoretically sustain for about one hour.</div>
             <div class="small" style="margin-top:8px;">Age is calculated automatically from date of birth.</div>
             <div style="margin-top:10px;">
               <label class="label">Profile picture (jpg/png/webp)</label>
@@ -4559,6 +5544,14 @@ function renderLobby() {
       </div>
       <div class="bike-choice-card" style="margin-top:12px;">
         ${selectedBikeDetailsHtml}
+      </div>
+      <div class="card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">Bot Riders (MVP)</h2>
+        <div class="small">Add up to ${MAX_SESSION_BOTS} bots before the ride starts. Each level maps to a fixed FTP target.</div>
+        <div style="margin-top:10px;">
+          <button id="addBotDraftBtn" type="button" class="secondary" ${canAddMoreBots ? "" : "disabled"}>${addBotButtonText}</button>
+        </div>
+        ${botRowsHtml || "<div class='small' style='margin-top:10px;'>No bots added yet.</div>"}
       </div>
       <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap;">
         <button id="createBtn">Create session</button>
@@ -4747,6 +5740,7 @@ function renderLobby() {
         displayName: document.getElementById("profileDisplayName").value,
         dateOfBirth: document.getElementById("profileDob").value,
         weight: document.getElementById("profileWeight").value,
+        ftpWatts: document.getElementById("profileFtpWatts")?.value ?? "",
         weightUnit: document.getElementById("profileWeightUnit").value,
         heightCm: document.getElementById("profileHeightCm")?.value ?? "",
         heightFeet: document.getElementById("profileHeightFeet")?.value ?? "",
@@ -4813,6 +5807,23 @@ function renderLobby() {
   if (friendSearchBtn) {
     friendSearchBtn.addEventListener("click", () => {
       state.account.friendSearchQuery = document.getElementById("friendSearchInput").value.trim();
+      render();
+    });
+  }
+
+  const accountGradientScaleRange = document.getElementById("accountGradientScaleRange");
+  if (accountGradientScaleRange) {
+    const accountGradientScaleValue = document.getElementById("accountGradientScaleValue");
+    const applyAccountGradientScale = () => {
+      const nextPct = clamp(Number(accountGradientScaleRange.value), 0, 100);
+      state.simulation.gradientScale = clamp(nextPct / 100, 0, 1);
+      if (accountGradientScaleValue) {
+        accountGradientScaleValue.textContent = `${Math.round(nextPct)}%`;
+      }
+    };
+    accountGradientScaleRange.addEventListener("input", applyAccountGradientScale);
+    accountGradientScaleRange.addEventListener("change", () => {
+      applyAccountGradientScale();
       render();
     });
   }
@@ -4889,6 +5900,39 @@ function renderLobby() {
       render();
     });
   }
+
+  const addBotDraftBtn = document.getElementById("addBotDraftBtn");
+  if (addBotDraftBtn) {
+    addBotDraftBtn.addEventListener("click", () => {
+      const result = addBotDraft(4);
+      if (!result.ok) {
+        showToast(result.error || "Could not add bot.");
+      }
+      render();
+    });
+  }
+
+  document.querySelectorAll("[data-remove-bot-draft]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const botDraftId = btn.getAttribute("data-remove-bot-draft");
+      const result = removeBotDraft(botDraftId);
+      if (!result.ok) {
+        showToast(result.error || "Could not remove bot.");
+      }
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-bot-difficulty-id]").forEach((selectEl) => {
+    selectEl.addEventListener("change", () => {
+      const botDraftId = selectEl.getAttribute("data-bot-difficulty-id");
+      const result = updateBotDraftDifficulty(botDraftId, selectEl.value);
+      if (!result.ok) {
+        showToast(result.error || "Could not update bot difficulty.");
+      }
+      render();
+    });
+  });
 
   const createRouteEl = document.getElementById("createRoute");
   if (createRouteEl) {
@@ -5024,7 +6068,11 @@ function renderLobby() {
         bikeId,
         isHost: true,
       });
-      const session = createSession({ hostUser: user, routePreset });
+      const session = createSession({
+        hostUser: user,
+        routePreset,
+        botConfigs: normalizeBotDrafts(state.lobby.botDrafts),
+      });
       persistLocalSession(session.code, user.id);
       setUser(user);
       setSession(session);
@@ -5190,6 +6238,7 @@ function renderSession() {
   const users = Object.values(session.users || {});
 
   const telemetry = session.telemetry || {};
+  const courseSegments = getCourseSegments(session);
 
   const connectedPeers = Object.values(state.webrtc.peers).filter((p) => p.connected).length;
   let webrtcStatus = "WebRTC not supported";
@@ -5210,9 +6259,13 @@ function renderSession() {
       const climbMeters = Number(session.aggregates?.[u.id]?.totalClimb) || 0;
       const wkg = computeWkg(t.power, u.weight);
       const isMe = user.id === u.id;
-      const gradeFromDistance = getCourseGradeContext(distance, getCourseSegments(session)).currentGrade;
+      const gradeFromDistance = getCourseGradeContext(distance, courseSegments).currentGrade;
+      const participantName = u.isBot
+        ? `${u.name} (Bot L${normalizeBotDifficultyLevel(u.difficultyLevel)} - ${Math.round(Number(u.ftpWatts) || 0)}W)`
+        : u.name;
       return {
         ...u,
+        participantLabel: participantName,
         power: t.power || 0,
         heartRate: t.heartRate || 0,
         cadence: t.cadence || 0,
@@ -5228,7 +6281,7 @@ function renderSession() {
   const currentRider = rows.find((row) => row.id === user.id) || rows[0] || null;
   const currentDistanceMeters = currentRider ? currentRider.distance : 0;
   const sessionRoute = getSessionRoute(session);
-  const routeDistanceMeters = normalizeCourseDistance(currentDistanceMeters, getCourseSegments(session));
+  const routeDistanceMeters = normalizeCourseDistance(currentDistanceMeters, courseSegments);
   const currentElevationMeters = getElevationAtDistance(sessionRoute, routeDistanceMeters);
   const next500mGradient = getAverageGradientAhead(sessionRoute, routeDistanceMeters, 500);
   const remainingDistanceMeters = getRemainingDistance(sessionRoute, routeDistanceMeters);
@@ -5236,17 +6289,21 @@ function renderSession() {
   const routeDistanceKm = Number.isFinite(Number(sessionRoute.distanceKm))
     ? Number(sessionRoute.distanceKm)
     : (Number(sessionRoute.totalDistanceMeters) || 0) / 1000;
-  const routeProfile = buildRouteProfileFromSegments(getCourseSegments(session));
+  const routeProfile = buildRouteProfileFromSegments(courseSegments);
   const elevationProfileHtml = renderElevationProfile({
     routeProfile,
     distanceTraveledMeters: currentDistanceMeters,
     width: 560,
     height: 120,
   });
+  const sideScrollRaceViewHtml = buildSessionSideScrollViewHtml(session, user, {
+    predictMotion: true,
+    nowMs: now,
+  });
 
   const telemetryZoneParticipants = rows.map((row) => ({
     id: row.id,
-    name: row.name,
+    name: row.participantLabel || row.name,
     heartRate: row.heartRate,
     watts: row.power,
   }));
@@ -5256,18 +6313,20 @@ function renderSession() {
     ? "Live values. Colors only: green (low), yellow (medium), red (high)."
     : "No live values yet. Showing mock participant data for testing.";
   const terrain = state.simulation.terrain;
-  const gradientScalePct = Math.round(clamp(state.simulation.gradientScale, 0, 1) * 100);
   const currentGradeText = formatSignedPercent(terrain.currentGrade, 1);
   const effectiveGradeText = formatSignedPercent(terrain.effectiveGrade, 1);
   const nextGradeText = formatSignedPercent(terrain.nextGrade, 1);
   const distanceToNextText =
     terrain.distanceToNext == null || Number.isNaN(terrain.distanceToNext) ? "--" : `${Math.max(0, Math.round(terrain.distanceToNext))}m`;
-  const routeLength = getCourseLengthMeters(getCourseSegments(session));
+  const routeLength = getCourseLengthMeters(courseSegments);
   const routeDistanceText = `${Math.round(terrain.routeDistance || 0)}m / ${Math.round(routeLength)}m`;
   const sessionClimbedText = formatClimbedMeters(session.totalClimbedMeters || 0);
   const privateRiderStats = getPrivateRiderStatsSnapshot(session, user);
   const sessionAvgWattsText = Number.isFinite(privateRiderStats.avgWatts) ? `${Math.round(privateRiderStats.avgWatts)} W` : "--";
   const privateSpeedText = formatSpeedMpsAsKph(privateRiderStats.speedMps);
+  const accountProfile = getCurrentAccountProfile();
+  const currentFtpWatts = getUserFtp(accountProfile);
+  const pendingFtpProposal = getPendingFtpProposal(session, user);
   const currentBike = getBikeById(user.bikeId);
   const sessionBikeOptionsHtml = buildBikeOptionsHtml(currentBike.id);
   const bikeSwitchAllowed = !isSessionRunning() || canSwitchBikeAtSpeed(privateRiderStats.speedMps);
@@ -5282,6 +6341,40 @@ function renderSession() {
     const queued = powerUpState.powerUpQueue[index];
     return `<div class="powerup-slot ${queued ? "filled" : ""}">${queued ? escapeHtml(queued.label) : "EMPTY"}</div>`;
   }).join("");
+  const sessionBots = Object.values(session.users || {}).filter((participant) => participant?.isBot);
+  const sessionBotRowsHtml = sessionBots
+    .map((bot) => {
+      const difficultyOptions = buildBotDifficultyOptionsHtml(bot.difficultyLevel);
+      return `
+        <div class="card" style="margin-top:10px;">
+          <div class="flex-space">
+            <div>
+              <div><strong>${escapeHtml(bot.name)}</strong></div>
+              <div class="small">${escapeHtml(getBotDifficultyConfig(bot.difficultyLevel).label)} | ${Math.round(Number(bot.ftpWatts) || 0)} W FTP</div>
+            </div>
+            <button type="button" class="secondary" data-remove-session-bot="${bot.id}">Remove</button>
+          </div>
+          <div style="margin-top:10px;max-width:320px;">
+            <label class="label">Difficulty</label>
+            <select data-session-bot-difficulty="${bot.id}">${difficultyOptions}</select>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+  const canConfigureSessionBots = user.isHost && !session.startedAt;
+  const sessionBotConfigHtml = canConfigureSessionBots
+    ? `
+      <div class="card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">Bot Riders (Pre-start)</h2>
+        <div class="small">Add up to ${MAX_SESSION_BOTS} pacing/challenge bots before starting the session.</div>
+        <div style="margin-top:10px;">
+          <button id="addSessionBotBtn" class="secondary" ${sessionBots.length < MAX_SESSION_BOTS ? "" : "disabled"}>Add Bot (${sessionBots.length}/${MAX_SESSION_BOTS})</button>
+        </div>
+        ${sessionBotRowsHtml || "<div class='small' style='margin-top:10px;'>No bots configured for this session.</div>"}
+      </div>
+    `
+    : "";
   const privatePeakRows = PRIVATE_RIDER_PEAK_WINDOWS.map((windowDef) => {
     const peakValue = privateRiderStats.bestRollingWatts?.[windowDef.seconds];
     return `
@@ -5291,6 +6384,24 @@ function renderSession() {
       </tr>
     `;
   }).join("");
+  const ftpUpdateCardHtml =
+    state.account.userId && Number.isFinite(currentFtpWatts) && pendingFtpProposal
+      ? `
+      <div class="card ftp-update-card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">FTP Update Available</h2>
+        <div class="small">
+          Your recent effort suggests a higher FTP.
+          Current: <strong>${Math.round(currentFtpWatts)} W</strong> |
+          Suggested: <strong>${Math.round(pendingFtpProposal.candidateFtpWatts)} W</strong>
+        </div>
+        <div class="small" style="margin-top:6px;">Source: ${escapeHtml(pendingFtpProposal.sourceLabel || "Recent effort")}</div>
+        <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
+          <button id="acceptFtpUpdateBtn">Accept new FTP</button>
+          <button id="declineFtpUpdateBtn" class="secondary">Decline</button>
+        </div>
+      </div>
+    `
+      : "";
 
   appEl.innerHTML = `
     <div class="card">
@@ -5335,6 +6446,8 @@ function renderSession() {
       </div>
       <div class="small" style="margin-top:4px;">WebRTC: ${webrtcStatus}</div>
 
+      ${sessionBotConfigHtml}
+
       <div class="terrain-panel" style="margin-top:12px;">
         <div class="terrain-grid">
           <div>
@@ -5364,10 +6477,12 @@ function renderSession() {
         </div>
         <div class="small" style="margin-top:2px;">${sessionClimbedText}</div>
         <div class="small" style="margin-top:2px;">Trainer control: ${escapeHtml(terrain.trainerControlStatus || "--")}</div>
-        <div style="margin-top:10px;">
-          <label class="label" for="gradientScaleRange">Gradient scale (${gradientScalePct}%)</label>
-          <input id="gradientScaleRange" type="range" min="0" max="100" step="5" value="${gradientScalePct}" />
-        </div>
+      </div>
+
+      <div class="elevation-profile-card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">Session Side-Scroller (Prototype)</h2>
+        <div class="small">Local rider is centered. Riders ahead are right, behind are left.</div>
+        <div id="sessionSideScrollMount">${sideScrollRaceViewHtml}</div>
       </div>
 
       <div class="elevation-profile-card" style="margin-top:12px;">
@@ -5401,6 +6516,8 @@ function renderSession() {
           </tbody>
         </table>
       </div>
+
+      ${ftpUpdateCardHtml}
 
       <div class="bike-choice-card" style="margin-top:12px;">
         <h2 style="margin-bottom:8px;">Bike Selection</h2>
@@ -5463,7 +6580,7 @@ function renderSession() {
             .map(
               (row) => `
             <tr class="${row.isMe ? "highlight" : ""}">
-              <td>${row.name}</td>
+              <td>${row.participantLabel || row.name}</td>
               <td>${row.power ? `${row.power}W` : "--"}</td>
               <td>${row.wkg ? formatNumber(row.wkg, 1) : "--"}</td>
               <td>${row.heartRate ? `${row.heartRate} bpm` : "--"}</td>
@@ -5501,6 +6618,41 @@ function renderSession() {
     openPairing("session");
   });
 
+  const addSessionBotBtn = document.getElementById("addSessionBotBtn");
+  if (addSessionBotBtn) {
+    addSessionBotBtn.addEventListener("click", () => {
+      if (!user.isHost || session.startedAt) return;
+      updateSessionOnStorage((sessionState) => {
+        const existingBots = Object.values(sessionState.users || {}).filter((participant) => participant?.isBot);
+        if (existingBots.length >= MAX_SESSION_BOTS) return;
+        const botDraft = createBotDraft(existingBots.length + 1, 4);
+        botDraft.name = getNextBotName(existingBots);
+        addBotToSession(sessionState, botDraft);
+      });
+    });
+  }
+
+  document.querySelectorAll("[data-remove-session-bot]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!user.isHost || session.startedAt) return;
+      const botId = btn.getAttribute("data-remove-session-bot");
+      updateSessionOnStorage((sessionState) => {
+        removeBotFromSession(sessionState, botId);
+      });
+    });
+  });
+
+  document.querySelectorAll("[data-session-bot-difficulty]").forEach((selectEl) => {
+    selectEl.addEventListener("change", () => {
+      if (!user.isHost || session.startedAt) return;
+      const botId = selectEl.getAttribute("data-session-bot-difficulty");
+      const nextLevel = selectEl.value;
+      updateSessionOnStorage((sessionState) => {
+        updateBotDifficulty(sessionState, botId, nextLevel);
+      });
+    });
+  });
+
   const activatePowerUpBtn = document.getElementById("activatePowerUpBtn");
   if (activatePowerUpBtn) {
     activatePowerUpBtn.addEventListener("click", () => {
@@ -5512,6 +6664,33 @@ function renderSession() {
         return;
       }
       showToast(`${activation.powerUp.label} activated for ${Math.round(activation.powerUp.durationMs / 1000)}s.`);
+      render();
+    });
+  }
+
+  const acceptFtpUpdateBtn = document.getElementById("acceptFtpUpdateBtn");
+  if (acceptFtpUpdateBtn) {
+    acceptFtpUpdateBtn.addEventListener("click", () => {
+      const result = acceptPendingFtpProposal(session, user);
+      if (!result.ok) {
+        showToast(result.error || "Could not update FTP.");
+        render();
+        return;
+      }
+      showToast(`FTP updated to ${Math.round(result.ftpWatts)} W.`);
+      render();
+    });
+  }
+
+  const declineFtpUpdateBtn = document.getElementById("declineFtpUpdateBtn");
+  if (declineFtpUpdateBtn) {
+    declineFtpUpdateBtn.addEventListener("click", () => {
+      const result = declinePendingFtpProposal(session, user);
+      if (!result.ok) {
+        showToast(result.error || "Could not dismiss FTP suggestion.");
+        return;
+      }
+      showToast("FTP suggestion dismissed.");
       render();
     });
   }
@@ -5551,19 +6730,6 @@ function renderSession() {
     });
   }
 
-  const gradientScaleRange = document.getElementById("gradientScaleRange");
-  if (gradientScaleRange) {
-    const applyScale = () => {
-      const next = Number(gradientScaleRange.value);
-      state.simulation.gradientScale = clamp(next / 100, 0, 1);
-    };
-    gradientScaleRange.addEventListener("input", applyScale);
-    gradientScaleRange.addEventListener("change", () => {
-      applyScale();
-      render();
-    });
-  }
-
   if (canStartSession()) {
     document.getElementById("startBtn").addEventListener("click", () => {
       startSession();
@@ -5575,6 +6741,8 @@ function renderSession() {
       endSession();
     });
   }
+
+  startSessionSideScrollRenderLoop();
 }
 
 function renderSummary() {
@@ -5679,6 +6847,7 @@ function renderSummaryFromData(summary) {
     state.view = "lobby";
     resetPrivateRiderStats();
     resetPowerUpState();
+    resetFtpProposalState();
     state.session = null;
     state.user = null;
     clearLocalSession();
@@ -5721,7 +6890,7 @@ function startLoop() {
       render();
     }
 
-    state.timer = window.setTimeout(step, 1000);
+    state.timer = window.setTimeout(step, TELEMETRY_POLL_INTERVAL_MS);
   };
 
   step();

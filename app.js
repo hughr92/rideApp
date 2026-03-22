@@ -84,6 +84,10 @@ const FTP_MIN_WATTS = 50;
 const FTP_MAX_WATTS = 600;
 const MAX_SESSION_BOTS = 3;
 const RECENT_SESSIONS_PAGE_SIZE = 10;
+const SAVED_WORKOUTS_PAGE_SIZE = 8;
+const SAVED_WORKOUTS_DURATION_MIN_MINUTES = 5;
+const SAVED_WORKOUTS_DURATION_MAX_MINUTES = 120;
+const SAVED_WORKOUTS_DURATION_STEP_MINUTES = 5;
 const WORKOUT_DEFAULT_SEGMENT_DURATION_SECONDS = 300;
 const WORKOUT_DEFAULT_SET_SEGMENT_DURATION_SECONDS = 60;
 const WORKOUT_MIN_SEGMENT_DURATION_SECONDS = 5;
@@ -477,9 +481,15 @@ let state = {
     workoutDraftSegments: [],
     workoutSelection: null,
     workoutEditingId: null,
+    savedWorkoutsPage: 1,
+    savedWorkoutsFiltersExpanded: false,
+    savedWorkoutsMinDurationSeconds: 0,
+    savedWorkoutsMinDifficulty: 0,
+    savedWorkoutsFilterTags: [],
     workoutFtpOverrideWatts: null,
     showWorkoutFtpModal: false,
     showWorkoutNotesModal: false,
+    workoutCreateNewModal: null,
     savedWorkoutNotesView: null,
     workoutRatingModal: null,
     workoutDeleteModal: null,
@@ -614,6 +624,22 @@ function getPaginatedSessions(sessionsInput, currentPageInput, pageSizeInput) {
     endIndex,
     sessions: sessions.slice(startIndex, endIndex),
   };
+}
+
+function normalizeSavedWorkoutsMinDurationSeconds(valueInput) {
+  const parsedValue = Number(valueInput);
+  if (!Number.isFinite(parsedValue) || parsedValue <= 0) return 0;
+  const stepSeconds = SAVED_WORKOUTS_DURATION_STEP_MINUTES * 60;
+  const minSeconds = SAVED_WORKOUTS_DURATION_MIN_MINUTES * 60;
+  const maxSeconds = SAVED_WORKOUTS_DURATION_MAX_MINUTES * 60;
+  const snappedSeconds = Math.round(parsedValue / stepSeconds) * stepSeconds;
+  return clamp(snappedSeconds, minSeconds, maxSeconds);
+}
+
+function normalizeSavedWorkoutsMinDifficulty(valueInput) {
+  const parsedValue = Number(valueInput);
+  if (!Number.isFinite(parsedValue) || parsedValue <= 0) return 0;
+  return clamp(Math.round(parsedValue), 1, 10);
 }
 
 function persistLocalSession(code, userId) {
@@ -1820,14 +1846,16 @@ function getWorkoutTargetFtpPctFromWatts(targetWattsInput, ftpWattsInput) {
   const safeTargetWatts = Number.isFinite(targetWatts) ? targetWatts : 0;
   if (ftpWatts <= 0) return 0;
   const rawTargetPct = (safeTargetWatts / ftpWatts) * 100;
-  return Math.max(0, Math.round(rawTargetPct * 10000) / 10000);
+  return Math.max(0, rawTargetPct);
 }
 
 function getWorkoutWattsFromTargetFtpPct(targetFtpPctInput, ftpWattsInput, fallbackTargetWatts = 0) {
   const targetFtpPct = normalizeWorkoutTargetFtpPct(targetFtpPctInput, null);
   if (targetFtpPct == null) return normalizeWorkoutTargetWatts(fallbackTargetWatts, 0);
   const ftpWatts = normalizeWorkoutFtpWatts(ftpWattsInput, WORKOUT_DEFAULT_FTP_WATTS);
-  return Math.max(0, Math.floor((ftpWatts * targetFtpPct) / 100));
+  const rawWatts = (ftpWatts * targetFtpPct) / 100;
+  const epsilon = Number.EPSILON * Math.max(1, Math.abs(rawWatts));
+  return Math.max(0, Math.floor(rawWatts + epsilon));
 }
 
 function getWorkoutZoneForWatts(targetWattsInput, ftpWattsInput) {
@@ -5881,6 +5909,13 @@ function renderLobby() {
           name: normalizeWorkoutName(state.lobby.workoutDeleteModal.name),
         }
       : null;
+  state.lobby.workoutCreateNewModal =
+    state.lobby.workoutCreateNewModal && typeof state.lobby.workoutCreateNewModal === "object"
+      ? {
+          name: normalizeWorkoutName(state.lobby.workoutCreateNewModal.name),
+        }
+      : null;
+  state.lobby.savedWorkoutsFiltersExpanded = state.lobby.savedWorkoutsFiltersExpanded === true;
   const selectedWorkoutEntity = getSelectedWorkoutEntity(state.lobby.workoutDraftSegments, state.lobby.workoutSelection);
   const selectedWorkoutSegment = selectedWorkoutEntity.segment;
   const selectedWorkoutSet = selectedWorkoutEntity.setItem;
@@ -5902,6 +5937,57 @@ function renderLobby() {
   const showRecentSessionsPagination = summaries.length > RECENT_SESSIONS_PAGE_SIZE;
   const showingStart = summaries.length === 0 ? 0 : paginatedSummaries.startIndex + 1;
   const showingEnd = Math.min(paginatedSummaries.endIndex, summaries.length);
+  state.lobby.savedWorkoutsMinDurationSeconds = normalizeSavedWorkoutsMinDurationSeconds(state.lobby.savedWorkoutsMinDurationSeconds);
+  state.lobby.savedWorkoutsMinDifficulty = normalizeSavedWorkoutsMinDifficulty(state.lobby.savedWorkoutsMinDifficulty);
+  state.lobby.savedWorkoutsFilterTags = normalizeWorkoutTags(state.lobby.savedWorkoutsFilterTags);
+  const savedWorkoutsMinDurationSeconds = state.lobby.savedWorkoutsMinDurationSeconds;
+  const savedWorkoutsMinDifficulty = state.lobby.savedWorkoutsMinDifficulty;
+  const savedWorkoutsFilterTags = state.lobby.savedWorkoutsFilterTags;
+  const savedWorkoutsMinDurationMinutes =
+    savedWorkoutsMinDurationSeconds > 0 ? Math.floor(savedWorkoutsMinDurationSeconds / 60) : 0;
+  const savedWorkoutsSliderMinutes =
+    savedWorkoutsMinDurationMinutes > 0 ? savedWorkoutsMinDurationMinutes : SAVED_WORKOUTS_DURATION_MIN_MINUTES;
+  const filteredSavedWorkouts = savedWorkouts.filter((workout) => {
+    if (savedWorkoutsMinDurationSeconds <= 0) return true;
+    const durationSeconds = Number(workout?.totalDurationSeconds);
+    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return false;
+    return durationSeconds >= savedWorkoutsMinDurationSeconds;
+  }).filter((workout) => {
+    if (savedWorkoutsMinDifficulty <= 0) return true;
+    const workoutDifficulty = calculateWorkoutDifficulty(
+      workout.segments,
+      normalizeWorkoutFtpWatts(workout.ftpReferenceWatts, WORKOUT_DEFAULT_FTP_WATTS),
+    );
+    return workoutDifficulty >= savedWorkoutsMinDifficulty;
+  }).filter((workout) => {
+    if (savedWorkoutsFilterTags.length === 0) return true;
+    const workoutTags = normalizeWorkoutTags(workout.tags);
+    return savedWorkoutsFilterTags.some((tag) => workoutTags.includes(tag));
+  });
+  const paginatedSavedWorkouts = getPaginatedSessions(
+    filteredSavedWorkouts,
+    state.lobby.savedWorkoutsPage,
+    SAVED_WORKOUTS_PAGE_SIZE,
+  );
+  state.lobby.savedWorkoutsPage = paginatedSavedWorkouts.currentPage;
+  const showSavedWorkoutsPagination = filteredSavedWorkouts.length > SAVED_WORKOUTS_PAGE_SIZE;
+  const showingSavedWorkoutsStart = filteredSavedWorkouts.length === 0 ? 0 : paginatedSavedWorkouts.startIndex + 1;
+  const showingSavedWorkoutsEnd = Math.min(paginatedSavedWorkouts.endIndex, filteredSavedWorkouts.length);
+  const savedWorkoutsDurationLabel =
+    savedWorkoutsMinDurationMinutes > 0 ? `${savedWorkoutsMinDurationMinutes} min and up` : "No minimum";
+  const savedWorkoutsDurationActiveLabel =
+    savedWorkoutsMinDurationMinutes > 0 ? `Duration: ${savedWorkoutsMinDurationMinutes}+ min` : "";
+  const savedWorkoutsDifficultyActiveLabel =
+    savedWorkoutsMinDifficulty > 0 ? `Difficulty: ${savedWorkoutsMinDifficulty}+ / 10` : "";
+  const savedWorkoutsTagsActiveLabel =
+    savedWorkoutsFilterTags.length > 0 ? `Tags: ${savedWorkoutsFilterTags.length}` : "";
+  const hasSavedWorkoutsActiveFilter =
+    savedWorkoutsMinDurationSeconds > 0 || savedWorkoutsMinDifficulty > 0 || savedWorkoutsFilterTags.length > 0;
+  const savedWorkoutsActiveFilterCount =
+    (savedWorkoutsMinDurationSeconds > 0 ? 1 : 0) +
+    (savedWorkoutsMinDifficulty > 0 ? 1 : 0) +
+    (savedWorkoutsFilterTags.length > 0 ? 1 : 0);
+  const savedWorkoutsFiltersExpanded = state.lobby.savedWorkoutsFiltersExpanded === true;
   const profile = getCurrentAccountProfile();
   const loggedIn = isAuthenticated() && !!profile;
   const bluetoothSupported = isWebBluetoothSupported();
@@ -6526,6 +6612,25 @@ function renderLobby() {
       >${escapeHtml(tag)}</button>
     `;
   }).join("");
+  const savedWorkoutsDifficultyOptionsHtml = `
+    <option value="0" ${savedWorkoutsMinDifficulty <= 0 ? "selected" : ""}>ALL</option>
+    ${Array.from({ length: 10 }, (_, index) => {
+      const difficultyValue = index + 1;
+      const isSelected = difficultyValue === savedWorkoutsMinDifficulty;
+      return `<option value="${difficultyValue}" ${isSelected ? "selected" : ""}>${difficultyValue}+</option>`;
+    }).join("")}
+  `;
+  const savedWorkoutsTagFilterButtonsHtml = WORKOUT_TAG_OPTIONS.map((tag) => {
+    const isSelectedTag = savedWorkoutsFilterTags.includes(tag);
+    return `
+      <button
+        type="button"
+        class="secondary workout-tag-btn ${isSelectedTag ? "is-selected" : ""}"
+        data-saved-workouts-filter-tag="${escapeHtml(tag)}"
+        aria-pressed="${isSelectedTag ? "true" : "false"}"
+      >${escapeHtml(tag)}</button>
+    `;
+  }).join("");
   const workoutZonePaletteHtml =
     WORKOUT_ZONES.map(
       (zoneDef) => {
@@ -6582,6 +6687,7 @@ function renderLobby() {
                 class="workout-set-segment-block ${getWorkoutEffortClass(segmentZone)} ${isSelectedSetSegment ? "is-selected" : ""}"
                 data-workout-set-segment-index="${segmentIndex}"
                 data-workout-set-parent-index="${index}"
+                draggable="true"
                 style="width:${segmentWidthPercent.toFixed(4)}%; flex-basis:${segmentWidthPercent.toFixed(4)}%;"
                 title="Set ${index + 1}, Segment ${segmentIndex + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${segmentTargetWatts} W target, ${formatDuration(segment.durationSeconds)}"
                 aria-label="Set ${index + 1}, Segment ${segmentIndex + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${segmentTargetWatts} watts target, ${formatDuration(segment.durationSeconds)}"
@@ -6591,9 +6697,11 @@ function renderLobby() {
           .join("");
         return `
           <div
-            class="workout-set-container ${isSelectedSet ? "is-selected" : ""}"
+            class="workout-set-container workout-top-block ${isSelectedSet ? "is-selected" : ""}"
+            data-workout-top-index="${index}"
             data-workout-set-index="${index}"
             data-workout-set-drop-index="${index}"
+            draggable="true"
             style="width:${widthPercent.toFixed(4)}%; flex-basis:${widthPercent.toFixed(4)}%;"
           >
             <div
@@ -6613,7 +6721,7 @@ function renderLobby() {
                 aria-label="Set ${index + 1} repetitions"
               />
             </div>
-            <div class="workout-set-segments">
+            <div class="workout-set-segments" data-workout-set-segments-index="${index}">
               ${
                 setSegmentsHtml ||
                 `<div class="small workout-set-empty">Drop zones here</div>`
@@ -6632,8 +6740,10 @@ function renderLobby() {
       return `
         <button
           type="button"
-          class="workout-segment-block ${getWorkoutEffortClass(itemZone)} ${isSelected ? "is-selected" : ""}"
+          class="workout-segment-block workout-top-block ${getWorkoutEffortClass(itemZone)} ${isSelected ? "is-selected" : ""}"
+          data-workout-top-index="${index}"
           data-workout-segment-index="${index}"
+          draggable="true"
           style="width:${widthPercent.toFixed(4)}%; flex-basis:${widthPercent.toFixed(4)}%;"
           title="Segment ${index + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${itemTargetWatts} W target, ${formatDuration(item.durationSeconds)}"
           aria-label="Segment ${index + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${itemTargetWatts} watts target, ${formatDuration(item.durationSeconds)}"
@@ -6641,7 +6751,7 @@ function renderLobby() {
       `;
     })
     .join("");
-  const workoutSavedRows = savedWorkouts
+  const workoutSavedRows = paginatedSavedWorkouts.sessions
     .map((workout) => {
       const isEditing = workout.id === state.lobby.workoutEditingId;
       const workoutDifficulty = calculateWorkoutDifficulty(workout.segments, workoutFtpWatts);
@@ -6666,11 +6776,10 @@ function renderLobby() {
           <td>${escapeHtml(workout.name)}</td>
           <td>${workoutDifficulty}/10</td>
           <td>${formatDuration(workout.totalDurationSeconds)}</td>
-          <td>${countWorkoutConfiguredSegments(workout.segments)}</td>
           <td>
             <div class="flex" style="gap:8px; justify-content:flex-end; flex-wrap:wrap;">
               <button type="button" class="secondary workout-rate-btn ${rating != null ? "is-rated" : ""}" data-workout-rate-id="${escapeHtml(workout.id)}">${ratingButtonLabel}</button>
-              <button type="button" class="secondary" data-workout-view-notes-id="${escapeHtml(workout.id)}">View Notes</button>
+              <button type="button" class="secondary" data-workout-view-notes-id="${escapeHtml(workout.id)}">Notes</button>
               <span class="workout-tags-count workout-tooltip-trigger" data-tooltip="${escapeHtml(tagHoverText)}">${tagCountLabel}</span>
               <button type="button" class="secondary" data-workout-load-id="${escapeHtml(workout.id)}">Edit</button>
               <button
@@ -6815,6 +6924,35 @@ function renderLobby() {
           <div class="flex" style="margin-top:12px; gap:8px; justify-content:flex-end;">
             <button id="workoutDeleteModalCancelBtn" class="secondary">Cancel</button>
             <button id="workoutDeleteModalConfirmBtn" class="danger">Remove</button>
+          </div>
+        </div>
+      </div>
+    `
+    : "";
+  const suggestedCreateNewWorkoutName = (() => {
+    const currentName = normalizeWorkoutName(state.lobby.workoutDraftName) || "New Workout";
+    if (state.lobby.workoutEditingId && !/\bcopy$/i.test(currentName)) {
+      return `${currentName} Copy`;
+    }
+    return currentName;
+  })();
+  const workoutCreateNewModalName = normalizeWorkoutName(state.lobby.workoutCreateNewModal?.name) || suggestedCreateNewWorkoutName;
+  const workoutCreateNewModalHtml = state.lobby.workoutCreateNewModal
+    ? `
+      <div class="workout-modal-backdrop" id="workoutCreateNewModalBackdrop">
+        <div class="workout-modal">
+          <h2 style="margin-bottom:8px;">Create New Workout</h2>
+          <div class="small">Confirm the name for the new workout before saving.</div>
+          <label class="label" for="workoutCreateNewNameInput" style="margin-top:10px;">Workout Name</label>
+          <input
+            id="workoutCreateNewNameInput"
+            value="${escapeHtml(workoutCreateNewModalName)}"
+            maxlength="120"
+            placeholder="Enter workout name"
+          />
+          <div class="flex" style="margin-top:12px; gap:8px; justify-content:flex-end;">
+            <button id="workoutCreateNewModalCancelBtn" class="secondary">Cancel</button>
+            <button id="workoutCreateNewModalConfirmBtn">Confirm</button>
           </div>
         </div>
       </div>
@@ -6980,21 +7118,119 @@ function renderLobby() {
       ${savedWorkoutNotesModalHtml}
       ${workoutRatingModalHtml}
       ${workoutDeleteModalHtml}
+      ${workoutCreateNewModalHtml}
     </div>
 
     <div class="card">
       <h2>Saved Workouts</h2>
-      <div class="small">Stored locally on this device for now.</div>
       ${
         savedWorkouts.length === 0
           ? "<p class='small' style='margin-top:10px;'>No saved workouts yet.</p>"
           : `
+      <div class="workout-filters-accordion">
+        <button
+          id="savedWorkoutsToggleFiltersBtn"
+          type="button"
+          class="secondary workout-filters-toggle ${savedWorkoutsFiltersExpanded ? "is-expanded" : ""}"
+          aria-expanded="${savedWorkoutsFiltersExpanded ? "true" : "false"}"
+          aria-controls="savedWorkoutsFiltersPanel"
+        >
+          <span>Filters</span>
+          <span class="small">${savedWorkoutsActiveFilterCount > 0 ? `${savedWorkoutsActiveFilterCount} active` : "No filters active"}</span>
+          <span class="workout-filters-chevron" aria-hidden="true">⌄</span>
+        </button>
+        ${
+          hasSavedWorkoutsActiveFilter
+            ? `
+          <div class="flex" style="gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px;">
+            ${
+              savedWorkoutsDurationActiveLabel
+                ? `<span class="workout-tags-count">${escapeHtml(savedWorkoutsDurationActiveLabel)}</span>`
+                : ""
+            }
+            ${
+              savedWorkoutsDifficultyActiveLabel
+                ? `<span class="workout-tags-count">${escapeHtml(savedWorkoutsDifficultyActiveLabel)}</span>`
+                : ""
+            }
+            ${
+              savedWorkoutsTagsActiveLabel
+                ? `<span class="workout-tags-count">${escapeHtml(savedWorkoutsTagsActiveLabel)}</span>`
+                : ""
+            }
+          </div>
+        `
+            : ""
+        }
+        ${
+          savedWorkoutsFiltersExpanded
+            ? `
+          <div id="savedWorkoutsFiltersPanel" class="workout-filters-panel">
+            <div class="flex" style="align-items:flex-end; gap:12px; flex-wrap:wrap;">
+              <div style="flex:1; min-width:220px;">
+                <label class="label" for="savedWorkoutsMinDurationSlider">Duration</label>
+                <input
+                  id="savedWorkoutsMinDurationSlider"
+                  type="range"
+                  min="${SAVED_WORKOUTS_DURATION_MIN_MINUTES}"
+                  max="${SAVED_WORKOUTS_DURATION_MAX_MINUTES}"
+                  step="${SAVED_WORKOUTS_DURATION_STEP_MINUTES}"
+                  value="${savedWorkoutsSliderMinutes}"
+                />
+                <div class="small" id="savedWorkoutsMinDurationValue">${savedWorkoutsDurationLabel}</div>
+              </div>
+              <div style="width:170px;">
+                <label class="label" for="savedWorkoutsMinDifficultySelect">Difficulty</label>
+                <select id="savedWorkoutsMinDifficultySelect">${savedWorkoutsDifficultyOptionsHtml}</select>
+              </div>
+            </div>
+            <div style="margin-top:10px;">
+              <div class="workout-tag-list">${savedWorkoutsTagFilterButtonsHtml}</div>
+            </div>
+          </div>
+        `
+            : ""
+        }
+      </div>
+      <div class="flex" style="margin-top:10px; justify-content:flex-end;">
+        <button
+          id="savedWorkoutsClearFiltersBtn"
+          type="button"
+          class="secondary"
+          ${hasSavedWorkoutsActiveFilter ? "" : "disabled"}
+        >Clear Filters</button>
+      </div>
+      ${
+        filteredSavedWorkouts.length === 0
+          ? "<p class='small' style='margin-top:10px;'>No saved workouts match the current filter.</p>"
+          : `
       <table class="table" style="margin-top:10px;">
         <thead>
-          <tr><th></th><th>Name</th><th>Difficulty</th><th>Total Duration</th><th>Segments</th><th>Actions</th></tr>
+          <tr><th></th><th>Name</th><th>Difficulty</th><th>Total Duration</th><th>Actions</th></tr>
         </thead>
         <tbody>${workoutSavedRows}</tbody>
       </table>
+      `
+      }
+      ${
+        showSavedWorkoutsPagination
+          ? `
+      <div class="flex-space" style="margin-top:12px; gap:10px; flex-wrap:wrap;">
+        <button id="savedWorkoutsPrevBtn" class="secondary" ${paginatedSavedWorkouts.currentPage <= 1 ? "disabled" : ""}>Previous</button>
+        <div class="small">Page ${paginatedSavedWorkouts.currentPage} of ${paginatedSavedWorkouts.totalPages}</div>
+        <button id="savedWorkoutsNextBtn" class="secondary" ${paginatedSavedWorkouts.currentPage >= paginatedSavedWorkouts.totalPages ? "disabled" : ""}>Next</button>
+      </div>
+      `
+          : ""
+      }
+      <div class="small" style="margin-top:6px;">
+        ${
+          filteredSavedWorkouts.length > 0
+            ? `Showing ${showingSavedWorkoutsStart}-${showingSavedWorkoutsEnd} of ${filteredSavedWorkouts.length} workouts`
+            : `Showing 0 of ${filteredSavedWorkouts.length} workouts`
+        }
+        ${hasSavedWorkoutsActiveFilter ? `(filtered from ${savedWorkouts.length})` : ""}
+      </div>
       `
       }
     </div>
@@ -7542,7 +7778,7 @@ function renderLobby() {
     disconnectHrmInlineBtn.addEventListener("click", () => disconnectDevice("hrm"));
   }
 
-  const addWorkoutDraftSegment = (zoneInput, setIndex = null) => {
+  const addWorkoutDraftSegment = (zoneInput, setIndex = null, setSegmentInsertIndex = null) => {
     const currentSegments = normalizeWorkoutSegments(state.lobby.workoutDraftSegments);
     const hasExplicitSetTarget = setIndex !== null && setIndex !== undefined && String(setIndex).trim() !== "";
     if (hasExplicitSetTarget && Number.isFinite(Number(setIndex))) {
@@ -7550,11 +7786,15 @@ function renderLobby() {
       const targetSet = currentSegments[targetSetIndex];
       if (targetSet?.type === WORKOUT_ITEM_TYPE_SET) {
         const nextSegment = createWorkoutSegment(zoneInput, WORKOUT_DEFAULT_SET_SEGMENT_DURATION_SECONDS, workoutFtpWatts);
+        const requestedInsertIndex = Number.isFinite(Number(setSegmentInsertIndex)) ? Math.round(Number(setSegmentInsertIndex)) : targetSet.segments.length;
+        const insertIndex = clamp(requestedInsertIndex, 0, targetSet.segments.length);
+        const nextSetSegments = targetSet.segments.slice();
+        nextSetSegments.splice(insertIndex, 0, nextSegment);
         const nextSegments = currentSegments.map((item, index) =>
           index === targetSetIndex
             ? {
                 ...item,
-                segments: [...item.segments, nextSegment],
+                segments: nextSetSegments,
               }
             : item,
         );
@@ -7562,7 +7802,7 @@ function renderLobby() {
         state.lobby.workoutSelection = {
           kind: "set-segment",
           setIndex: targetSetIndex,
-          segmentIndex: targetSet.segments.length,
+          segmentIndex: insertIndex,
         };
         return;
       }
@@ -7577,15 +7817,109 @@ function renderLobby() {
     };
   };
 
-  const addWorkoutDraftSet = () => {
+  const addWorkoutDraftSet = (insertIndex = null) => {
     const currentSegments = normalizeWorkoutSegments(state.lobby.workoutDraftSegments);
     const nextSet = createWorkoutSet(2);
-    const nextSegments = [...currentSegments, nextSet];
+    const hasExplicitInsertIndex = insertIndex !== null && insertIndex !== undefined && String(insertIndex).trim() !== "";
+    const resolvedInsertIndex =
+      hasExplicitInsertIndex && Number.isFinite(Number(insertIndex))
+        ? clamp(Math.round(Number(insertIndex)), 0, currentSegments.length)
+        : currentSegments.length;
+    const nextSegments = currentSegments.slice();
+    nextSegments.splice(resolvedInsertIndex, 0, nextSet);
     state.lobby.workoutDraftSegments = nextSegments;
     state.lobby.workoutSelection = {
       kind: "set",
-      setIndex: nextSegments.length - 1,
+      setIndex: resolvedInsertIndex,
     };
+  };
+
+  const insertWorkoutDraftSegmentAtTimelineIndex = (zoneInput, insertIndexInput) => {
+    const currentSegments = normalizeWorkoutSegments(state.lobby.workoutDraftSegments);
+    const insertIndex = clamp(Math.round(Number(insertIndexInput) || 0), 0, currentSegments.length);
+    const nextSegment = createWorkoutSegment(zoneInput, WORKOUT_DEFAULT_SEGMENT_DURATION_SECONDS, workoutFtpWatts);
+    const nextSegments = currentSegments.slice();
+    nextSegments.splice(insertIndex, 0, nextSegment);
+    state.lobby.workoutDraftSegments = nextSegments;
+    state.lobby.workoutSelection = {
+      kind: "segment",
+      index: insertIndex,
+    };
+  };
+
+  const moveWorkoutDraftTopItem = (fromIndexInput, insertIndexInput) => {
+    const currentSegments = normalizeWorkoutSegments(state.lobby.workoutDraftSegments);
+    const fromIndex = Math.round(Number(fromIndexInput));
+    if (!Number.isFinite(fromIndex) || fromIndex < 0 || fromIndex >= currentSegments.length) return false;
+    const rawInsertIndex = clamp(Math.round(Number(insertIndexInput) || 0), 0, currentSegments.length);
+    let resolvedInsertIndex = rawInsertIndex;
+    if (fromIndex < resolvedInsertIndex) {
+      resolvedInsertIndex -= 1;
+    }
+    resolvedInsertIndex = clamp(resolvedInsertIndex, 0, currentSegments.length - 1);
+    if (resolvedInsertIndex === fromIndex) return false;
+    const nextSegments = currentSegments.slice();
+    const [movedItem] = nextSegments.splice(fromIndex, 1);
+    nextSegments.splice(resolvedInsertIndex, 0, movedItem);
+    state.lobby.workoutDraftSegments = nextSegments;
+    state.lobby.workoutSelection =
+      movedItem?.type === WORKOUT_ITEM_TYPE_SET
+        ? { kind: "set", setIndex: resolvedInsertIndex }
+        : { kind: "segment", index: resolvedInsertIndex };
+    return true;
+  };
+
+  const moveWorkoutDraftSetSegment = (fromSetIndexInput, fromSegmentIndexInput, toSetIndexInput, toInsertIndexInput) => {
+    const currentSegments = normalizeWorkoutSegments(state.lobby.workoutDraftSegments);
+    const fromSetIndex = Math.round(Number(fromSetIndexInput));
+    const fromSegmentIndex = Math.round(Number(fromSegmentIndexInput));
+    const toSetIndex = Math.round(Number(toSetIndexInput));
+    if (!Number.isFinite(fromSetIndex) || !Number.isFinite(fromSegmentIndex) || !Number.isFinite(toSetIndex)) return false;
+    const sourceSet = currentSegments[fromSetIndex];
+    const targetSet = currentSegments[toSetIndex];
+    if (!sourceSet || sourceSet.type !== WORKOUT_ITEM_TYPE_SET) return false;
+    if (!targetSet || targetSet.type !== WORKOUT_ITEM_TYPE_SET) return false;
+    if (fromSegmentIndex < 0 || fromSegmentIndex >= sourceSet.segments.length) return false;
+    const movingSegment = sourceSet.segments[fromSegmentIndex];
+    const sourceSegments = sourceSet.segments.slice();
+    sourceSegments.splice(fromSegmentIndex, 1);
+    const targetSegments = fromSetIndex === toSetIndex ? sourceSegments.slice() : targetSet.segments.slice();
+    const rawInsertIndex = Math.round(Number(toInsertIndexInput));
+    let safeInsertIndex = Number.isFinite(rawInsertIndex) ? rawInsertIndex : targetSegments.length;
+    if (fromSetIndex === toSetIndex && fromSegmentIndex < safeInsertIndex) {
+      safeInsertIndex -= 1;
+    }
+    const insertIndex = clamp(safeInsertIndex, 0, targetSegments.length);
+    if (fromSetIndex === toSetIndex && insertIndex === fromSegmentIndex) return false;
+    targetSegments.splice(insertIndex, 0, movingSegment);
+    const nextSegments = currentSegments.map((entry, entryIndex) => {
+      if (entryIndex === fromSetIndex && entryIndex === toSetIndex) {
+        return {
+          ...entry,
+          segments: targetSegments,
+        };
+      }
+      if (entryIndex === fromSetIndex) {
+        return {
+          ...entry,
+          segments: sourceSegments,
+        };
+      }
+      if (entryIndex === toSetIndex) {
+        return {
+          ...entry,
+          segments: targetSegments,
+        };
+      }
+      return entry;
+    });
+    state.lobby.workoutDraftSegments = nextSegments;
+    state.lobby.workoutSelection = {
+      kind: "set-segment",
+      setIndex: toSetIndex,
+      segmentIndex: insertIndex,
+    };
+    return true;
   };
 
   const workoutNameInput = document.getElementById("workoutNameInput");
@@ -7614,15 +7948,65 @@ function renderLobby() {
     });
   }
 
+  const persistWorkoutDraft = ({ forceCreateNew = false, nameOverride = null } = {}) => {
+    const currentName = normalizeWorkoutName(state.lobby.workoutDraftName);
+    const overrideName = normalizeWorkoutName(nameOverride);
+    const draftName = overrideName
+      ? overrideName
+      : forceCreateNew && state.lobby.workoutEditingId && currentName && !/\bcopy$/i.test(currentName)
+        ? `${currentName} Copy`
+        : currentName;
+    const validation = validateWorkoutDraft(draftName, state.lobby.workoutDraftSegments, state.lobby.workoutDraftTags);
+    if (!validation.valid) {
+      showToast(validation.errors[0] || "Workout draft is incomplete.");
+      return;
+    }
+
+    const existingWorkouts = loadWorkouts();
+    const editingId = forceCreateNew ? null : state.lobby.workoutEditingId;
+    const editingIndex = editingId ? existingWorkouts.findIndex((workout) => workout.id === editingId) : -1;
+    const existingWorkout = editingIndex >= 0 ? existingWorkouts[editingIndex] : null;
+    const workoutId = existingWorkout?.id || `workout_${currentMs()}_${makeId(6).toLowerCase()}`;
+    const workoutRecord = normalizeWorkoutRecord({
+      id: workoutId,
+      name: validation.name,
+      createdAt: existingWorkout?.createdAt || currentMs(),
+      ftpReferenceWatts: workoutFtpWatts,
+      notes: state.lobby.workoutDraftNotes,
+      isFavorite: forceCreateNew ? false : existingWorkout?.isFavorite === true,
+      rating: forceCreateNew ? null : normalizeWorkoutRating(existingWorkout?.rating, null),
+      tags: validation.tags,
+      segments: validation.segments,
+      totalDurationSeconds: validation.totalDurationSeconds,
+    });
+
+    const nextWorkouts = existingWorkouts.slice();
+    if (editingIndex >= 0) {
+      nextWorkouts[editingIndex] = workoutRecord;
+    } else {
+      nextWorkouts.unshift(workoutRecord);
+    }
+    saveWorkouts(nextWorkouts);
+    state.lobby.workoutEditingId = workoutRecord.id;
+    state.lobby.workoutDraftName = workoutRecord.name;
+    state.lobby.workoutDraftNotes = normalizeWorkoutNotes(workoutRecord.notes);
+    state.lobby.workoutDraftTags = normalizeWorkoutTags(workoutRecord.tags);
+    state.lobby.workoutDraftSegments = normalizeWorkoutSegments(workoutRecord.segments);
+    state.lobby.workoutSelection = findFirstWorkoutSelection(state.lobby.workoutDraftSegments);
+    state.lobby.workoutCreateNewModal = null;
+    showToast(forceCreateNew ? "New workout saved." : editingIndex >= 0 ? "Workout updated." : "Workout saved.");
+    render();
+  };
+
   const workoutCreateNewBtn = document.getElementById("workoutCreateNewBtn");
   if (workoutCreateNewBtn) {
     workoutCreateNewBtn.addEventListener("click", () => {
-      const currentName = normalizeWorkoutName(state.lobby.workoutDraftName);
-      if (state.lobby.workoutEditingId && currentName && !/\bcopy$/i.test(currentName)) {
-        state.lobby.workoutDraftName = `${currentName} Copy`;
-      }
-      state.lobby.workoutEditingId = null;
-      showToast("Create New enabled. Saving now will create a new workout.");
+      const currentName = normalizeWorkoutName(state.lobby.workoutDraftName) || "New Workout";
+      const suggestedName =
+        state.lobby.workoutEditingId && !/\bcopy$/i.test(currentName) ? `${currentName} Copy` : currentName;
+      state.lobby.workoutCreateNewModal = {
+        name: suggestedName,
+      };
       render();
     });
   }
@@ -7630,45 +8014,32 @@ function renderLobby() {
   const workoutSaveBtn = document.getElementById("workoutSaveBtn");
   if (workoutSaveBtn) {
     workoutSaveBtn.addEventListener("click", () => {
-      const validation = validateWorkoutDraft(state.lobby.workoutDraftName, state.lobby.workoutDraftSegments, state.lobby.workoutDraftTags);
-      if (!validation.valid) {
-        showToast(validation.errors[0] || "Workout draft is incomplete.");
-        return;
-      }
+      persistWorkoutDraft({ forceCreateNew: false });
+    });
+  }
 
-      const existingWorkouts = loadWorkouts();
-      const editingId = state.lobby.workoutEditingId;
-      const editingIndex = editingId ? existingWorkouts.findIndex((workout) => workout.id === editingId) : -1;
-      const existingWorkout = editingIndex >= 0 ? existingWorkouts[editingIndex] : null;
-      const workoutId = existingWorkout?.id || `workout_${currentMs()}_${makeId(6).toLowerCase()}`;
-      const workoutRecord = normalizeWorkoutRecord({
-        id: workoutId,
-        name: validation.name,
-        createdAt: existingWorkout?.createdAt || currentMs(),
-        ftpReferenceWatts: workoutFtpWatts,
-        notes: state.lobby.workoutDraftNotes,
-        isFavorite: existingWorkout?.isFavorite === true,
-        rating: normalizeWorkoutRating(existingWorkout?.rating, null),
-        tags: validation.tags,
-        segments: validation.segments,
-        totalDurationSeconds: validation.totalDurationSeconds,
-      });
-
-      const nextWorkouts = existingWorkouts.slice();
-      if (editingIndex >= 0) {
-        nextWorkouts[editingIndex] = workoutRecord;
-      } else {
-        nextWorkouts.unshift(workoutRecord);
-      }
-      saveWorkouts(nextWorkouts);
-      state.lobby.workoutEditingId = workoutRecord.id;
-      state.lobby.workoutDraftName = workoutRecord.name;
-      state.lobby.workoutDraftNotes = normalizeWorkoutNotes(workoutRecord.notes);
-      state.lobby.workoutDraftTags = normalizeWorkoutTags(workoutRecord.tags);
-      state.lobby.workoutDraftSegments = normalizeWorkoutSegments(workoutRecord.segments);
-      state.lobby.workoutSelection = findFirstWorkoutSelection(state.lobby.workoutDraftSegments);
-      showToast(editingIndex >= 0 ? "Workout updated." : "Workout saved.");
+  const workoutCreateNewModalCancelBtn = document.getElementById("workoutCreateNewModalCancelBtn");
+  if (workoutCreateNewModalCancelBtn) {
+    workoutCreateNewModalCancelBtn.addEventListener("click", () => {
+      state.lobby.workoutCreateNewModal = null;
       render();
+    });
+  }
+
+  const workoutCreateNewModalBackdrop = document.getElementById("workoutCreateNewModalBackdrop");
+  if (workoutCreateNewModalBackdrop) {
+    workoutCreateNewModalBackdrop.addEventListener("click", (event) => {
+      if (event.target !== workoutCreateNewModalBackdrop) return;
+      state.lobby.workoutCreateNewModal = null;
+      render();
+    });
+  }
+
+  const workoutCreateNewModalConfirmBtn = document.getElementById("workoutCreateNewModalConfirmBtn");
+  if (workoutCreateNewModalConfirmBtn) {
+    workoutCreateNewModalConfirmBtn.addEventListener("click", () => {
+      const nextNameInput = document.getElementById("workoutCreateNewNameInput")?.value ?? "";
+      persistWorkoutDraft({ forceCreateNew: true, nameOverride: nextNameInput });
     });
   }
 
@@ -7761,17 +8132,38 @@ function renderLobby() {
     });
   }
 
+  let activeWorkoutDragPayloadRaw = null;
+  const setActiveWorkoutDragPayload = (payloadRaw) => {
+    activeWorkoutDragPayloadRaw = String(payloadRaw || "").trim() || null;
+  };
+  const clearActiveWorkoutDragPayload = () => {
+    activeWorkoutDragPayloadRaw = null;
+  };
+
   document.querySelectorAll("[data-workout-zone]").forEach((zoneEl) => {
     const zone = getWorkoutZoneConfig(zoneEl.getAttribute("data-workout-zone")).zone;
     zoneEl.addEventListener("dragstart", (event) => {
+      const payload = `zone:${zone}`;
+      setActiveWorkoutDragPayload(payload);
       if (event.dataTransfer) {
-        event.dataTransfer.setData("text/plain", `zone:${zone}`);
+        event.dataTransfer.setData("text/plain", payload);
         event.dataTransfer.effectAllowed = "copy";
       }
       zoneEl.classList.add("is-dragging");
     });
     zoneEl.addEventListener("dragend", () => {
       zoneEl.classList.remove("is-dragging");
+      clearActiveWorkoutDragPayload();
+      clearWorkoutTopDropHints();
+      clearWorkoutSetSegmentDropHints();
+      if (workoutTimelineDrop) {
+        delete workoutTimelineDrop.dataset.insertIndex;
+        workoutTimelineDrop.classList.remove("is-drag-over");
+      }
+      document.querySelectorAll("[data-workout-set-segments-index]").forEach((setSegmentsEl) => {
+        setSegmentsEl.classList.remove("is-drag-over");
+        delete setSegmentsEl.dataset.insertIndex;
+      });
     });
     zoneEl.addEventListener("click", () => {
       addWorkoutDraftSegment(zone);
@@ -7781,6 +8173,7 @@ function renderLobby() {
 
   document.querySelectorAll("[data-workout-add-set]").forEach((setEl) => {
     setEl.addEventListener("dragstart", (event) => {
+      setActiveWorkoutDragPayload("set");
       if (event.dataTransfer) {
         event.dataTransfer.setData("text/plain", "set");
         event.dataTransfer.effectAllowed = "copy";
@@ -7789,6 +8182,17 @@ function renderLobby() {
     });
     setEl.addEventListener("dragend", () => {
       setEl.classList.remove("is-dragging");
+      clearActiveWorkoutDragPayload();
+      clearWorkoutTopDropHints();
+      clearWorkoutSetSegmentDropHints();
+      if (workoutTimelineDrop) {
+        delete workoutTimelineDrop.dataset.insertIndex;
+        workoutTimelineDrop.classList.remove("is-drag-over");
+      }
+      document.querySelectorAll("[data-workout-set-segments-index]").forEach((setSegmentsEl) => {
+        setSegmentsEl.classList.remove("is-drag-over");
+        delete setSegmentsEl.dataset.insertIndex;
+      });
     });
     setEl.addEventListener("click", () => {
       addWorkoutDraftSet();
@@ -7815,42 +8219,266 @@ function renderLobby() {
   });
 
   const parseWorkoutPaletteDropPayload = (payloadInput) => {
-    const payload = String(payloadInput || "").trim().toLowerCase();
-    if (payload === "set") return { kind: "set" };
-    if (payload.startsWith("zone:")) {
-      const zoneValue = payload.slice("zone:".length);
+    const payload = String(payloadInput || "").trim();
+    const lowered = payload.toLowerCase();
+    if (lowered === "set") return { kind: "set" };
+    if (lowered.startsWith("zone:")) {
+      const zoneValue = lowered.slice("zone:".length);
       const zone = getWorkoutZoneConfig(zoneValue).zone;
       return { kind: "zone", zone };
     }
+    if (lowered.startsWith("move-top:")) {
+      const indexValue = Math.round(Number(lowered.slice("move-top:".length)));
+      if (!Number.isFinite(indexValue)) return null;
+      return { kind: "move-top", index: indexValue };
+    }
+    if (lowered.startsWith("move-set-segment:")) {
+      const values = lowered.slice("move-set-segment:".length).split(":");
+      if (values.length !== 2) return null;
+      const setIndex = Math.round(Number(values[0]));
+      const segmentIndex = Math.round(Number(values[1]));
+      if (!Number.isFinite(setIndex) || !Number.isFinite(segmentIndex)) return null;
+      return { kind: "move-set-segment", setIndex, segmentIndex };
+    }
     return null;
+  };
+  const getWorkoutDropPayload = (event) =>
+    parseWorkoutPaletteDropPayload(activeWorkoutDragPayloadRaw) ||
+    parseWorkoutPaletteDropPayload(event?.dataTransfer?.getData("text/plain"));
+
+  const clearWorkoutTopDropHints = () => {
+    document.querySelectorAll(".workout-top-block.is-drop-before, .workout-top-block.is-drop-after").forEach((entry) => {
+      entry.classList.remove("is-drop-before", "is-drop-after");
+    });
+  };
+
+  const clearWorkoutSetSegmentDropHints = () => {
+    document.querySelectorAll(".workout-set-segment-block.is-drop-before, .workout-set-segment-block.is-drop-after").forEach((entry) => {
+      entry.classList.remove("is-drop-before", "is-drop-after");
+    });
+  };
+
+  const getWorkoutTopInsertionIndexFromPointer = (containerEl, event) => {
+    const topBlocks = Array.from(containerEl.querySelectorAll("[data-workout-top-index]"));
+    if (topBlocks.length === 0) return 0;
+    const pointerX = Number(event.clientX);
+    const safePointerX = Number.isFinite(pointerX) ? pointerX : topBlocks[0].getBoundingClientRect().left;
+    for (const blockEl of topBlocks) {
+      const blockIndex = Math.round(Number(blockEl.getAttribute("data-workout-top-index")) || 0);
+      const rect = blockEl.getBoundingClientRect();
+      const midpoint = rect.left + rect.width / 2;
+      if (safePointerX < midpoint) return blockIndex;
+    }
+    return topBlocks.length;
+  };
+
+  const applyWorkoutTopInsertionHintByIndex = (containerEl, insertIndexInput) => {
+    clearWorkoutTopDropHints();
+    const topBlocks = Array.from(containerEl.querySelectorAll("[data-workout-top-index]"));
+    if (topBlocks.length === 0) return;
+    const insertIndex = clamp(Math.round(Number(insertIndexInput) || 0), 0, topBlocks.length);
+    if (insertIndex <= 0) {
+      topBlocks[0].classList.add("is-drop-before");
+      return;
+    }
+    if (insertIndex >= topBlocks.length) {
+      topBlocks[topBlocks.length - 1].classList.add("is-drop-after");
+      return;
+    }
+    const target = topBlocks.find((entry) => Math.round(Number(entry.getAttribute("data-workout-top-index")) || 0) === insertIndex);
+    if (target) {
+      target.classList.add("is-drop-before");
+    }
+  };
+
+  const getWorkoutSetInsertionIndexFromPointer = (setSegmentsEl, event) => {
+    const setSegmentBlocks = Array.from(setSegmentsEl.querySelectorAll("[data-workout-set-segment-index]"));
+    if (setSegmentBlocks.length === 0) return 0;
+    const pointerX = Number(event.clientX);
+    const safePointerX = Number.isFinite(pointerX) ? pointerX : setSegmentBlocks[0].getBoundingClientRect().left;
+    for (const segmentEl of setSegmentBlocks) {
+      const segmentIndex = Math.round(Number(segmentEl.getAttribute("data-workout-set-segment-index")) || 0);
+      const rect = segmentEl.getBoundingClientRect();
+      const midpoint = rect.left + rect.width / 2;
+      if (safePointerX < midpoint) return segmentIndex;
+    }
+    return setSegmentBlocks.length;
+  };
+
+  const applyWorkoutSetInsertionHintByIndex = (setSegmentsEl, insertIndexInput) => {
+    clearWorkoutSetSegmentDropHints();
+    const setSegmentBlocks = Array.from(setSegmentsEl.querySelectorAll("[data-workout-set-segment-index]"));
+    if (setSegmentBlocks.length === 0) return;
+    const insertIndex = clamp(Math.round(Number(insertIndexInput) || 0), 0, setSegmentBlocks.length);
+    if (insertIndex <= 0) {
+      setSegmentBlocks[0].classList.add("is-drop-before");
+      return;
+    }
+    if (insertIndex >= setSegmentBlocks.length) {
+      setSegmentBlocks[setSegmentBlocks.length - 1].classList.add("is-drop-after");
+      return;
+    }
+    const target = setSegmentBlocks.find((entry) => Math.round(Number(entry.getAttribute("data-workout-set-segment-index")) || 0) === insertIndex);
+    if (target) {
+      target.classList.add("is-drop-before");
+    }
+  };
+
+  const getWorkoutDropPosition = (event, targetEl, { edgeOnly = false } = {}) => {
+    const rect = targetEl.getBoundingClientRect();
+    const pointerX = Number(event.clientX) || rect.left;
+    if (edgeOnly) {
+      const edgeSize = Math.max(18, Math.min(34, rect.width * 0.22));
+      if (pointerX <= rect.left + edgeSize) return "before";
+      if (pointerX >= rect.right - edgeSize) return "after";
+      return "center";
+    }
+    const midpoint = rect.left + rect.width / 2;
+    return pointerX >= midpoint ? "after" : "before";
+  };
+
+  const applyWorkoutTopDropHint = (targetEl, position) => {
+    clearWorkoutTopDropHints();
+    if (!targetEl || (position !== "before" && position !== "after")) return;
+    targetEl.classList.add(position === "before" ? "is-drop-before" : "is-drop-after");
+  };
+
+  const applyWorkoutSetSegmentDropHint = (targetEl, position) => {
+    clearWorkoutSetSegmentDropHints();
+    if (!targetEl || (position !== "before" && position !== "after")) return;
+    targetEl.classList.add(position === "before" ? "is-drop-before" : "is-drop-after");
+  };
+
+  const shouldUseSetCenterDrop = (dropPayload, targetEl, event) => {
+    if (!dropPayload || !targetEl?.classList?.contains("workout-set-container")) return false;
+    if (dropPayload.kind !== "zone" && dropPayload.kind !== "move-set-segment") return false;
+    return getWorkoutDropPosition(event, targetEl, { edgeOnly: true }) === "center";
+  };
+
+  const applyWorkoutTopDropPayload = (dropPayload, insertionIndexInput) => {
+    if (!dropPayload) return false;
+    if (dropPayload.kind === "zone") {
+      insertWorkoutDraftSegmentAtTimelineIndex(dropPayload.zone, insertionIndexInput);
+      return true;
+    }
+    if (dropPayload.kind === "set") {
+      addWorkoutDraftSet(insertionIndexInput);
+      return true;
+    }
+    if (dropPayload.kind === "move-top") {
+      return moveWorkoutDraftTopItem(dropPayload.index, insertionIndexInput);
+    }
+    return false;
   };
 
   const workoutTimelineDrop = document.getElementById("workoutTimelineDrop");
   if (workoutTimelineDrop) {
     workoutTimelineDrop.addEventListener("dragover", (event) => {
+      const dropPayload = getWorkoutDropPayload(event);
+      const supportsTimelineInsert =
+        dropPayload?.kind === "zone" || dropPayload?.kind === "set" || dropPayload?.kind === "move-top";
+      if (!supportsTimelineInsert) return;
       event.preventDefault();
+      const insertIndex = getWorkoutTopInsertionIndexFromPointer(workoutTimelineDrop, event);
+      workoutTimelineDrop.dataset.insertIndex = String(insertIndex);
+      applyWorkoutTopInsertionHintByIndex(workoutTimelineDrop, insertIndex);
       workoutTimelineDrop.classList.add("is-drag-over");
     });
     workoutTimelineDrop.addEventListener("dragleave", () => {
       workoutTimelineDrop.classList.remove("is-drag-over");
+      delete workoutTimelineDrop.dataset.insertIndex;
+      clearWorkoutTopDropHints();
     });
     workoutTimelineDrop.addEventListener("drop", (event) => {
       event.preventDefault();
       workoutTimelineDrop.classList.remove("is-drag-over");
-      const dropPayload = parseWorkoutPaletteDropPayload(event.dataTransfer?.getData("text/plain"));
+      clearWorkoutTopDropHints();
+      clearWorkoutSetSegmentDropHints();
+      const dropPayload = getWorkoutDropPayload(event);
       if (!dropPayload) return;
-      if (dropPayload.kind === "set") {
-        addWorkoutDraftSet();
-      } else if (dropPayload.kind === "zone") {
-        addWorkoutDraftSegment(dropPayload.zone);
-      }
+      const supportsTimelineInsert =
+        dropPayload.kind === "zone" || dropPayload.kind === "set" || dropPayload.kind === "move-top";
+      if (!supportsTimelineInsert) return;
+      const fallbackInsertIndex = normalizeWorkoutSegments(state.lobby.workoutDraftSegments).length;
+      const parsedInsertIndex = Math.round(Number(workoutTimelineDrop.dataset.insertIndex));
+      const insertIndex = Number.isFinite(parsedInsertIndex) ? parsedInsertIndex : fallbackInsertIndex;
+      delete workoutTimelineDrop.dataset.insertIndex;
+      if (!applyWorkoutTopDropPayload(dropPayload, insertIndex)) return;
       render();
     });
   }
 
+  document.querySelectorAll("[data-workout-top-index]").forEach((topBlockEl) => {
+    const topIndex = Math.round(Number(topBlockEl.getAttribute("data-workout-top-index")) || 0);
+    topBlockEl.addEventListener("dragstart", (event) => {
+      const payload = `move-top:${topIndex}`;
+      setActiveWorkoutDragPayload(payload);
+      if (event.dataTransfer) {
+        event.dataTransfer.setData("text/plain", payload);
+        event.dataTransfer.effectAllowed = "move";
+      }
+      topBlockEl.classList.add("is-dragging");
+      hideWorkoutTooltip();
+    });
+    topBlockEl.addEventListener("dragend", () => {
+      topBlockEl.classList.remove("is-dragging");
+      clearActiveWorkoutDragPayload();
+      clearWorkoutTopDropHints();
+      clearWorkoutSetSegmentDropHints();
+      if (workoutTimelineDrop) {
+        delete workoutTimelineDrop.dataset.insertIndex;
+        workoutTimelineDrop.classList.remove("is-drag-over");
+      }
+    });
+    topBlockEl.addEventListener("dragover", (event) => {
+      const dropPayload = getWorkoutDropPayload(event);
+      if (!dropPayload) return;
+      if (shouldUseSetCenterDrop(dropPayload, topBlockEl, event)) {
+        clearWorkoutTopDropHints();
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const position = getWorkoutDropPosition(event, topBlockEl, {
+        edgeOnly: topBlockEl.classList.contains("workout-set-container"),
+      });
+      applyWorkoutTopDropHint(topBlockEl, position);
+    });
+    topBlockEl.addEventListener("dragleave", (event) => {
+      if (event.relatedTarget && topBlockEl.contains(event.relatedTarget)) return;
+      clearWorkoutTopDropHints();
+    });
+    topBlockEl.addEventListener("drop", (event) => {
+      const dropPayload = getWorkoutDropPayload(event);
+      if (!dropPayload) return;
+      if (shouldUseSetCenterDrop(dropPayload, topBlockEl, event)) {
+        clearWorkoutTopDropHints();
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const position = getWorkoutDropPosition(event, topBlockEl, {
+        edgeOnly: topBlockEl.classList.contains("workout-set-container"),
+      });
+      clearWorkoutTopDropHints();
+      clearWorkoutSetSegmentDropHints();
+      const insertionIndex = topIndex + (position === "after" ? 1 : 0);
+      if (!applyWorkoutTopDropPayload(dropPayload, insertionIndex)) return;
+      render();
+    });
+  });
+
   document.querySelectorAll("[data-workout-set-drop-index]").forEach((setDropEl) => {
     setDropEl.addEventListener("dragover", (event) => {
+      const dropPayload = getWorkoutDropPayload(event);
+      if (!dropPayload || (dropPayload.kind !== "zone" && dropPayload.kind !== "move-set-segment")) return;
+      const position = getWorkoutDropPosition(event, setDropEl, { edgeOnly: true });
+      if (position !== "center") {
+        setDropEl.classList.remove("is-drag-over");
+        return;
+      }
       event.preventDefault();
+      event.stopPropagation();
       setDropEl.classList.add("is-drag-over");
     });
     setDropEl.addEventListener("dragleave", () => {
@@ -7860,10 +8488,63 @@ function renderLobby() {
       event.preventDefault();
       event.stopPropagation();
       setDropEl.classList.remove("is-drag-over");
-      const dropPayload = parseWorkoutPaletteDropPayload(event.dataTransfer?.getData("text/plain"));
-      if (!dropPayload || dropPayload.kind !== "zone") return;
+      const dropPayload = getWorkoutDropPayload(event);
+      if (!dropPayload || (dropPayload.kind !== "zone" && dropPayload.kind !== "move-set-segment")) return;
+      const position = getWorkoutDropPosition(event, setDropEl, { edgeOnly: true });
+      if (position !== "center") return;
+      clearWorkoutTopDropHints();
+      clearWorkoutSetSegmentDropHints();
       const setIndex = Math.round(Number(setDropEl.getAttribute("data-workout-set-drop-index")) || 0);
-      addWorkoutDraftSegment(dropPayload.zone, setIndex);
+      if (dropPayload.kind === "zone") {
+        addWorkoutDraftSegment(dropPayload.zone, setIndex);
+      } else {
+        const currentSegments = normalizeWorkoutSegments(state.lobby.workoutDraftSegments);
+        const targetSet = currentSegments[setIndex];
+        if (!targetSet || targetSet.type !== WORKOUT_ITEM_TYPE_SET) return;
+        if (!moveWorkoutDraftSetSegment(dropPayload.setIndex, dropPayload.segmentIndex, setIndex, targetSet.segments.length)) return;
+      }
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-workout-set-segments-index]").forEach((setSegmentsEl) => {
+    setSegmentsEl.addEventListener("dragover", (event) => {
+      const dropPayload = getWorkoutDropPayload(event);
+      if (!dropPayload || (dropPayload.kind !== "zone" && dropPayload.kind !== "move-set-segment")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const insertIndex = getWorkoutSetInsertionIndexFromPointer(setSegmentsEl, event);
+      setSegmentsEl.dataset.insertIndex = String(insertIndex);
+      applyWorkoutSetInsertionHintByIndex(setSegmentsEl, insertIndex);
+      setSegmentsEl.classList.add("is-drag-over");
+    });
+    setSegmentsEl.addEventListener("dragleave", (event) => {
+      if (event.relatedTarget && setSegmentsEl.contains(event.relatedTarget)) return;
+      setSegmentsEl.classList.remove("is-drag-over");
+      delete setSegmentsEl.dataset.insertIndex;
+      clearWorkoutSetSegmentDropHints();
+    });
+    setSegmentsEl.addEventListener("drop", (event) => {
+      const dropPayload = getWorkoutDropPayload(event);
+      if (!dropPayload || (dropPayload.kind !== "zone" && dropPayload.kind !== "move-set-segment")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setSegmentsEl.classList.remove("is-drag-over");
+      const setIndex = Math.round(Number(setSegmentsEl.getAttribute("data-workout-set-segments-index")) || 0);
+      const currentSegments = normalizeWorkoutSegments(state.lobby.workoutDraftSegments);
+      const targetSet = currentSegments[setIndex];
+      if (!targetSet || targetSet.type !== WORKOUT_ITEM_TYPE_SET) return;
+      const parsedInsertIndex = Math.round(Number(setSegmentsEl.dataset.insertIndex));
+      const insertIndex = Number.isFinite(parsedInsertIndex) ? clamp(parsedInsertIndex, 0, targetSet.segments.length) : targetSet.segments.length;
+      delete setSegmentsEl.dataset.insertIndex;
+      clearWorkoutTopDropHints();
+      clearWorkoutSetSegmentDropHints();
+      if (dropPayload.kind === "zone") {
+        addWorkoutDraftSegment(dropPayload.zone, setIndex, insertIndex);
+        render();
+        return;
+      }
+      if (!moveWorkoutDraftSetSegment(dropPayload.setIndex, dropPayload.segmentIndex, setIndex, insertIndex)) return;
       render();
     });
   });
@@ -7895,6 +8576,56 @@ function renderLobby() {
       const setIndex = Math.round(Number(setSegmentBtn.getAttribute("data-workout-set-parent-index")) || 0);
       const segmentIndex = Math.round(Number(setSegmentBtn.getAttribute("data-workout-set-segment-index")) || 0);
       state.lobby.workoutSelection = { kind: "set-segment", setIndex, segmentIndex };
+      render();
+    });
+    setSegmentBtn.addEventListener("dragstart", (event) => {
+      const setIndex = Math.round(Number(setSegmentBtn.getAttribute("data-workout-set-parent-index")) || 0);
+      const segmentIndex = Math.round(Number(setSegmentBtn.getAttribute("data-workout-set-segment-index")) || 0);
+      const payload = `move-set-segment:${setIndex}:${segmentIndex}`;
+      setActiveWorkoutDragPayload(payload);
+      if (event.dataTransfer) {
+        event.dataTransfer.setData("text/plain", payload);
+        event.dataTransfer.effectAllowed = "move";
+      }
+      setSegmentBtn.classList.add("is-dragging");
+    });
+    setSegmentBtn.addEventListener("dragend", () => {
+      setSegmentBtn.classList.remove("is-dragging");
+      clearActiveWorkoutDragPayload();
+      clearWorkoutSetSegmentDropHints();
+      document.querySelectorAll("[data-workout-set-segments-index]").forEach((setSegmentsEl) => {
+        setSegmentsEl.classList.remove("is-drag-over");
+        delete setSegmentsEl.dataset.insertIndex;
+      });
+    });
+    setSegmentBtn.addEventListener("dragover", (event) => {
+      const dropPayload = getWorkoutDropPayload(event);
+      if (!dropPayload || (dropPayload.kind !== "zone" && dropPayload.kind !== "move-set-segment")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const position = getWorkoutDropPosition(event, setSegmentBtn);
+      applyWorkoutSetSegmentDropHint(setSegmentBtn, position);
+    });
+    setSegmentBtn.addEventListener("dragleave", (event) => {
+      if (event.relatedTarget && setSegmentBtn.contains(event.relatedTarget)) return;
+      clearWorkoutSetSegmentDropHints();
+    });
+    setSegmentBtn.addEventListener("drop", (event) => {
+      const dropPayload = getWorkoutDropPayload(event);
+      if (!dropPayload || (dropPayload.kind !== "zone" && dropPayload.kind !== "move-set-segment")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const setIndex = Math.round(Number(setSegmentBtn.getAttribute("data-workout-set-parent-index")) || 0);
+      const segmentIndex = Math.round(Number(setSegmentBtn.getAttribute("data-workout-set-segment-index")) || 0);
+      const position = getWorkoutDropPosition(event, setSegmentBtn);
+      const insertIndex = segmentIndex + (position === "after" ? 1 : 0);
+      clearWorkoutSetSegmentDropHints();
+      if (dropPayload.kind === "zone") {
+        addWorkoutDraftSegment(dropPayload.zone, setIndex, insertIndex);
+        render();
+        return;
+      }
+      if (!moveWorkoutDraftSetSegment(dropPayload.setIndex, dropPayload.segmentIndex, setIndex, insertIndex)) return;
       render();
     });
   });
@@ -8089,6 +8820,68 @@ function renderLobby() {
               kind: "set",
               setIndex: selected.setIndex,
             };
+      render();
+    });
+  }
+
+  const savedWorkoutsMinDurationSlider = document.getElementById("savedWorkoutsMinDurationSlider");
+  if (savedWorkoutsMinDurationSlider) {
+    const applySavedWorkoutsDurationFilter = (shouldCommit = false) => {
+      const selectedMinutes = Math.round(Number(savedWorkoutsMinDurationSlider.value) || SAVED_WORKOUTS_DURATION_MIN_MINUTES);
+      state.lobby.savedWorkoutsMinDurationSeconds = normalizeSavedWorkoutsMinDurationSeconds(selectedMinutes * 60);
+      const minDurationValueEl = document.getElementById("savedWorkoutsMinDurationValue");
+      if (minDurationValueEl) {
+        const selectedDurationMinutes = Math.floor(state.lobby.savedWorkoutsMinDurationSeconds / 60);
+        minDurationValueEl.textContent = selectedDurationMinutes > 0 ? `${selectedDurationMinutes} min and up` : "No minimum";
+      }
+      if (!shouldCommit) return;
+      state.lobby.savedWorkoutsPage = 1;
+      render();
+    };
+    savedWorkoutsMinDurationSlider.addEventListener("input", () => {
+      applySavedWorkoutsDurationFilter(false);
+    });
+    savedWorkoutsMinDurationSlider.addEventListener("change", () => {
+      applySavedWorkoutsDurationFilter(true);
+    });
+  }
+
+  const savedWorkoutsToggleFiltersBtn = document.getElementById("savedWorkoutsToggleFiltersBtn");
+  if (savedWorkoutsToggleFiltersBtn) {
+    savedWorkoutsToggleFiltersBtn.addEventListener("click", () => {
+      state.lobby.savedWorkoutsFiltersExpanded = !state.lobby.savedWorkoutsFiltersExpanded;
+      render();
+    });
+  }
+
+  const savedWorkoutsMinDifficultySelect = document.getElementById("savedWorkoutsMinDifficultySelect");
+  if (savedWorkoutsMinDifficultySelect) {
+    savedWorkoutsMinDifficultySelect.addEventListener("change", () => {
+      state.lobby.savedWorkoutsMinDifficulty = normalizeSavedWorkoutsMinDifficulty(savedWorkoutsMinDifficultySelect.value);
+      state.lobby.savedWorkoutsPage = 1;
+      render();
+    });
+  }
+
+  document.querySelectorAll("[data-saved-workouts-filter-tag]").forEach((tagBtn) => {
+    tagBtn.addEventListener("click", () => {
+      const tag = normalizeWorkoutTag(tagBtn.getAttribute("data-saved-workouts-filter-tag"));
+      if (!tag) return;
+      const currentTags = normalizeWorkoutTags(state.lobby.savedWorkoutsFilterTags);
+      const hasTag = currentTags.includes(tag);
+      state.lobby.savedWorkoutsFilterTags = hasTag ? currentTags.filter((entry) => entry !== tag) : [...currentTags, tag];
+      state.lobby.savedWorkoutsPage = 1;
+      render();
+    });
+  });
+
+  const savedWorkoutsClearFiltersBtn = document.getElementById("savedWorkoutsClearFiltersBtn");
+  if (savedWorkoutsClearFiltersBtn) {
+    savedWorkoutsClearFiltersBtn.addEventListener("click", () => {
+      state.lobby.savedWorkoutsMinDurationSeconds = 0;
+      state.lobby.savedWorkoutsMinDifficulty = 0;
+      state.lobby.savedWorkoutsFilterTags = [];
+      state.lobby.savedWorkoutsPage = 1;
       render();
     });
   }
@@ -8339,6 +9132,22 @@ function renderLobby() {
         state.lobby.workoutDeleteModal = null;
       }
       showToast(`Removed ${workout.name}.`);
+      render();
+    });
+  }
+
+  const savedWorkoutsPrevBtn = document.getElementById("savedWorkoutsPrevBtn");
+  if (savedWorkoutsPrevBtn) {
+    savedWorkoutsPrevBtn.addEventListener("click", () => {
+      state.lobby.savedWorkoutsPage = clampPage(state.lobby.savedWorkoutsPage - 1, paginatedSavedWorkouts.totalPages);
+      render();
+    });
+  }
+
+  const savedWorkoutsNextBtn = document.getElementById("savedWorkoutsNextBtn");
+  if (savedWorkoutsNextBtn) {
+    savedWorkoutsNextBtn.addEventListener("click", () => {
+      state.lobby.savedWorkoutsPage = clampPage(state.lobby.savedWorkoutsPage + 1, paginatedSavedWorkouts.totalPages);
       render();
     });
   }

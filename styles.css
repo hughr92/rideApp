@@ -621,6 +621,43 @@ button:disabled {
   gap: 8px;
 }
 
+.workout-filters-accordion {
+  margin-top: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.workout-filters-toggle {
+  width: 100%;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+}
+
+.workout-filters-toggle .small {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.workout-filters-chevron {
+  font-size: 0.9rem;
+  transition: transform 0.14s ease;
+}
+
+.workout-filters-toggle.is-expanded .workout-filters-chevron {
+  transform: rotate(180deg);
+}
+
+.workout-filters-panel {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
 .workout-tag-btn {
   margin: 0;
   padding: 7px 10px;
@@ -875,6 +912,15 @@ button:disabled {
   min-width: 100%;
 }
 
+.workout-top-block {
+  cursor: grab;
+}
+
+.workout-top-block.is-dragging {
+  opacity: 0.48;
+  cursor: grabbing;
+}
+
 .workout-segment-block {
   margin: 0;
   border: 1px solid rgba(255, 255, 255, 0.18);
@@ -893,6 +939,18 @@ button:disabled {
 .workout-segment-block.is-selected {
   border-color: rgba(50, 214, 255, 0.85);
   box-shadow: 0 0 0 2px rgba(50, 214, 255, 0.18) inset;
+}
+
+.workout-segment-block.is-drop-before,
+.workout-set-container.is-drop-before,
+.workout-set-segment-block.is-drop-before {
+  box-shadow: inset 4px 0 0 rgba(50, 214, 255, 0.95);
+}
+
+.workout-segment-block.is-drop-after,
+.workout-set-container.is-drop-after,
+.workout-set-segment-block.is-drop-after {
+  box-shadow: inset -4px 0 0 rgba(50, 214, 255, 0.95);
 }
 
 .workout-set-container {
@@ -979,6 +1037,10 @@ button:disabled {
 .workout-set-segment-block.is-selected {
   border-color: rgba(50, 214, 255, 0.85);
   box-shadow: 0 0 0 2px rgba(50, 214, 255, 0.15) inset;
+}
+
+.workout-set-segment-block.is-dragging {
+  opacity: 0.48;
 }
 
 .workout-set-empty {

@@ -492,7 +492,7 @@ button:disabled {
 
 .telemetry-zone-grid {
   display: grid;
-  grid-template-columns: minmax(140px, 1fr) 170px 170px;
+  grid-template-columns: minmax(140px, 1fr) minmax(120px, 150px) minmax(120px, 150px) minmax(120px, 150px);
   gap: 8px;
   align-items: center;
 }

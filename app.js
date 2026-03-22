@@ -720,12 +720,20 @@ let state = {
     generatedRouteDistanceKm: 20,
     generatedRouteHilliness: "rolling",
     createSessionAdditionalRoutes: [],
+    createSessionRouteSteps: [],
+    createSessionRouteEditIndex: 0,
     createSessionSelectedWorkoutId: null,
     createSessionAdditionalWorkoutIds: [],
+    createSessionPendingAddedWorkoutId: null,
     showCreateSessionWorkoutPickerModal: false,
     createSessionWorkoutPickerTab: SAVED_WORKOUTS_TAB_CUSTOM,
     createSessionWorkoutPickerPage: 1,
     createSessionWorkoutPickerExpandedId: null,
+    createSessionWorkoutPickerFiltersExpanded: false,
+    createSessionWorkoutPickerMinDurationSeconds: 0,
+    createSessionWorkoutPickerMinDifficulty: 0,
+    createSessionWorkoutPickerFavoritesOnly: false,
+    createSessionWorkoutPickerFilterTags: [],
     recentSessionsPage: 1,
     recentSessionsKnownCodes: [],
     workoutDraftName: "",
@@ -4750,66 +4758,6 @@ function updateTerrainState(terrainUpdate) {
   };
 }
 
-// Placeholder thresholds for MVP color zones.
-// Keep these centralized so we can replace with personalized zones later.
-const HEART_RATE_ZONE_THRESHOLDS = Object.freeze({
-  lowMax: 99,
-  mediumMax: 150,
-});
-
-const WATTS_ZONE_THRESHOLDS = Object.freeze({
-  lowMax: 99,
-  mediumMax: 250,
-});
-
-function getZoneFromValue(value, thresholds) {
-  const numericValue = Number(value);
-  const safeValue = Number.isFinite(numericValue) ? numericValue : 0;
-  if (safeValue <= thresholds.lowMax) return "low";
-  if (safeValue <= thresholds.mediumMax) return "medium";
-  return "high";
-}
-
-function getHeartRateZone(heartRate, thresholds = HEART_RATE_ZONE_THRESHOLDS) {
-  return getZoneFromValue(heartRate, thresholds);
-}
-
-function getWattsZone(watts, thresholds = WATTS_ZONE_THRESHOLDS) {
-  return getZoneFromValue(watts, thresholds);
-}
-
-function getZoneColorClass(zone) {
-  if (zone === "high") return "zone-high";
-  if (zone === "medium") return "zone-medium";
-  return "zone-low";
-}
-
-function getMockTelemetryParticipants() {
-  return [
-    { id: "mock_1", name: "Rider Alpha", heartRate: 92, watts: 85 },
-    { id: "mock_2", name: "Rider Beta", heartRate: 132, watts: 180 },
-    { id: "mock_3", name: "Rider Gamma", heartRate: 168, watts: 305 },
-  ];
-}
-
-function renderTelemetryZoneRows(participants) {
-  return participants
-    .map((participant) => {
-      const heartRate = Math.max(0, Math.round(Number(participant.heartRate) || 0));
-      const watts = Math.max(0, Math.round(Number(participant.watts) || 0));
-      const heartRateZone = getHeartRateZone(heartRate);
-      const wattsZone = getWattsZone(watts);
-      return `
-        <div class="telemetry-zone-grid telemetry-zone-row">
-          <div class="telemetry-zone-name">${escapeHtml(participant.name || "Rider")}</div>
-          <div class="telemetry-zone-pill ${getZoneColorClass(heartRateZone)}">HR ${heartRate} bpm</div>
-          <div class="telemetry-zone-pill ${getZoneColorClass(wattsZone)}">Power ${watts} W</div>
-        </div>
-      `;
-    })
-    .join("");
-}
-
 function createUser({ name, weight, bikeId = DEFAULT_BIKE_ID, isHost = false, id = null }) {
   return {
     id: id || `u_${makeId(8)}`,
@@ -7082,6 +7030,9 @@ function generateLobbyRouteDraft(distanceKmInput, hillinessInput) {
   state.lobby.generatedRouteDistanceKm = resolvedDistanceKm;
   state.lobby.generatedRouteHilliness = resolvedHilliness;
   state.lobby.generatedRouteDraft = generatedRoute;
+  // Generated routes are applied immediately; no separate confirmation step required.
+  state.lobby.generatedRouteConfirmed = cloneJson(generatedRoute);
+  state.lobby.routeSelectionMode = "generated";
   return generatedRoute;
 }
 
@@ -7137,6 +7088,24 @@ function renderLobby() {
   if (state.lobby.createSessionWorkoutPickerExpandedId && !savedWorkoutIdSet.has(state.lobby.createSessionWorkoutPickerExpandedId)) {
     state.lobby.createSessionWorkoutPickerExpandedId = null;
   }
+  state.lobby.createSessionWorkoutPickerFiltersExpanded = state.lobby.createSessionWorkoutPickerFiltersExpanded === true;
+  state.lobby.createSessionWorkoutPickerMinDurationSeconds = normalizeSavedWorkoutsMinDurationSeconds(
+    state.lobby.createSessionWorkoutPickerMinDurationSeconds,
+  );
+  state.lobby.createSessionWorkoutPickerMinDifficulty = normalizeSavedWorkoutsMinDifficulty(
+    state.lobby.createSessionWorkoutPickerMinDifficulty,
+  );
+  state.lobby.createSessionWorkoutPickerFavoritesOnly = normalizeSavedWorkoutsFavoritesOnly(
+    state.lobby.createSessionWorkoutPickerFavoritesOnly,
+  );
+  state.lobby.createSessionWorkoutPickerFilterTags = normalizeWorkoutTags(state.lobby.createSessionWorkoutPickerFilterTags);
+  state.lobby.createSessionPendingAddedWorkoutId =
+    state.lobby.createSessionPendingAddedWorkoutId != null && String(state.lobby.createSessionPendingAddedWorkoutId).trim()
+      ? String(state.lobby.createSessionPendingAddedWorkoutId).trim()
+      : null;
+  if (state.lobby.createSessionPendingAddedWorkoutId && !savedWorkoutIdSet.has(state.lobby.createSessionPendingAddedWorkoutId)) {
+    state.lobby.createSessionPendingAddedWorkoutId = null;
+  }
   state.lobby.createSessionAdditionalRoutes = Array.isArray(state.lobby.createSessionAdditionalRoutes)
     ? state.lobby.createSessionAdditionalRoutes
         .map((route) => {
@@ -7145,6 +7114,18 @@ function renderLobby() {
         })
         .filter(Boolean)
     : [];
+  state.lobby.createSessionRouteSteps = Array.isArray(state.lobby.createSessionRouteSteps)
+    ? state.lobby.createSessionRouteSteps
+        .map((route) => {
+          if (!route || typeof route !== "object") return null;
+          return ensureRoutePresetShape(route, DEFAULT_ROUTE_PRESET);
+        })
+        .filter(Boolean)
+    : [];
+  const parsedCreateSessionRouteEditIndex = Math.round(Number(state.lobby.createSessionRouteEditIndex));
+  state.lobby.createSessionRouteEditIndex = Number.isFinite(parsedCreateSessionRouteEditIndex)
+    ? Math.max(0, parsedCreateSessionRouteEditIndex)
+    : 0;
   state.lobby.workoutDraftName = normalizeWorkoutName(state.lobby.workoutDraftName);
   state.lobby.workoutDraftNotes = normalizeWorkoutNotes(state.lobby.workoutDraftNotes);
   state.lobby.workoutDraftTags = normalizeWorkoutTags(state.lobby.workoutDraftTags);
@@ -7224,29 +7205,52 @@ function renderLobby() {
   const savedWorkoutsMinDifficulty = state.lobby.savedWorkoutsMinDifficulty;
   const savedWorkoutsFavoritesOnly = state.lobby.savedWorkoutsFavoritesOnly;
   const savedWorkoutsFilterTags = state.lobby.savedWorkoutsFilterTags;
+  const createSessionWorkoutPickerMinDurationSeconds = state.lobby.createSessionWorkoutPickerMinDurationSeconds;
+  const createSessionWorkoutPickerMinDifficulty = state.lobby.createSessionWorkoutPickerMinDifficulty;
+  const createSessionWorkoutPickerFavoritesOnly = state.lobby.createSessionWorkoutPickerFavoritesOnly;
+  const createSessionWorkoutPickerFilterTags = state.lobby.createSessionWorkoutPickerFilterTags;
+  const filterWorkoutsByCriteria = (
+    workoutsInput,
+    {
+      minDurationSeconds = 0,
+      minDifficulty = 0,
+      favoritesOnly = false,
+      filterTags = [],
+    } = {},
+  ) =>
+    workoutsInput
+      .filter((workout) => {
+        if (minDurationSeconds <= 0) return true;
+        const durationSeconds = Number(workout?.totalDurationSeconds);
+        if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return false;
+        return durationSeconds >= minDurationSeconds;
+      })
+      .filter((workout) => {
+        if (minDifficulty <= 0) return true;
+        const workoutDifficulty = calculateWorkoutDifficulty(
+          workout.segments,
+          normalizeWorkoutFtpWatts(workout.ftpReferenceWatts, WORKOUT_DEFAULT_FTP_WATTS),
+        );
+        return workoutDifficulty >= minDifficulty;
+      })
+      .filter((workout) => {
+        if (!favoritesOnly) return true;
+        return normalizeWorkoutFavorite(workout.isFavorite);
+      })
+      .filter((workout) => {
+        if (filterTags.length === 0) return true;
+        const workoutTags = normalizeWorkoutTags(workout.tags);
+        return filterTags.some((tag) => workoutTags.includes(tag));
+      });
   const savedWorkoutsMinDurationMinutes =
     savedWorkoutsMinDurationSeconds > 0 ? Math.floor(savedWorkoutsMinDurationSeconds / 60) : 0;
   const savedWorkoutsSliderMinutes =
     savedWorkoutsMinDurationMinutes > 0 ? savedWorkoutsMinDurationMinutes : SAVED_WORKOUTS_DURATION_MIN_MINUTES;
-  const filteredSavedWorkouts = savedWorkouts.filter((workout) => {
-    if (savedWorkoutsMinDurationSeconds <= 0) return true;
-    const durationSeconds = Number(workout?.totalDurationSeconds);
-    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return false;
-    return durationSeconds >= savedWorkoutsMinDurationSeconds;
-  }).filter((workout) => {
-    if (savedWorkoutsMinDifficulty <= 0) return true;
-    const workoutDifficulty = calculateWorkoutDifficulty(
-      workout.segments,
-      normalizeWorkoutFtpWatts(workout.ftpReferenceWatts, WORKOUT_DEFAULT_FTP_WATTS),
-    );
-    return workoutDifficulty >= savedWorkoutsMinDifficulty;
-  }).filter((workout) => {
-    if (!savedWorkoutsFavoritesOnly) return true;
-    return normalizeWorkoutFavorite(workout.isFavorite);
-  }).filter((workout) => {
-    if (savedWorkoutsFilterTags.length === 0) return true;
-    const workoutTags = normalizeWorkoutTags(workout.tags);
-    return savedWorkoutsFilterTags.some((tag) => workoutTags.includes(tag));
+  const filteredSavedWorkouts = filterWorkoutsByCriteria(savedWorkouts, {
+    minDurationSeconds: savedWorkoutsMinDurationSeconds,
+    minDifficulty: savedWorkoutsMinDifficulty,
+    favoritesOnly: savedWorkoutsFavoritesOnly,
+    filterTags: savedWorkoutsFilterTags,
   });
   const filteredTemplateWorkouts = filteredSavedWorkouts.filter(
     (workout) => workout.source === WORKOUT_SOURCE_TEMPLATE,
@@ -7319,7 +7323,12 @@ function renderLobby() {
       );
       const isCurrentSelection = index === createSessionWorkoutSequence.length - 1 && selectedCreateSessionWorkout != null;
       const actionHtml = isCurrentSelection
-        ? `<span class="small">Current</span>`
+        ? `
+          <div class="flex" style="gap:8px; align-items:center; flex-wrap:wrap;">
+            <span class="small">Current</span>
+            <button type="button" class="secondary" data-remove-create-workout-step-index="${index}" style="padding:4px 8px;">Remove</button>
+          </div>
+        `
         : `<button type="button" class="secondary" data-remove-create-workout-step-index="${index}" style="padding:4px 8px;">Remove</button>`;
       return `
         <div class="flex-space" style="gap:10px; align-items:center; border:1px solid #d6e2f3; border-radius:8px; padding:8px 10px; margin-top:${
@@ -7342,16 +7351,54 @@ function renderLobby() {
         normalizeWorkoutFtpWatts(selectedCreateSessionWorkout.ftpReferenceWatts, WORKOUT_DEFAULT_FTP_WATTS),
       )
     : null;
+  const createSessionWorkoutPickerMinDurationMinutes =
+    createSessionWorkoutPickerMinDurationSeconds > 0 ? Math.floor(createSessionWorkoutPickerMinDurationSeconds / 60) : 0;
+  const createSessionWorkoutPickerSliderMinutes =
+    createSessionWorkoutPickerMinDurationMinutes > 0
+      ? createSessionWorkoutPickerMinDurationMinutes
+      : SAVED_WORKOUTS_DURATION_MIN_MINUTES;
+  const createSessionWorkoutPickerFilteredWorkouts = filterWorkoutsByCriteria(savedWorkouts, {
+    minDurationSeconds: createSessionWorkoutPickerMinDurationSeconds,
+    minDifficulty: createSessionWorkoutPickerMinDifficulty,
+    favoritesOnly: createSessionWorkoutPickerFavoritesOnly,
+    filterTags: createSessionWorkoutPickerFilterTags,
+  });
+  const createSessionWorkoutPickerFilteredTemplateWorkouts = createSessionWorkoutPickerFilteredWorkouts.filter(
+    (workout) => workout.source === WORKOUT_SOURCE_TEMPLATE,
+  );
+  const createSessionWorkoutPickerFilteredCustomWorkouts = createSessionWorkoutPickerFilteredWorkouts.filter(
+    (workout) => workout.source !== WORKOUT_SOURCE_TEMPLATE,
+  );
+  const createSessionWorkoutPickerDurationLabel =
+    createSessionWorkoutPickerMinDurationMinutes > 0 ? `${createSessionWorkoutPickerMinDurationMinutes} min and up` : "No minimum";
+  const createSessionWorkoutPickerDurationActiveLabel =
+    createSessionWorkoutPickerMinDurationMinutes > 0 ? `Duration: ${createSessionWorkoutPickerMinDurationMinutes}+ min` : "";
+  const createSessionWorkoutPickerDifficultyActiveLabel =
+    createSessionWorkoutPickerMinDifficulty > 0 ? `Difficulty: ${createSessionWorkoutPickerMinDifficulty}+ / 10` : "";
+  const createSessionWorkoutPickerFavoritesActiveLabel = createSessionWorkoutPickerFavoritesOnly ? "Favorites only" : "";
+  const createSessionWorkoutPickerTagsActiveLabel =
+    createSessionWorkoutPickerFilterTags.length > 0 ? `Tags: ${createSessionWorkoutPickerFilterTags.length}` : "";
+  const hasCreateSessionWorkoutPickerActiveFilter =
+    createSessionWorkoutPickerMinDurationSeconds > 0 ||
+    createSessionWorkoutPickerMinDifficulty > 0 ||
+    createSessionWorkoutPickerFavoritesOnly ||
+    createSessionWorkoutPickerFilterTags.length > 0;
+  const createSessionWorkoutPickerActiveFilterCount =
+    (createSessionWorkoutPickerMinDurationSeconds > 0 ? 1 : 0) +
+    (createSessionWorkoutPickerMinDifficulty > 0 ? 1 : 0) +
+    (createSessionWorkoutPickerFavoritesOnly ? 1 : 0) +
+    (createSessionWorkoutPickerFilterTags.length > 0 ? 1 : 0);
+  const createSessionWorkoutPickerFiltersExpanded = state.lobby.createSessionWorkoutPickerFiltersExpanded === true;
   const createSessionWorkoutPickerTab = state.lobby.createSessionWorkoutPickerTab;
   const isCreateSessionWorkoutPickerTemplateTab = createSessionWorkoutPickerTab === SAVED_WORKOUTS_TAB_TEMPLATE;
   const createSessionWorkoutPickerPaginatedCustom = getPaginatedSessions(
-    customSavedWorkouts,
+    createSessionWorkoutPickerFilteredCustomWorkouts,
     state.lobby.createSessionWorkoutPickerPage,
     SAVED_WORKOUTS_PAGE_SIZE,
   );
   state.lobby.createSessionWorkoutPickerPage = createSessionWorkoutPickerPaginatedCustom.currentPage;
   const createSessionWorkoutPickerWorkouts = isCreateSessionWorkoutPickerTemplateTab
-    ? templateSavedWorkouts
+    ? createSessionWorkoutPickerFilteredTemplateWorkouts
     : createSessionWorkoutPickerPaginatedCustom.sessions;
   const createSessionWorkoutPickerVisibleIds = new Set(createSessionWorkoutPickerWorkouts.map((workout) => workout.id));
   if (
@@ -7361,12 +7408,13 @@ function renderLobby() {
     state.lobby.createSessionWorkoutPickerExpandedId = null;
   }
   const showCreateSessionWorkoutPickerPagination =
-    !isCreateSessionWorkoutPickerTemplateTab && customSavedWorkouts.length > SAVED_WORKOUTS_PAGE_SIZE;
+    !isCreateSessionWorkoutPickerTemplateTab &&
+    createSessionWorkoutPickerFilteredCustomWorkouts.length > SAVED_WORKOUTS_PAGE_SIZE;
   const createSessionWorkoutPickerShowingStart =
-    customSavedWorkouts.length === 0 ? 0 : createSessionWorkoutPickerPaginatedCustom.startIndex + 1;
+    createSessionWorkoutPickerFilteredCustomWorkouts.length === 0 ? 0 : createSessionWorkoutPickerPaginatedCustom.startIndex + 1;
   const createSessionWorkoutPickerShowingEnd = Math.min(
     createSessionWorkoutPickerPaginatedCustom.endIndex,
-    customSavedWorkouts.length,
+    createSessionWorkoutPickerFilteredCustomWorkouts.length,
   );
   const profile = getCurrentAccountProfile();
   const loggedIn = isAuthenticated() && !!profile;
@@ -7418,46 +7466,65 @@ function renderLobby() {
     normalizeGeneratedHilliness(generatedDraft.hillinessPreset) === generatedHilliness;
   const generatedValidation =
     generatedDraft?._validation || (generatedDraft ? validateGeneratedRoute(generatedDraft, generatedDistanceKm, generatedHilliness) : null);
-  const generatedConfirmMatchesDraft =
-    generatedDraft &&
-    generatedConfirmed &&
-    generatedDraft.generatedAt &&
-    generatedConfirmed.generatedAt &&
-    generatedDraft.generatedAt === generatedConfirmed.generatedAt;
   const generatedStatus = !ROUTE_GENERATOR_SERVICE?.generateRoutePreset
     ? "Route generator service is unavailable. Ensure route-generator.js is loaded."
     : generatedValidation && !generatedValidation.valid
       ? `Validation: ${generatedValidation.errors[0] || "Generated route failed validation."}`
       : generatedDraft && !generatedDraftMatchesInputs
-        ? "Inputs changed. Click Regenerate to update the route preview."
-        : generatedDraft && !generatedConfirmMatchesDraft
-          ? "Preview ready. Click Use Generated Route to confirm."
+        ? "Inputs changed. Click Regenerate to generate and apply the latest route."
+        : generatedDraft
+          ? "Generated route is active and ready for session start."
           : generatedConfirmed
-            ? "Generated route confirmed and ready for session start."
-            : "Generate a route, review the profile, then confirm.";
-  const createSessionAdditionalRoutes = state.lobby.createSessionAdditionalRoutes;
-  const createSessionRoutePlanPreviewRoutes = [selectedRoute, ...createSessionAdditionalRoutes];
-  const createSessionRoutePlanRowsHtml = createSessionRoutePlanPreviewRoutes
+            ? "Generated route is active and ready for session start."
+            : "Click Regenerate to generate and apply a route.";
+  const legacyCreateSessionAdditionalRoutes = Array.isArray(state.lobby.createSessionAdditionalRoutes)
+    ? state.lobby.createSessionAdditionalRoutes
+    : [];
+  const seededCreateSessionRouteSteps =
+    state.lobby.createSessionRouteSteps.length > 0
+      ? state.lobby.createSessionRouteSteps
+      : [selectedRoute, ...legacyCreateSessionAdditionalRoutes];
+  let createSessionRouteSteps = seededCreateSessionRouteSteps
+    .map((route) => ensureRoutePresetShape(route, DEFAULT_ROUTE_PRESET))
+    .filter(Boolean);
+  if (createSessionRouteSteps.length === 0) {
+    createSessionRouteSteps = [selectedRoute];
+  }
+  let createSessionRouteEditIndex = clamp(state.lobby.createSessionRouteEditIndex, 0, Math.max(0, createSessionRouteSteps.length - 1));
+  createSessionRouteSteps = createSessionRouteSteps.map((route, index) =>
+    index === createSessionRouteEditIndex ? selectedRoute : route,
+  );
+  state.lobby.createSessionRouteSteps = createSessionRouteSteps;
+  state.lobby.createSessionRouteEditIndex = createSessionRouteEditIndex;
+  state.lobby.createSessionAdditionalRoutes = createSessionRouteSteps.slice(1);
+  const createSessionRoutePlanRowsHtml = createSessionRouteSteps
     .map((route, index) => {
       const stepDistanceKm = Number(route.distanceKm) || (Number(route.totalDistanceMeters) || 0) / 1000;
+      const isEditing = index === createSessionRouteEditIndex;
+      const selectionStatusHtml = isEditing ? `<span class="small">Selected</span>` : "";
       const removeButtonHtml =
-        index > 0
-          ? `<button type="button" class="secondary" data-remove-create-route-step-index="${index - 1}" style="padding:4px 8px;">Remove</button>`
-          : `<span class="small">Current</span>`;
+        createSessionRouteSteps.length > 1
+          ? `<button type="button" class="secondary" data-remove-create-route-step-index="${index}" style="padding:4px 8px;">Remove</button>`
+          : "";
       return `
-        <div class="flex-space" style="gap:10px; align-items:center; border:1px solid #d6e2f3; border-radius:8px; padding:8px 10px; margin-top:${
+        <div class="flex-space" data-select-create-route-step-index="${index}" role="button" tabindex="0" aria-pressed="${
+          isEditing ? "true" : "false"
+        }" style="gap:10px; align-items:center; border:1px solid #d6e2f3; border-radius:8px; padding:8px 10px; margin-top:${
           index === 0 ? "0" : "8px"
-        };">
+        }; cursor:pointer; ${isEditing ? "box-shadow:0 0 0 1px rgba(50, 214, 255, 0.8) inset;" : ""}">
           <div style="min-width:0;">
             <div><strong>Step ${index + 1}</strong> - ${escapeHtml(route.name || `Route ${index + 1}`)}</div>
             <div class="small">${escapeHtml(route.country || "Unknown")} • ${stepDistanceKm.toFixed(1)} km</div>
           </div>
-          ${removeButtonHtml}
+          <div class="flex" style="gap:8px; align-items:center; flex-wrap:wrap;">
+            ${selectionStatusHtml}
+            ${removeButtonHtml}
+          </div>
         </div>
       `;
     })
     .join("");
-  const hasCreateSessionAdditionalRoutes = createSessionAdditionalRoutes.length > 0;
+  const hasCreateSessionAdditionalRoutes = createSessionRouteSteps.length > 1;
   state.lobby.botDrafts = normalizeBotDrafts(state.lobby.botDrafts);
   const botDrafts = state.lobby.botDrafts;
   const canAddMoreBots = botDrafts.length < MAX_SESSION_BOTS;
@@ -7939,7 +8006,6 @@ function renderLobby() {
           </div>
           <div style="display:flex;gap:10px;flex-wrap:wrap;">
             <button id="regenerateRouteBtn" class="secondary">Regenerate</button>
-            <button id="confirmGeneratedRouteBtn">Use Generated Route</button>
           </div>
         </div>
         <div id="generatedRouteStatus" class="small" style="margin-top:8px;">${escapeHtml(generatedStatus)}</div>
@@ -7954,34 +8020,34 @@ function renderLobby() {
         ${selectedRoutePreviewHtml}
       </div>
       <div class="card" style="margin-top:12px;">
-        <div class="flex-space" style="gap:10px; flex-wrap:wrap;">
+        <div>
           <div>
             <h2 style="margin-bottom:6px;">Route Sequence</h2>
             <div class="small">Routes are completed in order. Add steps to ride multiple routes back to back.</div>
-          </div>
-          <div class="flex" style="gap:8px; flex-wrap:wrap;">
-            <button id="createRouteAddStepBtn" type="button" class="secondary">Add Route Step</button>
-            ${
-              hasCreateSessionAdditionalRoutes
-                ? `<button id="createRouteClearStepsBtn" type="button" class="secondary">Clear Added Steps</button>`
-                : ""
-            }
           </div>
         </div>
         <div style="margin-top:10px;">
           ${createSessionRoutePlanRowsHtml}
         </div>
-      </div>
-      <div style="margin-top:12px;max-width:320px;">
-        <label class="label">Bike choice</label>
-        <select id="createBike">${bikeOptionsHtml}</select>
-      </div>
-      <div class="bike-choice-card" style="margin-top:12px;">
-        ${selectedBikeDetailsHtml}
+        <div class="flex" style="gap:8px; flex-wrap:wrap; margin-top:10px;">
+          <button id="createRouteAddStepBtn" type="button" class="secondary">Add Route Step</button>
+          ${
+            hasCreateSessionAdditionalRoutes
+              ? `<button id="createRouteClearStepsBtn" type="button" class="secondary">Clear Added Steps</button>`
+              : ""
+          }
+        </div>
       </div>
       <div class="card" style="margin-top:12px;">
         <h2 style="margin-bottom:8px;">Workout</h2>
         <div class="small">Optionally attach one or more saved workouts to run in order during the session.</div>
+        <div style="margin-top:10px;">
+          ${
+            hasCreateSessionWorkoutSequence
+              ? createSessionWorkoutSequenceRowsHtml
+              : `<div class="small">No workout steps added yet.</div>`
+          }
+        </div>
         <div class="flex-space" style="margin-top:10px; gap:10px; flex-wrap:wrap;">
           <div style="min-width:220px;">
             <div class="code">${escapeHtml(selectedCreateSessionWorkout?.name || "No current workout selected")}</div>
@@ -8023,17 +8089,13 @@ function renderLobby() {
         `
             : ""
         }
-        <div style="margin-top:10px;">
-          <h2 style="margin-bottom:6px;">Workout Sequence</h2>
-          <div class="small">Step order is applied exactly as shown.</div>
-          <div style="margin-top:8px;">
-            ${
-              hasCreateSessionWorkoutSequence
-                ? createSessionWorkoutSequenceRowsHtml
-                : `<div class="small">No workout steps added yet.</div>`
-            }
-          </div>
-        </div>
+      </div>
+      <div style="margin-top:12px;max-width:320px;">
+        <label class="label">Bike choice</label>
+        <select id="createBike">${bikeOptionsHtml}</select>
+      </div>
+      <div class="bike-choice-card" style="margin-top:12px;">
+        ${selectedBikeDetailsHtml}
       </div>
       <div class="card" style="margin-top:12px;">
         <h2 style="margin-bottom:8px;">Bot Riders (MVP)</h2>
@@ -8172,6 +8234,14 @@ function renderLobby() {
       return `<option value="${difficultyValue}" ${isSelected ? "selected" : ""}>${difficultyValue}+</option>`;
     }).join("")}
   `;
+  const createSessionWorkoutPickerDifficultyOptionsHtml = `
+    <option value="0" ${createSessionWorkoutPickerMinDifficulty <= 0 ? "selected" : ""}>ALL</option>
+    ${Array.from({ length: 10 }, (_, index) => {
+      const difficultyValue = index + 1;
+      const isSelected = difficultyValue === createSessionWorkoutPickerMinDifficulty;
+      return `<option value="${difficultyValue}" ${isSelected ? "selected" : ""}>${difficultyValue}+</option>`;
+    }).join("")}
+  `;
   const savedWorkoutsTagFilterButtonsHtml = WORKOUT_TAG_OPTIONS.map((tag) => {
     const isSelectedTag = savedWorkoutsFilterTags.includes(tag);
     return `
@@ -8179,6 +8249,17 @@ function renderLobby() {
         type="button"
         class="secondary workout-tag-btn ${isSelectedTag ? "is-selected" : ""}"
         data-saved-workouts-filter-tag="${escapeHtml(tag)}"
+        aria-pressed="${isSelectedTag ? "true" : "false"}"
+      >${escapeHtml(tag)}</button>
+    `;
+  }).join("");
+  const createSessionWorkoutPickerTagFilterButtonsHtml = WORKOUT_TAG_OPTIONS.map((tag) => {
+    const isSelectedTag = createSessionWorkoutPickerFilterTags.includes(tag);
+    return `
+      <button
+        type="button"
+        class="secondary workout-tag-btn ${isSelectedTag ? "is-selected" : ""}"
+        data-create-session-workout-filter-tag="${escapeHtml(tag)}"
         aria-pressed="${isSelectedTag ? "true" : "false"}"
       >${escapeHtml(tag)}</button>
     `;
@@ -8449,19 +8530,111 @@ function renderLobby() {
               id="createSessionWorkoutPickerTabTemplateBtn"
               class="secondary workout-source-tab ${isCreateSessionWorkoutPickerTemplateTab ? "is-active" : ""}"
               aria-pressed="${isCreateSessionWorkoutPickerTemplateTab ? "true" : "false"}"
-            >Template (${templateSavedWorkouts.length})</button>
+            >Template (${createSessionWorkoutPickerFilteredTemplateWorkouts.length})</button>
             <button
               type="button"
               id="createSessionWorkoutPickerTabCustomBtn"
               class="secondary workout-source-tab ${!isCreateSessionWorkoutPickerTemplateTab ? "is-active" : ""}"
               aria-pressed="${!isCreateSessionWorkoutPickerTemplateTab ? "true" : "false"}"
-            >Custom (${customSavedWorkouts.length})</button>
+            >Custom (${createSessionWorkoutPickerFilteredCustomWorkouts.length})</button>
+          </div>
+          <div class="workout-filters-accordion">
+            <button
+              id="createSessionWorkoutPickerToggleFiltersBtn"
+              type="button"
+              class="secondary workout-filters-toggle ${createSessionWorkoutPickerFiltersExpanded ? "is-expanded" : ""}"
+              aria-expanded="${createSessionWorkoutPickerFiltersExpanded ? "true" : "false"}"
+              aria-controls="createSessionWorkoutPickerFiltersPanel"
+            >
+              <span>Filters</span>
+              <span class="small">${
+                createSessionWorkoutPickerActiveFilterCount > 0
+                  ? `${createSessionWorkoutPickerActiveFilterCount} active`
+                  : "No filters active"
+              }</span>
+              <span class="workout-filters-chevron" aria-hidden="true">⌄</span>
+            </button>
+            ${
+              hasCreateSessionWorkoutPickerActiveFilter
+                ? `
+              <div class="flex" style="gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px;">
+                ${
+                  createSessionWorkoutPickerDurationActiveLabel
+                    ? `<span class="workout-tags-count">${escapeHtml(createSessionWorkoutPickerDurationActiveLabel)}</span>`
+                    : ""
+                }
+                ${
+                  createSessionWorkoutPickerDifficultyActiveLabel
+                    ? `<span class="workout-tags-count">${escapeHtml(createSessionWorkoutPickerDifficultyActiveLabel)}</span>`
+                    : ""
+                }
+                ${
+                  createSessionWorkoutPickerFavoritesActiveLabel
+                    ? `<span class="workout-tags-count">${escapeHtml(createSessionWorkoutPickerFavoritesActiveLabel)}</span>`
+                    : ""
+                }
+                ${
+                  createSessionWorkoutPickerTagsActiveLabel
+                    ? `<span class="workout-tags-count">${escapeHtml(createSessionWorkoutPickerTagsActiveLabel)}</span>`
+                    : ""
+                }
+              </div>
+            `
+                : ""
+            }
+            ${
+              createSessionWorkoutPickerFiltersExpanded
+                ? `
+              <div id="createSessionWorkoutPickerFiltersPanel" class="workout-filters-panel">
+                <div class="flex" style="align-items:flex-end; gap:12px; flex-wrap:wrap;">
+                  <div style="flex:1; min-width:220px;">
+                    <label class="label" for="createSessionWorkoutPickerMinDurationSlider">Duration</label>
+                    <input
+                      id="createSessionWorkoutPickerMinDurationSlider"
+                      type="range"
+                      min="${SAVED_WORKOUTS_DURATION_MIN_MINUTES}"
+                      max="${SAVED_WORKOUTS_DURATION_MAX_MINUTES}"
+                      step="${SAVED_WORKOUTS_DURATION_STEP_MINUTES}"
+                      value="${createSessionWorkoutPickerSliderMinutes}"
+                    />
+                    <div class="small" id="createSessionWorkoutPickerMinDurationValue">${createSessionWorkoutPickerDurationLabel}</div>
+                  </div>
+                  <div style="width:170px;">
+                    <label class="label" for="createSessionWorkoutPickerMinDifficultySelect">Difficulty</label>
+                    <select id="createSessionWorkoutPickerMinDifficultySelect">${createSessionWorkoutPickerDifficultyOptionsHtml}</select>
+                  </div>
+                  <label class="workout-filter-checkbox" for="createSessionWorkoutPickerFavoritesOnlyInput">
+                    <input
+                      id="createSessionWorkoutPickerFavoritesOnlyInput"
+                      type="checkbox"
+                      ${createSessionWorkoutPickerFavoritesOnly ? "checked" : ""}
+                    />
+                    <span>Favorited only</span>
+                  </label>
+                </div>
+                <div style="margin-top:10px;">
+                  <div class="workout-tag-list">${createSessionWorkoutPickerTagFilterButtonsHtml}</div>
+                </div>
+              </div>
+            `
+                : ""
+            }
+          </div>
+          <div class="flex" style="margin-top:10px; justify-content:flex-end;">
+            <button
+              id="createSessionWorkoutPickerClearFiltersBtn"
+              type="button"
+              class="secondary"
+              ${hasCreateSessionWorkoutPickerActiveFilter ? "" : "disabled"}
+            >Clear Filters</button>
           </div>
           ${
             createSessionWorkoutPickerWorkouts.length === 0
-              ? `<p class="small" style="margin-top:10px;">No ${
-                  isCreateSessionWorkoutPickerTemplateTab ? "template" : "custom"
-                } workouts available.</p>`
+              ? `<p class="small" style="margin-top:10px;">${
+                  hasCreateSessionWorkoutPickerActiveFilter
+                    ? `No ${isCreateSessionWorkoutPickerTemplateTab ? "template" : "custom"} workouts match the current filter.`
+                    : `No ${isCreateSessionWorkoutPickerTemplateTab ? "template" : "custom"} workouts available.`
+                }</p>`
               : `
           <table class="table" style="margin-top:10px;">
             <thead>
@@ -8487,7 +8660,7 @@ function renderLobby() {
               ${createSessionWorkoutPickerPaginatedCustom.currentPage >= createSessionWorkoutPickerPaginatedCustom.totalPages ? "disabled" : ""}
             >Next</button>
           </div>
-          <div class="small" style="margin-top:6px;">Showing ${createSessionWorkoutPickerShowingStart}-${createSessionWorkoutPickerShowingEnd} of ${customSavedWorkouts.length} custom workouts</div>
+          <div class="small" style="margin-top:6px;">Showing ${createSessionWorkoutPickerShowingStart}-${createSessionWorkoutPickerShowingEnd} of ${createSessionWorkoutPickerFilteredCustomWorkouts.length} custom workouts</div>
           `
               : ""
           }
@@ -9295,10 +9468,41 @@ function renderLobby() {
     });
   }
 
+  const rollbackPendingCreateSessionWorkoutStep = () => {
+    const pendingWorkoutId =
+      state.lobby.createSessionPendingAddedWorkoutId != null && String(state.lobby.createSessionPendingAddedWorkoutId).trim()
+        ? String(state.lobby.createSessionPendingAddedWorkoutId).trim()
+        : null;
+    if (!pendingWorkoutId) return false;
+    const additionalIds = Array.isArray(state.lobby.createSessionAdditionalWorkoutIds)
+      ? state.lobby.createSessionAdditionalWorkoutIds
+      : [];
+    const pendingIndex = additionalIds.lastIndexOf(pendingWorkoutId);
+    if (pendingIndex >= 0) {
+      const nextAdditionalIds = additionalIds.slice();
+      nextAdditionalIds.splice(pendingIndex, 1);
+      state.lobby.createSessionAdditionalWorkoutIds = nextAdditionalIds;
+    }
+    state.lobby.createSessionSelectedWorkoutId = pendingWorkoutId;
+    state.lobby.createSessionWorkoutPickerExpandedId = pendingWorkoutId;
+    state.lobby.createSessionPendingAddedWorkoutId = null;
+    return true;
+  };
+
+  const closeCreateSessionWorkoutPicker = ({ rollbackPendingStep = false } = {}) => {
+    const rolledBack = rollbackPendingStep ? rollbackPendingCreateSessionWorkoutStep() : false;
+    state.lobby.showCreateSessionWorkoutPickerModal = false;
+    if (!rollbackPendingStep) {
+      state.lobby.createSessionPendingAddedWorkoutId = null;
+    }
+    return rolledBack;
+  };
+
   const createSessionClearWorkoutBtn = document.getElementById("createSessionClearWorkoutBtn");
   if (createSessionClearWorkoutBtn) {
     createSessionClearWorkoutBtn.addEventListener("click", () => {
       state.lobby.createSessionSelectedWorkoutId = null;
+      state.lobby.createSessionPendingAddedWorkoutId = null;
       showToast("Current workout cleared.");
       render();
     });
@@ -9320,8 +9524,10 @@ function renderLobby() {
         return;
       }
       state.lobby.createSessionAdditionalWorkoutIds = [...additionalIds, selectedWorkoutId];
+      state.lobby.createSessionPendingAddedWorkoutId = selectedWorkoutId;
       state.lobby.createSessionSelectedWorkoutId = null;
       state.lobby.createSessionWorkoutPickerExpandedId = null;
+      state.lobby.showCreateSessionWorkoutPickerModal = true;
       showToast("Workout step added. Select the next workout.");
       render();
     });
@@ -9331,6 +9537,7 @@ function renderLobby() {
   if (createSessionClearWorkoutStepsBtn) {
     createSessionClearWorkoutStepsBtn.addEventListener("click", () => {
       state.lobby.createSessionAdditionalWorkoutIds = [];
+      state.lobby.createSessionPendingAddedWorkoutId = null;
       showToast("Added workout steps cleared.");
       render();
     });
@@ -9339,7 +9546,10 @@ function renderLobby() {
   const createSessionWorkoutPickerCloseBtn = document.getElementById("createSessionWorkoutPickerCloseBtn");
   if (createSessionWorkoutPickerCloseBtn) {
     createSessionWorkoutPickerCloseBtn.addEventListener("click", () => {
-      state.lobby.showCreateSessionWorkoutPickerModal = false;
+      const rolledBack = closeCreateSessionWorkoutPicker({ rollbackPendingStep: true });
+      if (rolledBack) {
+        showToast("Workout step add canceled.");
+      }
       render();
     });
   }
@@ -9348,7 +9558,10 @@ function renderLobby() {
   if (createSessionWorkoutPickerModalBackdrop) {
     createSessionWorkoutPickerModalBackdrop.addEventListener("click", (event) => {
       if (event.target !== createSessionWorkoutPickerModalBackdrop) return;
-      state.lobby.showCreateSessionWorkoutPickerModal = false;
+      const rolledBack = closeCreateSessionWorkoutPicker({ rollbackPendingStep: true });
+      if (rolledBack) {
+        showToast("Workout step add canceled.");
+      }
       render();
     });
   }
@@ -9371,6 +9584,83 @@ function renderLobby() {
       state.lobby.createSessionWorkoutPickerTab = SAVED_WORKOUTS_TAB_CUSTOM;
       state.lobby.createSessionWorkoutPickerPage = 1;
       state.lobby.createSessionWorkoutPickerExpandedId = null;
+      render();
+    });
+  }
+
+  const createSessionWorkoutPickerMinDurationSlider = document.getElementById("createSessionWorkoutPickerMinDurationSlider");
+  if (createSessionWorkoutPickerMinDurationSlider) {
+    const durationValueEl = document.getElementById("createSessionWorkoutPickerMinDurationValue");
+    const applyCreateSessionWorkoutPickerDurationFilter = (shouldCommit) => {
+      const selectedMinutes = clamp(
+        Number(createSessionWorkoutPickerMinDurationSlider.value),
+        SAVED_WORKOUTS_DURATION_MIN_MINUTES,
+        SAVED_WORKOUTS_DURATION_MAX_MINUTES,
+      );
+      state.lobby.createSessionWorkoutPickerMinDurationSeconds = normalizeSavedWorkoutsMinDurationSeconds(selectedMinutes * 60);
+      if (durationValueEl) {
+        durationValueEl.textContent = selectedMinutes > 0 ? `${selectedMinutes} min and up` : "No minimum";
+      }
+      if (!shouldCommit) return;
+      state.lobby.createSessionWorkoutPickerPage = 1;
+      render();
+    };
+    createSessionWorkoutPickerMinDurationSlider.addEventListener("input", () => {
+      applyCreateSessionWorkoutPickerDurationFilter(false);
+    });
+    createSessionWorkoutPickerMinDurationSlider.addEventListener("change", () => {
+      applyCreateSessionWorkoutPickerDurationFilter(true);
+    });
+  }
+
+  const createSessionWorkoutPickerToggleFiltersBtn = document.getElementById("createSessionWorkoutPickerToggleFiltersBtn");
+  if (createSessionWorkoutPickerToggleFiltersBtn) {
+    createSessionWorkoutPickerToggleFiltersBtn.addEventListener("click", () => {
+      state.lobby.createSessionWorkoutPickerFiltersExpanded = !state.lobby.createSessionWorkoutPickerFiltersExpanded;
+      render();
+    });
+  }
+
+  const createSessionWorkoutPickerMinDifficultySelect = document.getElementById("createSessionWorkoutPickerMinDifficultySelect");
+  if (createSessionWorkoutPickerMinDifficultySelect) {
+    createSessionWorkoutPickerMinDifficultySelect.addEventListener("change", () => {
+      state.lobby.createSessionWorkoutPickerMinDifficulty = normalizeSavedWorkoutsMinDifficulty(
+        createSessionWorkoutPickerMinDifficultySelect.value,
+      );
+      state.lobby.createSessionWorkoutPickerPage = 1;
+      render();
+    });
+  }
+
+  const createSessionWorkoutPickerFavoritesOnlyInput = document.getElementById("createSessionWorkoutPickerFavoritesOnlyInput");
+  if (createSessionWorkoutPickerFavoritesOnlyInput) {
+    createSessionWorkoutPickerFavoritesOnlyInput.addEventListener("change", () => {
+      state.lobby.createSessionWorkoutPickerFavoritesOnly = createSessionWorkoutPickerFavoritesOnlyInput.checked === true;
+      state.lobby.createSessionWorkoutPickerPage = 1;
+      render();
+    });
+  }
+
+  document.querySelectorAll("[data-create-session-workout-filter-tag]").forEach((tagBtn) => {
+    tagBtn.addEventListener("click", () => {
+      const tag = normalizeWorkoutTag(tagBtn.getAttribute("data-create-session-workout-filter-tag"));
+      if (!tag) return;
+      const currentTags = normalizeWorkoutTags(state.lobby.createSessionWorkoutPickerFilterTags);
+      const hasTag = currentTags.includes(tag);
+      state.lobby.createSessionWorkoutPickerFilterTags = hasTag ? currentTags.filter((entry) => entry !== tag) : [...currentTags, tag];
+      state.lobby.createSessionWorkoutPickerPage = 1;
+      render();
+    });
+  });
+
+  const createSessionWorkoutPickerClearFiltersBtn = document.getElementById("createSessionWorkoutPickerClearFiltersBtn");
+  if (createSessionWorkoutPickerClearFiltersBtn) {
+    createSessionWorkoutPickerClearFiltersBtn.addEventListener("click", () => {
+      state.lobby.createSessionWorkoutPickerMinDurationSeconds = 0;
+      state.lobby.createSessionWorkoutPickerMinDifficulty = 0;
+      state.lobby.createSessionWorkoutPickerFavoritesOnly = false;
+      state.lobby.createSessionWorkoutPickerFilterTags = [];
+      state.lobby.createSessionWorkoutPickerPage = 1;
       render();
     });
   }
@@ -9410,7 +9700,7 @@ function renderLobby() {
       }
       state.lobby.createSessionSelectedWorkoutId = workout.id;
       state.lobby.createSessionWorkoutPickerExpandedId = workout.id;
-      state.lobby.showCreateSessionWorkoutPickerModal = false;
+      closeCreateSessionWorkoutPicker();
       showToast(`${workout.name} selected as current workout.`);
       render();
     });
@@ -9422,10 +9712,17 @@ function renderLobby() {
       const additionalIds = Array.isArray(state.lobby.createSessionAdditionalWorkoutIds)
         ? state.lobby.createSessionAdditionalWorkoutIds
         : [];
-      if (index >= additionalIds.length) return;
-      const nextAdditionalIds = additionalIds.slice();
-      nextAdditionalIds.splice(index, 1);
-      state.lobby.createSessionAdditionalWorkoutIds = nextAdditionalIds;
+      const hasCurrentSelection = !!state.lobby.createSessionSelectedWorkoutId;
+      const currentSelectionIndex = hasCurrentSelection ? additionalIds.length : -1;
+      if (index < additionalIds.length) {
+        const nextAdditionalIds = additionalIds.slice();
+        nextAdditionalIds.splice(index, 1);
+        state.lobby.createSessionAdditionalWorkoutIds = nextAdditionalIds;
+      } else if (index === currentSelectionIndex && hasCurrentSelection) {
+        state.lobby.createSessionSelectedWorkoutId = null;
+      } else {
+        return;
+      }
       showToast("Workout step removed.");
       render();
     });
@@ -9529,38 +9826,8 @@ function renderLobby() {
       if (!validation.valid) {
         showToast(validation.errors[0] || "Generated route failed validation.");
       } else {
-        showToast("Generated a new route preview.");
+        showToast("Generated route updated and applied.");
       }
-      render();
-    });
-  }
-
-  const confirmGeneratedRouteBtn = document.getElementById("confirmGeneratedRouteBtn");
-  if (confirmGeneratedRouteBtn) {
-    confirmGeneratedRouteBtn.addEventListener("click", () => {
-      if (!ROUTE_GENERATOR_SERVICE?.generateRoutePreset) {
-        showToast("Route generator unavailable.");
-        return;
-      }
-      const distanceKm = normalizeGeneratedRouteDistanceKm(document.getElementById("generatedRouteDistance")?.value);
-      const hilliness = normalizeGeneratedHilliness(document.getElementById("generatedRouteHilliness")?.value);
-      const needsRegenerate =
-        !state.lobby.generatedRouteDraft ||
-        Math.abs((Number(state.lobby.generatedRouteDraft.distanceKm) || 0) - distanceKm) >= 0.01 ||
-        normalizeGeneratedHilliness(state.lobby.generatedRouteDraft.hillinessPreset) !== hilliness;
-      const draft = needsRegenerate ? generateLobbyRouteDraft(distanceKm, hilliness) : state.lobby.generatedRouteDraft;
-      if (!draft) {
-        showToast("No generated route to confirm.");
-        return;
-      }
-      const validation = draft._validation || validateGeneratedRoute(draft, distanceKm, hilliness);
-      if (!validation.valid) {
-        showToast(validation.errors[0] || "Generated route failed validation.");
-        return;
-      }
-      state.lobby.generatedRouteConfirmed = cloneJson(draft);
-      state.lobby.routeSelectionMode = "generated";
-      showToast("Generated route confirmed.");
       render();
     });
   }
@@ -9568,37 +9835,47 @@ function renderLobby() {
   const resolveCurrentCreateRouteSelection = () => {
     const currentRouteMode = normalizeRouteSelectionMode(state.lobby.routeSelectionMode);
     if (currentRouteMode === "generated") {
+      const draft = state.lobby.generatedRouteDraft ? ensureRoutePresetShape(state.lobby.generatedRouteDraft) : null;
       const confirmed = state.lobby.generatedRouteConfirmed ? ensureRoutePresetShape(state.lobby.generatedRouteConfirmed) : null;
-      if (!confirmed) {
-        return { ok: false, error: "Generate and confirm a route first." };
-      }
-      const activeDraft = state.lobby.generatedRouteDraft ? ensureRoutePresetShape(state.lobby.generatedRouteDraft) : null;
-      const previewDiffersFromConfirmed =
-        activeDraft &&
-        activeDraft.generatedAt &&
-        confirmed.generatedAt &&
-        activeDraft.generatedAt !== confirmed.generatedAt;
-      if (previewDiffersFromConfirmed) {
-        return { ok: false, error: "Confirm the latest generated route before using it." };
+      const activeGeneratedRoute = draft || confirmed;
+      if (!activeGeneratedRoute) {
+        return { ok: false, error: "Generate a route first." };
       }
       const settingsDrifted =
-        Math.abs((Number(confirmed.distanceKm) || 0) - normalizeGeneratedRouteDistanceKm(state.lobby.generatedRouteDistanceKm)) >= 0.01 ||
-        normalizeGeneratedHilliness(confirmed.hillinessPreset) !== normalizeGeneratedHilliness(state.lobby.generatedRouteHilliness);
+        Math.abs((Number(activeGeneratedRoute.distanceKm) || 0) - normalizeGeneratedRouteDistanceKm(state.lobby.generatedRouteDistanceKm)) >= 0.01 ||
+        normalizeGeneratedHilliness(activeGeneratedRoute.hillinessPreset) !== normalizeGeneratedHilliness(state.lobby.generatedRouteHilliness);
       if (settingsDrifted) {
-        return { ok: false, error: "Regenerate and confirm to match the current generated-route settings." };
+        return { ok: false, error: "Regenerate to apply the current generated-route settings." };
       }
       const validation =
-        confirmed._validation ||
-        validateGeneratedRoute(confirmed, state.lobby.generatedRouteDistanceKm, state.lobby.generatedRouteHilliness);
+        activeGeneratedRoute._validation ||
+        validateGeneratedRoute(activeGeneratedRoute, state.lobby.generatedRouteDistanceKm, state.lobby.generatedRouteHilliness);
       if (!validation.valid) {
-        return { ok: false, error: validation.errors[0] || "Generated route is invalid. Regenerate and confirm again." };
+        return { ok: false, error: validation.errors[0] || "Generated route is invalid. Regenerate and try again." };
       }
-      return { ok: true, routePreset: confirmed };
+      state.lobby.generatedRouteConfirmed = cloneJson(activeGeneratedRoute);
+      return { ok: true, routePreset: activeGeneratedRoute };
     }
 
     const routeId = document.getElementById("createRoute")?.value || state.lobby.selectedRouteId || DEFAULT_ROUTE_PRESET.id;
     state.lobby.selectedRouteId = routeId;
     return { ok: true, routePreset: getRoutePresetById(routeId) };
+  };
+
+  const setCreateSessionRouteEditorFromRoute = (routeInput) => {
+    const route = ensureRoutePresetShape(routeInput, DEFAULT_ROUTE_PRESET);
+    const routeId = String(route.routeId || route.id || "").trim();
+    const isGeneratedRoute = routeId === GENERATED_ROUTE_ID || String(route.id || "").trim() === GENERATED_ROUTE_ID;
+    if (isGeneratedRoute) {
+      state.lobby.routeSelectionMode = "generated";
+      state.lobby.generatedRouteDistanceKm = normalizeGeneratedRouteDistanceKm(route.distanceKm);
+      state.lobby.generatedRouteHilliness = normalizeGeneratedHilliness(route.hillinessPreset);
+      state.lobby.generatedRouteConfirmed = cloneJson(route);
+      state.lobby.generatedRouteDraft = cloneJson(route);
+      return;
+    }
+    state.lobby.routeSelectionMode = "preset";
+    state.lobby.selectedRouteId = getRoutePresetById(routeId || DEFAULT_ROUTE_PRESET.id).id;
   };
 
   const createRouteAddStepBtn = document.getElementById("createRouteAddStepBtn");
@@ -9609,10 +9886,11 @@ function renderLobby() {
         showToast(resolved.error || "Could not add route step.");
         return;
       }
-      state.lobby.createSessionAdditionalRoutes = [
-        ...(Array.isArray(state.lobby.createSessionAdditionalRoutes) ? state.lobby.createSessionAdditionalRoutes : []),
-        cloneJson(resolved.routePreset),
-      ];
+      const currentRouteSteps = Array.isArray(state.lobby.createSessionRouteSteps) ? state.lobby.createSessionRouteSteps : [];
+      const nextRouteSteps = [...currentRouteSteps, cloneJson(resolved.routePreset)];
+      state.lobby.createSessionRouteSteps = nextRouteSteps;
+      state.lobby.createSessionRouteEditIndex = Math.max(0, nextRouteSteps.length - 1);
+      state.lobby.createSessionAdditionalRoutes = nextRouteSteps.slice(1);
       showToast(`${resolved.routePreset.name} added to route sequence.`);
       render();
     });
@@ -9621,20 +9899,60 @@ function renderLobby() {
   const createRouteClearStepsBtn = document.getElementById("createRouteClearStepsBtn");
   if (createRouteClearStepsBtn) {
     createRouteClearStepsBtn.addEventListener("click", () => {
+      const resolved = resolveCurrentCreateRouteSelection();
+      if (!resolved.ok || !resolved.routePreset) {
+        showToast(resolved.error || "Could not reset route sequence.");
+        return;
+      }
+      state.lobby.createSessionRouteSteps = [cloneJson(resolved.routePreset)];
+      state.lobby.createSessionRouteEditIndex = 0;
       state.lobby.createSessionAdditionalRoutes = [];
       showToast("Route sequence reset to a single route.");
       render();
     });
   }
 
+  document.querySelectorAll("[data-select-create-route-step-index]").forEach((rowEl) => {
+    const selectRouteStepForEditing = () => {
+      const stepIndex = Math.max(0, Math.round(Number(rowEl.getAttribute("data-select-create-route-step-index")) || 0));
+      const currentRouteSteps = Array.isArray(state.lobby.createSessionRouteSteps) ? state.lobby.createSessionRouteSteps : [];
+      if (stepIndex >= currentRouteSteps.length) return;
+      state.lobby.createSessionRouteEditIndex = stepIndex;
+      setCreateSessionRouteEditorFromRoute(currentRouteSteps[stepIndex]);
+      render();
+    };
+    rowEl.addEventListener("click", (event) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest("button, input, select, textarea, a, label")) return;
+      selectRouteStepForEditing();
+    });
+    rowEl.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      const target = event.target;
+      if (target instanceof Element && target.closest("button, input, select, textarea, a, label")) return;
+      event.preventDefault();
+      selectRouteStepForEditing();
+    });
+  });
+
   document.querySelectorAll("[data-remove-create-route-step-index]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const removeIndex = Math.max(0, Math.round(Number(btn.getAttribute("data-remove-create-route-step-index")) || 0));
-      const currentRoutes = Array.isArray(state.lobby.createSessionAdditionalRoutes) ? state.lobby.createSessionAdditionalRoutes : [];
-      if (removeIndex >= currentRoutes.length) return;
-      const nextRoutes = currentRoutes.slice();
-      nextRoutes.splice(removeIndex, 1);
-      state.lobby.createSessionAdditionalRoutes = nextRoutes;
+      const currentRouteSteps = Array.isArray(state.lobby.createSessionRouteSteps) ? state.lobby.createSessionRouteSteps : [];
+      if (currentRouteSteps.length <= 1 || removeIndex >= currentRouteSteps.length) return;
+      const nextRouteSteps = currentRouteSteps.slice();
+      nextRouteSteps.splice(removeIndex, 1);
+      let nextEditIndex = Math.max(0, Math.round(Number(state.lobby.createSessionRouteEditIndex) || 0));
+      if (nextEditIndex === removeIndex) {
+        nextEditIndex = Math.max(0, removeIndex - 1);
+      } else if (nextEditIndex > removeIndex) {
+        nextEditIndex -= 1;
+      }
+      nextEditIndex = clamp(nextEditIndex, 0, Math.max(0, nextRouteSteps.length - 1));
+      state.lobby.createSessionRouteSteps = nextRouteSteps;
+      state.lobby.createSessionRouteEditIndex = nextEditIndex;
+      state.lobby.createSessionAdditionalRoutes = nextRouteSteps.slice(1);
+      setCreateSessionRouteEditorFromRoute(nextRouteSteps[nextEditIndex]);
       showToast("Route step removed.");
       render();
     });
@@ -9653,8 +9971,19 @@ function renderLobby() {
         return;
       }
 
-      const additionalRoutes = Array.isArray(state.lobby.createSessionAdditionalRoutes) ? state.lobby.createSessionAdditionalRoutes : [];
-      const routePlanPresets = [resolvedCurrentRoute.routePreset, ...additionalRoutes];
+      const routeStepsForSession = Array.isArray(state.lobby.createSessionRouteSteps) ? state.lobby.createSessionRouteSteps : [];
+      const routePlanPresets = (routeStepsForSession.length > 0 ? routeStepsForSession : [resolvedCurrentRoute.routePreset]).map((route) =>
+        cloneJson(ensureRoutePresetShape(route, DEFAULT_ROUTE_PRESET)),
+      );
+      const routeEditIndexForSession = clamp(
+        Math.round(Number(state.lobby.createSessionRouteEditIndex) || 0),
+        0,
+        Math.max(0, routePlanPresets.length - 1),
+      );
+      routePlanPresets[routeEditIndexForSession] = cloneJson(resolvedCurrentRoute.routePreset);
+      state.lobby.createSessionRouteSteps = routePlanPresets.map((route) => ensureRoutePresetShape(route, DEFAULT_ROUTE_PRESET));
+      state.lobby.createSessionRouteEditIndex = routeEditIndexForSession;
+      state.lobby.createSessionAdditionalRoutes = state.lobby.createSessionRouteSteps.slice(1);
       const accountProfile = getCurrentAccountProfile();
       const resolvedName = name || accountProfile?.displayName || "";
       const resolvedWeight = Number.isFinite(weight) ? weight : Number.isFinite(accountProfile?.weightKg) ? accountProfile.weightKg : null;
@@ -11662,17 +11991,6 @@ function renderSession() {
     nowMs: now,
   });
 
-  const telemetryZoneParticipants = rows.map((row) => ({
-    id: row.id,
-    name: row.participantLabel || row.name,
-    heartRate: row.heartRate,
-    watts: row.power,
-  }));
-  const hasLiveTelemetry = telemetryZoneParticipants.some((participant) => participant.heartRate > 0 || participant.watts > 0);
-  const zoneParticipants = hasLiveTelemetry ? telemetryZoneParticipants : getMockTelemetryParticipants();
-  const zoneStatusLabel = hasLiveTelemetry
-    ? "Live values. Colors only: green (low), yellow (medium), red (high)."
-    : "No live values yet. Showing mock participant data for testing.";
   const terrain = state.simulation.terrain;
   const currentGradeText = formatSignedPercent(terrain.currentGrade, 1);
   const effectiveGradeText = formatSignedPercent(terrain.effectiveGrade, 1);
@@ -11928,18 +12246,6 @@ function renderSession() {
         <div class="small" style="margin-top:8px;">Other riders can see active usage only, not your inventory.</div>
       </div>
 
-      <div style="margin-top:18px;">
-        <h2 style="margin-bottom:8px;">Participant Telemetry Zones (MVP)</h2>
-        <div class="small">${zoneStatusLabel}</div>
-        <div class="telemetry-zone-grid telemetry-zone-header" style="margin-top:10px;">
-          <div>Participant</div>
-          <div>Heart Rate</div>
-          <div>Watts</div>
-        </div>
-        <div class="telemetry-zone-list">
-          ${renderTelemetryZoneRows(zoneParticipants)}
-        </div>
-      </div>
       `
           : ""
       }
@@ -11951,8 +12257,8 @@ function renderSession() {
             <th>Watts</th>
             <th>W/kg</th>
             <th>HR</th>
+            <th>Cadence</th>
             <th>Grade</th>
-            <th>Power-Up</th>
             <th>Distance / Climb</th>
           </tr>
         </thead>
@@ -11965,8 +12271,8 @@ function renderSession() {
               <td>${row.power ? `${row.power}W` : "--"}</td>
               <td>${row.wkg ? formatNumber(row.wkg, 1) : "--"}</td>
               <td>${row.heartRate ? `${row.heartRate} bpm` : "--"}</td>
+              <td>${row.cadence ? `${row.cadence} rpm` : "--"}</td>
               <td><span class="grade-chip ${getGradeColorClass(row.grade)}">${formatSignedPercent(row.grade, 1)}</span></td>
-              <td>${escapeHtml(formatActivePowerUpLabel(row.activePowerUp, now))}</td>
               <td>${formatDistanceKmFloor(row.distance)} | ${Math.round(row.climbMeters)} m climbed</td>
             </tr>
           `,

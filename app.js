@@ -18,6 +18,7 @@ const PUBLIC_PROFILES_KEY = `${STORAGE_PREFIX}:publicProfiles`;
 const FRIEND_REQUESTS_KEY = `${STORAGE_PREFIX}:friendRequests`;
 const FRIENDSHIPS_KEY = `${STORAGE_PREFIX}:friendships`;
 const WORKOUTS_KEY = `${STORAGE_PREFIX}:workouts`;
+const WORKOUT_TEMPLATE_META_KEY = `${STORAGE_PREFIX}:workoutTemplateMeta`;
 
 // WebRTC signaling server (fallbacks to localStorage if unavailable)
 const DEFAULT_SIGNALING_SERVER = "ws://localhost:3000";
@@ -36,7 +37,22 @@ const PRIVATE_RIDER_PEAK_WINDOWS = Object.freeze([
   { label: "1h", seconds: 3600 },
 ]);
 const PRIVATE_RIDER_MAX_WINDOW_SECONDS = PRIVATE_RIDER_PEAK_WINDOWS[PRIVATE_RIDER_PEAK_WINDOWS.length - 1].seconds;
+const EFFORT_SEISMOGRAPH_FRAME_SECONDS = 5;
+const EFFORT_SEISMOGRAPH_WINDOW_SECONDS = 10 * 60;
+const EFFORT_SEISMOGRAPH_MAX_FRAMES = EFFORT_SEISMOGRAPH_WINDOW_SECONDS / EFFORT_SEISMOGRAPH_FRAME_SECONDS;
+const EFFORT_SEISMOGRAPH_POWER_CAP_FTP_MULTIPLIER = 1.5;
+const EFFORT_SEISMOGRAPH_HEART_RATE_MIN = 80;
+const EFFORT_SEISMOGRAPH_HEART_RATE_MAX = 200;
 const BIKE_SWITCH_SPEED_LIMIT_KPH = 2;
+const ERG_STATE_UNAVAILABLE = "unavailable";
+const ERG_STATE_AVAILABLE = "available";
+const ERG_STATE_ENABLING = "enabling";
+const ERG_STATE_ACTIVE = "active";
+const ERG_STATE_INTERRUPTED = "interrupted";
+const ERG_STATE_ERROR = "error";
+const ERG_STATE_DISABLED = "disabled";
+const TRAINER_CONTROL_WRITE_TIMEOUT_MS = 5000;
+const TRAINER_TELEMETRY_STALE_MS = 8000;
 // Bike catalog is intentionally data-driven so adding new bike types is a catalog-only change.
 const BIKE_CATALOG = Object.freeze([
   {
@@ -93,6 +109,8 @@ const WORKOUT_DEFAULT_SET_SEGMENT_DURATION_SECONDS = 60;
 const WORKOUT_MIN_SEGMENT_DURATION_SECONDS = 5;
 const WORKOUT_MAX_SEGMENT_DURATION_SECONDS = 7200;
 const WORKOUT_SEGMENT_SECOND_STEP = 5;
+const WORKOUT_TARGET_CADENCE_MIN_RPM = 40;
+const WORKOUT_TARGET_CADENCE_MAX_RPM = 140;
 const WORKOUT_TIMELINE_BASE_WINDOW_SECONDS = 3600;
 const WORKOUT_TIMELINE_MARKER_STEP_SECONDS = 300;
 const WORKOUT_SET_REPETITIONS_MIN = 1;
@@ -103,6 +121,10 @@ const WORKOUT_DEFAULT_FTP_WATTS = 200;
 const WORKOUT_NOTES_MAX_LENGTH = 5000;
 const WORKOUT_RATING_MIN = 1;
 const WORKOUT_RATING_MAX = 5;
+const WORKOUT_SOURCE_TEMPLATE = "template";
+const WORKOUT_SOURCE_CUSTOM = "custom";
+const SAVED_WORKOUTS_TAB_TEMPLATE = "template";
+const SAVED_WORKOUTS_TAB_CUSTOM = "custom";
 const WORKOUT_TAG_OPTIONS = Object.freeze([
   "FTP Builder",
   "Endurance",
@@ -114,6 +136,157 @@ const WORKOUT_TAG_OPTIONS = Object.freeze([
   "Climbing",
   "Sweet Spot",
   "Race Prep",
+]);
+const WORKOUT_TEMPLATE_SEEDS = Object.freeze([
+  {
+    id: "template-ftp-builder-foundation",
+    name: "FTP Builder Foundation",
+    tags: ["FTP Builder"],
+    notes: "A structured workout focused on building sustained FTP-related effort.",
+    segments: [
+      { zone: 1, durationSeconds: 5 * 60 },
+      { zone: 3, durationSeconds: 10 * 60 },
+      { zone: 4, durationSeconds: 10 * 60 },
+      { zone: 2, durationSeconds: 5 * 60 },
+      { zone: 4, durationSeconds: 10 * 60 },
+      { zone: 1, durationSeconds: 5 * 60 },
+    ],
+  },
+  {
+    id: "template-endurance-base-45",
+    name: "Endurance Base 45",
+    tags: ["Endurance"],
+    notes: "A steady endurance workout for aerobic base building.",
+    segments: [
+      { zone: 1, durationSeconds: 5 * 60 },
+      { zone: 2, durationSeconds: 30 * 60 },
+      { zone: 2, durationSeconds: 10 * 60 },
+      { zone: 1, durationSeconds: 5 * 60 },
+    ],
+  },
+  {
+    id: "template-easy-recovery-spin",
+    name: "Easy Recovery Spin",
+    tags: ["Recovery"],
+    notes: "A low-stress recovery ride for easy spinning.",
+    segments: [
+      { zone: 1, durationSeconds: 5 * 60 },
+      { zone: 1, durationSeconds: 15 * 60 },
+      { zone: 2, durationSeconds: 5 * 60 },
+      { zone: 1, durationSeconds: 5 * 60 },
+    ],
+  },
+  {
+    id: "template-tempo-builder-40",
+    name: "Tempo Builder 40",
+    tags: ["Tempo"],
+    notes: "A tempo-focused session with sustained moderate pressure.",
+    segments: [
+      { zone: 1, durationSeconds: 5 * 60 },
+      { zone: 2, durationSeconds: 5 * 60 },
+      { zone: 3, durationSeconds: 15 * 60 },
+      { zone: 2, durationSeconds: 5 * 60 },
+      { zone: 3, durationSeconds: 15 * 60 },
+      { zone: 1, durationSeconds: 5 * 60 },
+    ],
+  },
+  {
+    id: "template-threshold-ladder",
+    name: "Threshold Ladder",
+    tags: ["Threshold"],
+    notes: "A threshold workout with increasingly long efforts.",
+    segments: [
+      { zone: 1, durationSeconds: 5 * 60 },
+      { zone: 3, durationSeconds: 5 * 60 },
+      { zone: 4, durationSeconds: 8 * 60 },
+      { zone: 2, durationSeconds: 4 * 60 },
+      { zone: 4, durationSeconds: 10 * 60 },
+      { zone: 2, durationSeconds: 4 * 60 },
+      { zone: 4, durationSeconds: 12 * 60 },
+      { zone: 1, durationSeconds: 5 * 60 },
+    ],
+  },
+  {
+    id: "template-vo2-max-punches",
+    name: "VO2 Max Punches",
+    tags: ["VO2 Max"],
+    notes: "A short hard workout targeting VO2 style efforts.",
+    segments: [
+      { zone: 1, durationSeconds: 5 * 60 },
+      { zone: 3, durationSeconds: 5 * 60 },
+      { zone: 5, durationSeconds: 3 * 60 },
+      { zone: 1, durationSeconds: 3 * 60 },
+      { zone: 5, durationSeconds: 3 * 60 },
+      { zone: 1, durationSeconds: 3 * 60 },
+      { zone: 5, durationSeconds: 3 * 60 },
+      { zone: 1, durationSeconds: 3 * 60 },
+      { zone: 5, durationSeconds: 3 * 60 },
+      { zone: 1, durationSeconds: 5 * 60 },
+    ],
+  },
+  {
+    id: "template-sprint-primer",
+    name: "Sprint Primer",
+    tags: ["Sprint"],
+    notes: "A short session with repeated sprint efforts and easy recovery.",
+    segments: [
+      { zone: 1, durationSeconds: 5 * 60 },
+      { zone: 2, durationSeconds: 5 * 60 },
+      { zone: 5, durationSeconds: 30 },
+      { zone: 1, durationSeconds: 2 * 60 },
+      { zone: 5, durationSeconds: 30 },
+      { zone: 1, durationSeconds: 2 * 60 },
+      { zone: 5, durationSeconds: 30 },
+      { zone: 1, durationSeconds: 2 * 60 },
+      { zone: 5, durationSeconds: 30 },
+      { zone: 1, durationSeconds: 5 * 60 },
+    ],
+  },
+  {
+    id: "template-climbing-steps",
+    name: "Climbing Steps",
+    tags: ["Climbing"],
+    notes: "A climbing-style session with longer steady uphill-feeling efforts.",
+    segments: [
+      { zone: 1, durationSeconds: 5 * 60 },
+      { zone: 2, durationSeconds: 5 * 60 },
+      { zone: 3, durationSeconds: 10 * 60 },
+      { zone: 4, durationSeconds: 10 * 60 },
+      { zone: 3, durationSeconds: 5 * 60 },
+      { zone: 4, durationSeconds: 10 * 60 },
+      { zone: 1, durationSeconds: 5 * 60 },
+    ],
+  },
+  {
+    id: "template-sweet-spot-builder",
+    name: "Sweet Spot Builder",
+    tags: ["Sweet Spot"],
+    notes: "A sweet spot session with repeat sustained efforts.",
+    segments: [
+      { zone: 1, durationSeconds: 5 * 60 },
+      { zone: 3, durationSeconds: 5 * 60 },
+      { zone: 4, durationSeconds: 12 * 60 },
+      { zone: 2, durationSeconds: 5 * 60 },
+      { zone: 4, durationSeconds: 12 * 60 },
+      { zone: 1, durationSeconds: 5 * 60 },
+    ],
+  },
+  {
+    id: "template-race-prep-opener",
+    name: "Race Prep Opener",
+    tags: ["Race Prep"],
+    notes: "A mixed-intensity opener session designed to prepare a rider for harder efforts.",
+    segments: [
+      { zone: 1, durationSeconds: 5 * 60 },
+      { zone: 2, durationSeconds: 5 * 60 },
+      { zone: 4, durationSeconds: 4 * 60 },
+      { zone: 1, durationSeconds: 3 * 60 },
+      { zone: 5, durationSeconds: 2 * 60 },
+      { zone: 1, durationSeconds: 3 * 60 },
+      { zone: 3, durationSeconds: 5 * 60 },
+      { zone: 1, durationSeconds: 5 * 60 },
+    ],
+  },
 ]);
 const WORKOUT_ZONES = Object.freeze([
   Object.freeze({ zone: 1, label: "Recovery", ftpRange: "0-55%", minPct: 0, maxPct: 55 }),
@@ -435,6 +608,21 @@ function createEmptyPrivateRiderStats(sessionCode = null, userId = null) {
   };
 }
 
+function createEmptyEffortSeismographState(sessionCode = null, userId = null) {
+  return {
+    sessionCode,
+    userId,
+    frameSeconds: EFFORT_SEISMOGRAPH_FRAME_SECONDS,
+    maxFrames: EFFORT_SEISMOGRAPH_MAX_FRAMES,
+    frames: [],
+    pendingElapsedSeconds: 0,
+    pendingPowerSeconds: 0,
+    pendingHeartRateSeconds: 0,
+    pendingHeartRateWeightSeconds: 0,
+    lastFrameTimestampMs: null,
+  };
+}
+
 function createEmptyPowerUpState(sessionCode = null, userId = null) {
   return {
     sessionCode,
@@ -451,6 +639,64 @@ function createEmptyFtpProposalState(sessionCode = null, userId = null) {
     userId,
     pendingProposal: null,
     lastDeclinedCandidateWatts: null,
+  };
+}
+
+function createDefaultTrainerErgState(overrides = {}) {
+  const source = overrides && typeof overrides === "object" ? overrides : {};
+  return {
+    desiredEnabled: source.desiredEnabled === true,
+    state: source.state || ERG_STATE_UNAVAILABLE,
+    supported: source.supported === true,
+    unsupportedReason: source.unsupportedReason || "Trainer not connected",
+    currentTargetWatts: Number.isFinite(Number(source.currentTargetWatts)) ? Math.round(Number(source.currentTargetWatts)) : null,
+    lastSentTargetWatts: Number.isFinite(Number(source.lastSentTargetWatts)) ? Math.round(Number(source.lastSentTargetWatts)) : null,
+    lastAppliedEntryKey: source.lastAppliedEntryKey != null ? String(source.lastAppliedEntryKey) : null,
+    error: source.error || null,
+    lastTelemetryAt: Number.isFinite(Number(source.lastTelemetryAt)) ? Number(source.lastTelemetryAt) : null,
+    telemetryStale: source.telemetryStale === true,
+    powerRange:
+      source.powerRange && typeof source.powerRange === "object"
+        ? {
+            minWatts: Number.isFinite(Number(source.powerRange.minWatts)) ? Math.round(Number(source.powerRange.minWatts)) : null,
+            maxWatts: Number.isFinite(Number(source.powerRange.maxWatts)) ? Math.round(Number(source.powerRange.maxWatts)) : null,
+            incrementWatts: Number.isFinite(Number(source.powerRange.incrementWatts)) ? Math.round(Number(source.powerRange.incrementWatts)) : null,
+          }
+        : { minWatts: null, maxWatts: null, incrementWatts: null },
+    lastSyncAt: Number.isFinite(Number(source.lastSyncAt)) ? Number(source.lastSyncAt) : 0,
+    syncInFlight: false,
+  };
+}
+
+function createDefaultTrainerDeviceState(overrides = {}) {
+  const source = overrides && typeof overrides === "object" ? overrides : {};
+  return {
+    connected: source.connected === true,
+    name: source.name || null,
+    device: source.device || null,
+    server: source.server || null,
+    characteristic: source.characteristic || null,
+    controlCharacteristic: source.controlCharacteristic || null,
+    controlSupported: source.controlSupported === true,
+    controlGranted: source.controlGranted === true,
+    lastControlError: source.lastControlError || null,
+    lastResistancePercent: Number.isFinite(Number(source.lastResistancePercent)) ? Number(source.lastResistancePercent) : null,
+    lastResistanceAt: Number.isFinite(Number(source.lastResistanceAt)) ? Number(source.lastResistanceAt) : 0,
+    lastReading: source.lastReading || null,
+    controlWriteQueue: Promise.resolve(),
+    erg: createDefaultTrainerErgState(source.erg),
+  };
+}
+
+function createDefaultHrmDeviceState(overrides = {}) {
+  const source = overrides && typeof overrides === "object" ? overrides : {};
+  return {
+    connected: source.connected === true,
+    name: source.name || null,
+    device: source.device || null,
+    server: source.server || null,
+    characteristic: source.characteristic || null,
+    lastReading: source.lastReading || null,
   };
 }
 
@@ -473,6 +719,13 @@ let state = {
     generatedRouteConfirmed: null,
     generatedRouteDistanceKm: 20,
     generatedRouteHilliness: "rolling",
+    createSessionAdditionalRoutes: [],
+    createSessionSelectedWorkoutId: null,
+    createSessionAdditionalWorkoutIds: [],
+    showCreateSessionWorkoutPickerModal: false,
+    createSessionWorkoutPickerTab: SAVED_WORKOUTS_TAB_CUSTOM,
+    createSessionWorkoutPickerPage: 1,
+    createSessionWorkoutPickerExpandedId: null,
     recentSessionsPage: 1,
     recentSessionsKnownCodes: [],
     workoutDraftName: "",
@@ -482,9 +735,11 @@ let state = {
     workoutSelection: null,
     workoutEditingId: null,
     savedWorkoutsPage: 1,
+    savedWorkoutsActiveTab: SAVED_WORKOUTS_TAB_CUSTOM,
     savedWorkoutsFiltersExpanded: false,
     savedWorkoutsMinDurationSeconds: 0,
     savedWorkoutsMinDifficulty: 0,
+    savedWorkoutsFavoritesOnly: false,
     savedWorkoutsFilterTags: [],
     workoutFtpOverrideWatts: null,
     showWorkoutFtpModal: false,
@@ -493,6 +748,7 @@ let state = {
     savedWorkoutNotesView: null,
     workoutRatingModal: null,
     workoutDeleteModal: null,
+    savedWorkoutsExpandedId: null,
   },
   session: null,
   user: null,
@@ -500,28 +756,8 @@ let state = {
   lastTick: null,
   toastTimeout: null,
   devices: {
-    trainer: {
-      connected: false,
-      name: null,
-      device: null,
-      server: null,
-      characteristic: null,
-      controlCharacteristic: null,
-      controlSupported: false,
-      controlGranted: false,
-      lastControlError: null,
-      lastResistancePercent: null,
-      lastResistanceAt: 0,
-      lastReading: null,
-    },
-    hrm: {
-      connected: false,
-      name: null,
-      device: null,
-      server: null,
-      characteristic: null,
-      lastReading: null,
-    },
+    trainer: createDefaultTrainerDeviceState(),
+    hrm: createDefaultHrmDeviceState(),
   },
   webrtc: {
     enabled: true,
@@ -556,6 +792,7 @@ let state = {
   },
   sessionRenderDeferred: false,
   privateRiderStats: createEmptyPrivateRiderStats(),
+  effortSeismograph: createEmptyEffortSeismographState(),
   powerUps: createEmptyPowerUpState(),
   ftp: createEmptyFtpProposalState(),
 };
@@ -640,6 +877,15 @@ function normalizeSavedWorkoutsMinDifficulty(valueInput) {
   const parsedValue = Number(valueInput);
   if (!Number.isFinite(parsedValue) || parsedValue <= 0) return 0;
   return clamp(Math.round(parsedValue), 1, 10);
+}
+
+function normalizeSavedWorkoutsActiveTab(tabInput) {
+  const normalized = String(tabInput || "").trim().toLowerCase();
+  return normalized === SAVED_WORKOUTS_TAB_TEMPLATE ? SAVED_WORKOUTS_TAB_TEMPLATE : SAVED_WORKOUTS_TAB_CUSTOM;
+}
+
+function normalizeSavedWorkoutsFavoritesOnly(valueInput) {
+  return valueInput === true;
 }
 
 function persistLocalSession(code, userId) {
@@ -1772,7 +2018,7 @@ const GENERATED_HILLINESS_LABELS = Object.freeze({
   hilly: "Hilly",
   climbing: "Climbing",
 });
-const LOBBY_SECTIONS = Object.freeze(["account", "create", "join", "devices", "workouts"]);
+const LOBBY_SECTIONS = Object.freeze(["home", "account", "create", "join", "devices", "workouts"]);
 
 function normalizeGeneratedRouteDistanceKm(distanceKmInput) {
   const parsed = Number(distanceKmInput);
@@ -1789,8 +2035,8 @@ function normalizeRouteSelectionMode(modeInput) {
   return String(modeInput || "").trim().toLowerCase() === "generated" ? "generated" : "preset";
 }
 
-function normalizeLobbySection(sectionInput, fallbackSection = "account") {
-  const fallback = LOBBY_SECTIONS.includes(fallbackSection) ? fallbackSection : "account";
+function normalizeLobbySection(sectionInput, fallbackSection = "home") {
+  const fallback = LOBBY_SECTIONS.includes(fallbackSection) ? fallbackSection : "home";
   const normalized = String(sectionInput || "").trim().toLowerCase();
   return LOBBY_SECTIONS.includes(normalized) ? normalized : fallback;
 }
@@ -1840,6 +2086,25 @@ function normalizeWorkoutTargetFtpPct(targetFtpPctInput, fallbackTargetFtpPct = 
   return null;
 }
 
+function normalizeWorkoutTargetCadenceRpm(targetCadenceInput, fallbackCadenceRpm = null) {
+  if (targetCadenceInput == null || String(targetCadenceInput).trim() === "") {
+    const parsedFallback = Math.round(Number(fallbackCadenceRpm));
+    if (Number.isFinite(parsedFallback)) {
+      return clamp(parsedFallback, WORKOUT_TARGET_CADENCE_MIN_RPM, WORKOUT_TARGET_CADENCE_MAX_RPM);
+    }
+    return null;
+  }
+  const parsed = Math.round(Number(targetCadenceInput));
+  if (!Number.isFinite(parsed)) {
+    const parsedFallback = Math.round(Number(fallbackCadenceRpm));
+    if (Number.isFinite(parsedFallback)) {
+      return clamp(parsedFallback, WORKOUT_TARGET_CADENCE_MIN_RPM, WORKOUT_TARGET_CADENCE_MAX_RPM);
+    }
+    return null;
+  }
+  return clamp(parsed, WORKOUT_TARGET_CADENCE_MIN_RPM, WORKOUT_TARGET_CADENCE_MAX_RPM);
+}
+
 function getWorkoutTargetFtpPctFromWatts(targetWattsInput, ftpWattsInput) {
   const ftpWatts = normalizeWorkoutFtpWatts(ftpWattsInput, WORKOUT_DEFAULT_FTP_WATTS);
   const targetWatts = normalizeWorkoutTargetWatts(targetWattsInput, 0);
@@ -1883,6 +2148,16 @@ function getWorkoutSegmentZone(segmentInput, ftpWattsInput) {
   const segment = segmentInput && typeof segmentInput === "object" ? segmentInput : {};
   const targetWatts = getWorkoutSegmentTargetWatts(segment, ftpWattsInput);
   return getWorkoutZoneForWatts(targetWatts, ftpWattsInput);
+}
+
+function getWorkoutSegmentTargetCadenceRpm(segmentInput) {
+  const segment = segmentInput && typeof segmentInput === "object" ? segmentInput : {};
+  return normalizeWorkoutTargetCadenceRpm(segment.targetCadenceRpm, null);
+}
+
+function formatWorkoutCadenceTargetLabel(segmentInput, fallbackLabel = "No cadence target") {
+  const cadenceRpm = getWorkoutSegmentTargetCadenceRpm(segmentInput);
+  return cadenceRpm != null ? `${cadenceRpm} rpm cadence` : fallbackLabel;
 }
 
 function getWorkoutEffortClass(zoneInput) {
@@ -1936,10 +2211,12 @@ function normalizeWorkoutZoneSegment(segmentInput, ftpReferenceWattsInput = WORK
     : targetFtpPct != null
       ? getWorkoutZoneForWatts(referenceWatts, ftpReferenceWattsInput)
       : getWorkoutZoneConfig(segment.zone).zone;
+  const targetCadenceRpm = normalizeWorkoutTargetCadenceRpm(segment.targetCadenceRpm, null);
   return {
     type: WORKOUT_ITEM_TYPE_SEGMENT,
     zone,
     targetFtpPct,
+    targetCadenceRpm,
     durationSeconds: normalizeWorkoutDurationSeconds(segment.durationSeconds),
   };
 }
@@ -2064,6 +2341,76 @@ function computeWorkoutTotalDurationSeconds(segmentsInput) {
   }, 0);
 }
 
+function buildWorkoutPlaybackTimeline(segmentsInput, ftpReferenceWattsInput = WORKOUT_DEFAULT_FTP_WATTS) {
+  const ftpReferenceWatts = normalizeWorkoutFtpWatts(ftpReferenceWattsInput, WORKOUT_DEFAULT_FTP_WATTS);
+  const segments = normalizeWorkoutSegments(segmentsInput, ftpReferenceWatts);
+  const entries = [];
+  let elapsedSeconds = 0;
+
+  segments.forEach((item, topIndex) => {
+    if (item.type === WORKOUT_ITEM_TYPE_SET) {
+      const repetitions = normalizeWorkoutSetRepetitions(item.repetitions);
+      for (let repIndex = 0; repIndex < repetitions; repIndex += 1) {
+        item.segments.forEach((segment, setSegmentIndex) => {
+          const durationSeconds = normalizeWorkoutDurationSeconds(segment.durationSeconds);
+          const startSeconds = elapsedSeconds;
+          const endSeconds = startSeconds + durationSeconds;
+          const zone = getWorkoutSegmentZone(segment, ftpReferenceWatts);
+          const targetWatts = getWorkoutSegmentTargetWatts(segment, ftpReferenceWatts);
+          const targetCadenceRpm = getWorkoutSegmentTargetCadenceRpm(segment);
+          entries.push({
+            timelineIndex: entries.length,
+            kind: "set-segment",
+            topIndex,
+            setIndex: topIndex,
+            setSegmentIndex,
+            repIndex,
+            repetitions,
+            durationSeconds,
+            startSeconds,
+            endSeconds,
+            zone,
+            targetWatts,
+            targetCadenceRpm,
+            label: `Set ${topIndex + 1} | Rep ${repIndex + 1}/${repetitions} | Segment ${setSegmentIndex + 1}`,
+          });
+          elapsedSeconds = endSeconds;
+        });
+      }
+      return;
+    }
+
+    const durationSeconds = normalizeWorkoutDurationSeconds(item.durationSeconds);
+    const startSeconds = elapsedSeconds;
+    const endSeconds = startSeconds + durationSeconds;
+    const zone = getWorkoutSegmentZone(item, ftpReferenceWatts);
+    const targetWatts = getWorkoutSegmentTargetWatts(item, ftpReferenceWatts);
+    const targetCadenceRpm = getWorkoutSegmentTargetCadenceRpm(item);
+    entries.push({
+      timelineIndex: entries.length,
+      kind: "segment",
+      topIndex,
+      setIndex: null,
+      setSegmentIndex: null,
+      repIndex: null,
+      repetitions: null,
+      durationSeconds,
+      startSeconds,
+      endSeconds,
+      zone,
+      targetWatts,
+      targetCadenceRpm,
+      label: `Segment ${topIndex + 1}`,
+    });
+    elapsedSeconds = endSeconds;
+  });
+
+  return {
+    entries,
+    totalDurationSeconds: elapsedSeconds,
+  };
+}
+
 function createWorkoutSegment(
   zoneInput,
   durationSecondsInput = WORKOUT_DEFAULT_SEGMENT_DURATION_SECONDS,
@@ -2076,6 +2423,7 @@ function createWorkoutSegment(
     type: WORKOUT_ITEM_TYPE_SEGMENT,
     zone: zoneDef.zone,
     targetFtpPct,
+    targetCadenceRpm: null,
     durationSeconds: normalizeWorkoutDurationSeconds(durationSecondsInput),
   };
 }
@@ -2231,8 +2579,63 @@ function normalizeWorkoutTags(tagsInput) {
   return normalized;
 }
 
+function normalizeWorkoutSource(sourceInput) {
+  const normalized = String(sourceInput || "").trim().toLowerCase();
+  return normalized === WORKOUT_SOURCE_TEMPLATE ? WORKOUT_SOURCE_TEMPLATE : WORKOUT_SOURCE_CUSTOM;
+}
+
+function normalizeWorkoutTemplateMetaRecord(metaInput) {
+  const meta = metaInput && typeof metaInput === "object" ? metaInput : {};
+  return {
+    isFavorite: normalizeWorkoutFavorite(meta.isFavorite),
+    rating: normalizeWorkoutRating(meta.rating, null),
+  };
+}
+
+function loadWorkoutTemplateMeta() {
+  const raw = loadJson(WORKOUT_TEMPLATE_META_KEY, {});
+  const source = raw && typeof raw === "object" ? raw : {};
+  const normalized = {};
+  WORKOUT_TEMPLATE_SEEDS.forEach((seed) => {
+    normalized[seed.id] = normalizeWorkoutTemplateMetaRecord(source[seed.id]);
+  });
+  return normalized;
+}
+
+function saveWorkoutTemplateMeta(metaInput) {
+  const source = metaInput && typeof metaInput === "object" ? metaInput : {};
+  const normalized = {};
+  WORKOUT_TEMPLATE_SEEDS.forEach((seed) => {
+    normalized[seed.id] = normalizeWorkoutTemplateMetaRecord(source[seed.id]);
+  });
+  saveJson(WORKOUT_TEMPLATE_META_KEY, normalized);
+}
+
+function loadTemplateWorkouts() {
+  const templateMeta = loadWorkoutTemplateMeta();
+  return WORKOUT_TEMPLATE_SEEDS.map((seed, index) => {
+    const meta = normalizeWorkoutTemplateMetaRecord(templateMeta[seed.id]);
+    return normalizeWorkoutRecord(
+      {
+        id: seed.id,
+        source: WORKOUT_SOURCE_TEMPLATE,
+        name: seed.name,
+        createdAt: index + 1,
+        ftpReferenceWatts: WORKOUT_DEFAULT_FTP_WATTS,
+        notes: normalizeWorkoutNotes(seed.notes),
+        isFavorite: meta.isFavorite,
+        rating: meta.rating,
+        tags: seed.tags,
+        segments: seed.segments,
+      },
+      index,
+    );
+  });
+}
+
 function normalizeWorkoutRecord(workoutInput, index = 0) {
   const workout = workoutInput && typeof workoutInput === "object" ? workoutInput : {};
+  const source = normalizeWorkoutSource(workout.source);
   const ftpReferenceWatts = normalizeWorkoutFtpWatts(workout.ftpReferenceWatts, WORKOUT_DEFAULT_FTP_WATTS);
   const segments = normalizeWorkoutSegments(workout.segments, ftpReferenceWatts);
   const name = normalizeWorkoutName(workout.name) || `Workout ${index + 1}`;
@@ -2250,6 +2653,7 @@ function normalizeWorkoutRecord(workoutInput, index = 0) {
 
   return {
     id,
+    source,
     name,
     createdAt: createdAtMs,
     ftpReferenceWatts,
@@ -2262,16 +2666,132 @@ function normalizeWorkoutRecord(workoutInput, index = 0) {
   };
 }
 
+function buildSessionWorkoutPlan(workoutInput) {
+  if (!workoutInput || typeof workoutInput !== "object") return null;
+  const normalizedWorkout = normalizeWorkoutRecord(workoutInput, 0);
+  const normalizedWorkoutSteps = Array.isArray(workoutInput.workouts)
+    ? workoutInput.workouts
+        .map((step, index) => {
+          if (!step || typeof step !== "object") return null;
+          const name = normalizeWorkoutName(step.name) || `Workout ${index + 1}`;
+          const id = step.id != null && String(step.id).trim() !== "" ? String(step.id).trim() : `session_workout_step_${index + 1}`;
+          const totalDurationSeconds = Math.max(0, Math.round(Number(step.totalDurationSeconds) || 0));
+          return {
+            id,
+            name,
+            totalDurationSeconds,
+          };
+        })
+        .filter(Boolean)
+    : [];
+  const resolvedWorkoutSteps =
+    normalizedWorkoutSteps.length > 0
+      ? normalizedWorkoutSteps
+      : [
+          {
+            id: normalizedWorkout.id,
+            name: normalizedWorkout.name,
+            totalDurationSeconds: computeWorkoutTotalDurationSeconds(normalizedWorkout.segments),
+          },
+        ];
+  return {
+    id: normalizedWorkout.id,
+    source: normalizedWorkout.source,
+    name: normalizedWorkout.name,
+    ftpReferenceWatts: normalizedWorkout.ftpReferenceWatts,
+    notes: normalizeWorkoutNotes(normalizedWorkout.notes),
+    tags: normalizeWorkoutTags(normalizedWorkout.tags),
+    segments: normalizeWorkoutSegments(normalizedWorkout.segments, normalizedWorkout.ftpReferenceWatts),
+    totalDurationSeconds: computeWorkoutTotalDurationSeconds(normalizedWorkout.segments),
+    workouts: resolvedWorkoutSteps,
+    selectedAt: currentMs(),
+  };
+}
+
+function buildSessionWorkoutPlanFromSequence(workoutSequenceInput) {
+  const workoutSequence = Array.isArray(workoutSequenceInput) ? workoutSequenceInput : [];
+  const normalizedWorkouts = workoutSequence
+    .map((workout, index) => {
+      if (!workout || typeof workout !== "object") return null;
+      return normalizeWorkoutRecord(workout, index);
+    })
+    .filter(Boolean);
+  if (normalizedWorkouts.length === 0) return null;
+  if (normalizedWorkouts.length === 1) {
+    return buildSessionWorkoutPlan(normalizedWorkouts[0]);
+  }
+
+  const mergedSegments = [];
+  const mergedTags = [];
+  const seenTags = new Set();
+  let totalDurationSeconds = 0;
+  normalizedWorkouts.forEach((workout) => {
+    const workoutSegments = normalizeWorkoutSegments(workout.segments, workout.ftpReferenceWatts);
+    mergedSegments.push(...workoutSegments.map((segment) => cloneJson(segment)));
+    totalDurationSeconds += computeWorkoutTotalDurationSeconds(workoutSegments);
+    normalizeWorkoutTags(workout.tags).forEach((tag) => {
+      if (seenTags.has(tag)) return;
+      seenTags.add(tag);
+      mergedTags.push(tag);
+    });
+  });
+
+  const firstWorkout = normalizedWorkouts[0];
+  const mergedWorkout = {
+    id: `session_sequence_${currentMs()}_${makeId(4).toLowerCase()}`,
+    source: WORKOUT_SOURCE_CUSTOM,
+    name: `${firstWorkout.name} + ${normalizedWorkouts.length - 1} more`,
+    ftpReferenceWatts: firstWorkout.ftpReferenceWatts,
+    notes: normalizeWorkoutNotes(""),
+    tags: mergedTags,
+    segments: mergedSegments,
+    totalDurationSeconds,
+    workouts: normalizedWorkouts.map((workout) => ({
+      id: workout.id,
+      name: workout.name,
+      totalDurationSeconds: computeWorkoutTotalDurationSeconds(workout.segments),
+    })),
+  };
+  return buildSessionWorkoutPlan(mergedWorkout);
+}
+
 function loadWorkouts() {
   const raw = loadJson(WORKOUTS_KEY, []);
   if (!Array.isArray(raw)) return [];
-  return raw.map((workout, index) => normalizeWorkoutRecord(workout, index));
+  return raw
+    .map((workout, index) => normalizeWorkoutRecord(workout, index))
+    .map((workout) => ({
+      ...workout,
+      source: WORKOUT_SOURCE_CUSTOM,
+    }));
 }
 
 function saveWorkouts(workoutsInput) {
   const workouts = Array.isArray(workoutsInput) ? workoutsInput : [];
-  const normalized = workouts.map((workout, index) => normalizeWorkoutRecord(workout, index));
+  const normalized = workouts
+    .map((workout, index) => normalizeWorkoutRecord(workout, index))
+    .filter((workout) => workout.source === WORKOUT_SOURCE_CUSTOM)
+    .map((workout) => ({
+      ...workout,
+      source: WORKOUT_SOURCE_CUSTOM,
+    }));
   saveJson(WORKOUTS_KEY, normalized);
+}
+
+function buildWorkoutCopyName(nameInput, existingNamesInput = []) {
+  const baseName = normalizeWorkoutName(nameInput) || "Workout";
+  const existingNames = new Set(
+    (Array.isArray(existingNamesInput) ? existingNamesInput : [])
+      .map((name) => normalizeWorkoutName(name).toLowerCase())
+      .filter(Boolean),
+  );
+  const firstCopyName = `${baseName} (Copy)`;
+  if (!existingNames.has(firstCopyName.toLowerCase())) return firstCopyName;
+  for (let copyNumber = 2; copyNumber < 500; copyNumber += 1) {
+    const candidate = `${baseName} (Copy ${copyNumber})`;
+    if (!existingNames.has(candidate.toLowerCase())) return candidate;
+  }
+  return `${baseName} (Copy ${currentMs()})`;
 }
 
 function validateWorkoutDraft(nameInput, segmentsInput, tagsInput = []) {
@@ -2528,16 +3048,160 @@ function createCourseFromRoutePreset(routePresetInput = DEFAULT_ROUTE_PRESET) {
   };
 }
 
+function normalizeSessionRoutePlanItems(routeItemsInput, fallbackRouteInput = DEFAULT_ROUTE_PRESET) {
+  const fallbackCourse = createCourseFromRoutePreset(fallbackRouteInput);
+  const routeItems = Array.isArray(routeItemsInput) ? routeItemsInput : [];
+  const normalized = routeItems
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      try {
+        return createCourseFromRoutePreset(item);
+      } catch {
+        return null;
+      }
+    })
+    .filter((item) => !!item && Array.isArray(item.segments) && item.segments.length > 0);
+  return normalized.length > 0 ? normalized : [fallbackCourse];
+}
+
+function buildCompositeCourseFromRoutePlan(routeItemsInput, fallbackRouteInput = DEFAULT_ROUTE_PRESET) {
+  const routeCourses = normalizeSessionRoutePlanItems(routeItemsInput, fallbackRouteInput);
+  if (routeCourses.length <= 1) {
+    const singleCourse = routeCourses[0];
+    return createCourseFromRoutePreset(singleCourse);
+  }
+
+  const combinedSegments = [];
+  let offsetMeters = 0;
+  let totalAscentM = 0;
+  let totalDescentM = 0;
+  let maxGradientPct = 0;
+  routeCourses.forEach((course) => {
+    const routeLengthMeters = Math.max(
+      1,
+      Number(course.totalDistanceMeters) || Number(course.lengthMeters) || getCourseLengthMeters(course.segments),
+    );
+    (Array.isArray(course.segments) ? course.segments : []).forEach((segment) => {
+      const startDistance = offsetMeters + (Number(segment.startDistance) || 0);
+      const endDistance = offsetMeters + (Number(segment.endDistance) || 0);
+      if (endDistance <= startDistance) return;
+      const grade = Number(segment.grade) || 0;
+      maxGradientPct = Math.max(maxGradientPct, Math.abs(grade));
+      combinedSegments.push({
+        startDistance,
+        endDistance,
+        grade,
+      });
+    });
+    totalAscentM += Math.max(0, Number(course.elevationGainM) || 0);
+    totalDescentM += Math.max(0, Number(course.totalDescentM) || 0);
+    offsetMeters += routeLengthMeters;
+  });
+
+  const safeSegments = combinedSegments.length > 0 ? combinedSegments : DEFAULT_COURSE_SEGMENTS.map((segment) => ({ ...segment }));
+  const totalDistanceMeters = Math.max(1, offsetMeters || getCourseLengthMeters(safeSegments));
+  const firstCourse = routeCourses[0];
+  const startElevationM = Number(firstCourse.startElevationM) || 0;
+  const elevationProfile = buildElevationProfileFromSegments(safeSegments, startElevationM, 100);
+  const metrics = computeSegmentElevationStats(safeSegments, startElevationM);
+  const routeLabel = `${firstCourse.name} + ${routeCourses.length - 1} more`;
+
+  return {
+    id: "route-sequence",
+    routeId: "route-sequence",
+    name: routeLabel,
+    country: "Multi-route",
+    distanceKm: totalDistanceMeters / 1000,
+    elevationGainM: Math.round(totalAscentM || metrics.totalAscentM || 0),
+    totalDescentM: Math.round(totalDescentM || metrics.totalDescentM || 0),
+    startElevationM,
+    summitElevationM: Number(metrics.summitElevationM) || startElevationM,
+    avgGradientPct: Number(metrics.avgAbsGradientPct?.toFixed(1) || 0),
+    maxGradientPct: Number(maxGradientPct.toFixed(1)),
+    hillinessPreset: null,
+    generatedAt: null,
+    totalDistanceMeters,
+    segments: safeSegments,
+    elevationProfile,
+    lengthMeters: totalDistanceMeters,
+  };
+}
+
+function getSessionRouteSequence(sessionInput = getCurrentSession()) {
+  const session = sessionInput && typeof sessionInput === "object" ? sessionInput : null;
+  const fallbackRoute = session?.course || DEFAULT_ROUTE_PRESET;
+  const routeCourses = normalizeSessionRoutePlanItems(session?.routePlan?.routes, fallbackRoute);
+  let runningDistance = 0;
+  const entries = routeCourses.map((course, index) => {
+    const lengthMeters = Math.max(
+      1,
+      Number(course.totalDistanceMeters) || Number(course.lengthMeters) || getCourseLengthMeters(course.segments),
+    );
+    const entry = {
+      index,
+      route: course,
+      startDistanceMeters: runningDistance,
+      endDistanceMeters: runningDistance + lengthMeters,
+      lengthMeters,
+    };
+    runningDistance += lengthMeters;
+    return entry;
+  });
+  return {
+    entries,
+    routeCount: entries.length,
+    totalDistanceMeters: Math.max(1, runningDistance),
+  };
+}
+
+function getSessionRoutePosition(sessionInput = getCurrentSession(), distanceMetersInput = 0) {
+  const sequence = getSessionRouteSequence(sessionInput);
+  const entries = sequence.entries;
+  const totalDistanceMeters = Math.max(1, sequence.totalDistanceMeters);
+  if (entries.length === 0) {
+    return {
+      sequence,
+      effectiveDistanceMeters: 0,
+      currentEntry: null,
+      currentIndex: 0,
+      nextEntry: null,
+      routeDistanceMeters: 0,
+      remainingDistanceMeters: 0,
+    };
+  }
+
+  const rawDistance = Number(distanceMetersInput) || 0;
+  let effectiveDistanceMeters = rawDistance % totalDistanceMeters;
+  if (effectiveDistanceMeters < 0) effectiveDistanceMeters += totalDistanceMeters;
+  const fallbackEntry = entries[entries.length - 1];
+  const currentEntry =
+    entries.find(
+      (entry) =>
+        effectiveDistanceMeters >= entry.startDistanceMeters &&
+        (effectiveDistanceMeters < entry.endDistanceMeters || entry === fallbackEntry),
+    ) || fallbackEntry;
+  const routeDistanceMeters = clamp(
+    effectiveDistanceMeters - currentEntry.startDistanceMeters,
+    0,
+    Math.max(1, currentEntry.lengthMeters),
+  );
+  const nextEntry = entries.length > 1 ? entries[(currentEntry.index + 1) % entries.length] : null;
+  return {
+    sequence,
+    effectiveDistanceMeters,
+    currentEntry,
+    currentIndex: currentEntry.index,
+    nextEntry,
+    routeDistanceMeters,
+    remainingDistanceMeters: Math.max(0, currentEntry.lengthMeters - routeDistanceMeters),
+  };
+}
+
 function normalizeSessionCourse(session) {
   if (!session || typeof session !== "object") return;
 
-  const course = session.course;
-  if (!course || typeof course !== "object") {
-    session.course = createCourseFromRoutePreset(DEFAULT_ROUTE_PRESET);
-    return;
-  }
-
-  const fallbackRoute = getRoutePresetById(course.routeId || course.id);
+  const course = session.course && typeof session.course === "object" ? session.course : createCourseFromRoutePreset(DEFAULT_ROUTE_PRESET);
+  const fallbackRoute = getRoutePresetById(course.routeId || course.id || DEFAULT_ROUTE_PRESET.id);
   const sourceSegments =
     Array.isArray(course.segments) && course.segments.length > 0 ? course.segments : fallbackRoute.courseSegments;
   const segments = sourceSegments
@@ -2548,65 +3212,84 @@ function normalizeSessionCourse(session) {
     }))
     .filter((segment) => segment.endDistance > segment.startDistance);
 
+  let normalizedBaseCourse = null;
   if (segments.length === 0) {
-    session.course = createCourseFromRoutePreset(fallbackRoute);
-    return;
+    normalizedBaseCourse = createCourseFromRoutePreset(fallbackRoute);
+  } else {
+    const lengthMeters = getCourseLengthMeters(segments);
+    const startElevationM = Number.isFinite(Number(course.startElevationM))
+      ? Number(course.startElevationM)
+      : Number(fallbackRoute.startElevationM) || 0;
+    const distanceKm = Number.isFinite(Number(course.distanceKm)) ? Number(course.distanceKm) : lengthMeters / 1000;
+    const elevationGainM = Number.isFinite(Number(course.elevationGainM))
+      ? Number(course.elevationGainM)
+      : Number(fallbackRoute.elevationGainM) || 0;
+    const totalDescentM = Number.isFinite(Number(course.totalDescentM))
+      ? Number(course.totalDescentM)
+      : Number.isFinite(Number(fallbackRoute.totalDescentM))
+        ? Number(fallbackRoute.totalDescentM)
+        : null;
+    const normalizedProfile = Array.isArray(course.elevationProfile)
+      ? course.elevationProfile
+          .map((point) => ({
+            distanceFromStartM: Number(point?.distanceFromStartM) || 0,
+            elevationM: Number(point?.elevationM) || 0,
+            gradientPct: Number(point?.gradientPct) || 0,
+          }))
+          .sort((a, b) => a.distanceFromStartM - b.distanceFromStartM)
+      : [];
+
+    normalizedBaseCourse = {
+      ...course,
+      id: course.id || fallbackRoute.id,
+      routeId: course.routeId || course.id || fallbackRoute.id,
+      name: course.name || fallbackRoute.name,
+      country: course.country || fallbackRoute.country,
+      distanceKm,
+      elevationGainM,
+      totalDescentM,
+      startElevationM,
+      summitElevationM: Number.isFinite(Number(course.summitElevationM))
+        ? Number(course.summitElevationM)
+        : startElevationM + elevationGainM,
+      avgGradientPct: Number.isFinite(Number(course.avgGradientPct))
+        ? Number(course.avgGradientPct)
+        : Number(fallbackRoute.avgGradientPct) || 0,
+      maxGradientPct: Number.isFinite(Number(course.maxGradientPct))
+        ? Number(course.maxGradientPct)
+        : Number.isFinite(Number(fallbackRoute.maxGradientPct))
+          ? Number(fallbackRoute.maxGradientPct)
+          : null,
+      hillinessPreset: course.hillinessPreset || fallbackRoute.hillinessPreset || null,
+      generatedAt: course.generatedAt || fallbackRoute.generatedAt || null,
+      totalDistanceMeters: Number.isFinite(Number(course.totalDistanceMeters)) ? Number(course.totalDistanceMeters) : lengthMeters,
+      segments,
+      elevationProfile:
+        normalizedProfile.length > 1
+          ? normalizedProfile
+          : buildElevationProfileFromSegments(segments, startElevationM, 100),
+      lengthMeters,
+    };
   }
 
-  const lengthMeters = getCourseLengthMeters(segments);
-  const startElevationM = Number.isFinite(Number(course.startElevationM))
-    ? Number(course.startElevationM)
-    : Number(fallbackRoute.startElevationM) || 0;
-  const distanceKm = Number.isFinite(Number(course.distanceKm)) ? Number(course.distanceKm) : lengthMeters / 1000;
-  const elevationGainM = Number.isFinite(Number(course.elevationGainM))
-    ? Number(course.elevationGainM)
-    : Number(fallbackRoute.elevationGainM) || 0;
-  const totalDescentM = Number.isFinite(Number(course.totalDescentM))
-    ? Number(course.totalDescentM)
-    : Number.isFinite(Number(fallbackRoute.totalDescentM))
-      ? Number(fallbackRoute.totalDescentM)
-      : null;
-  const normalizedProfile = Array.isArray(course.elevationProfile)
-    ? course.elevationProfile
-        .map((point) => ({
-          distanceFromStartM: Number(point?.distanceFromStartM) || 0,
-          elevationM: Number(point?.elevationM) || 0,
-          gradientPct: Number(point?.gradientPct) || 0,
-        }))
-        .sort((a, b) => a.distanceFromStartM - b.distanceFromStartM)
-    : [];
+  const routePlanState = session.routePlan && typeof session.routePlan === "object" ? session.routePlan : {};
+  const routePlanItemsRaw =
+    Array.isArray(routePlanState.routes) && routePlanState.routes.length > 0 ? routePlanState.routes : [normalizedBaseCourse];
+  const normalizedRoutePlanItems = normalizeSessionRoutePlanItems(routePlanItemsRaw, normalizedBaseCourse);
+  const compositeCourse = buildCompositeCourseFromRoutePlan(normalizedRoutePlanItems, normalizedBaseCourse);
+  const totalRoutePlanDistanceMeters = normalizedRoutePlanItems.reduce(
+    (total, route) =>
+      total + Math.max(1, Number(route.totalDistanceMeters) || Number(route.lengthMeters) || getCourseLengthMeters(route.segments)),
+    0,
+  );
 
-  session.course = {
-    ...course,
-    id: course.id || fallbackRoute.id,
-    routeId: course.routeId || course.id || fallbackRoute.id,
-    name: course.name || fallbackRoute.name,
-    country: course.country || fallbackRoute.country,
-    distanceKm,
-    elevationGainM,
-    totalDescentM,
-    startElevationM,
-    summitElevationM: Number.isFinite(Number(course.summitElevationM))
-      ? Number(course.summitElevationM)
-      : startElevationM + elevationGainM,
-    avgGradientPct: Number.isFinite(Number(course.avgGradientPct))
-      ? Number(course.avgGradientPct)
-      : Number(fallbackRoute.avgGradientPct) || 0,
-    maxGradientPct: Number.isFinite(Number(course.maxGradientPct))
-      ? Number(course.maxGradientPct)
-      : Number.isFinite(Number(fallbackRoute.maxGradientPct))
-        ? Number(fallbackRoute.maxGradientPct)
-        : null,
-    hillinessPreset: course.hillinessPreset || fallbackRoute.hillinessPreset || null,
-    generatedAt: course.generatedAt || fallbackRoute.generatedAt || null,
-    totalDistanceMeters: Number.isFinite(Number(course.totalDistanceMeters)) ? Number(course.totalDistanceMeters) : lengthMeters,
-    segments,
-    elevationProfile:
-      normalizedProfile.length > 1
-        ? normalizedProfile
-        : buildElevationProfileFromSegments(segments, startElevationM, 100),
-    lengthMeters,
+  session.routePlan = {
+    ...routePlanState,
+    routes: normalizedRoutePlanItems,
+    routeCount: normalizedRoutePlanItems.length,
+    totalDistanceMeters: totalRoutePlanDistanceMeters,
   };
+  session.course = compositeCourse;
 }
 
 function getSessionRoute(session) {
@@ -3698,6 +4381,297 @@ function buildFtmsSimulationCommand(gradePercent) {
   return Uint8Array.from([0x11, windEncoded[0], windEncoded[1], gradeEncoded[0], gradeEncoded[1], crrTenThousandths, cwHundredths]);
 }
 
+function buildFtmsSetTargetPowerCommand(targetWattsInput) {
+  const targetWatts = normalizeWorkoutTargetWatts(targetWattsInput, 0);
+  const [low, high] = encodeSint16LE(targetWatts);
+  return Uint8Array.from([0x05, low, high]);
+}
+
+function withTimeout(promise, timeoutMs, timeoutMessage = "Operation timed out") {
+  const timeout = Math.max(100, Math.round(Number(timeoutMs) || TRAINER_CONTROL_WRITE_TIMEOUT_MS));
+  return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeout);
+    Promise.resolve(promise)
+      .then((value) => {
+        window.clearTimeout(timeoutId);
+        resolve(value);
+      })
+      .catch((error) => {
+        window.clearTimeout(timeoutId);
+        reject(error);
+      });
+  });
+}
+
+function queueTrainerControlWrite(taskFn) {
+  const trainer = state.devices.trainer;
+  if (!trainer) return Promise.reject(new Error("Trainer unavailable"));
+  const previousQueue = trainer.controlWriteQueue || Promise.resolve();
+  const nextQueue = previousQueue
+    .catch(() => {})
+    .then(() =>
+      withTimeout(
+        Promise.resolve().then(() => taskFn()),
+        TRAINER_CONTROL_WRITE_TIMEOUT_MS,
+        "Trainer control write timed out",
+      ),
+    );
+  trainer.controlWriteQueue = nextQueue.catch(() => {});
+  return nextQueue;
+}
+
+function parseSupportedPowerRangeCharacteristic(dataView) {
+  if (!dataView || dataView.byteLength < 6) {
+    return { minWatts: null, maxWatts: null, incrementWatts: null };
+  }
+  return {
+    minWatts: dataView.getInt16(0, true),
+    maxWatts: dataView.getInt16(2, true),
+    incrementWatts: dataView.getInt16(4, true),
+  };
+}
+
+async function resolveTrainerErgCapabilities(service, controlInfo) {
+  const supportsControl = !!(controlInfo?.supported && controlInfo?.granted && controlInfo?.characteristic);
+  let powerRange = { minWatts: null, maxWatts: null, incrementWatts: null };
+
+  try {
+    const supportedPowerRangeCharacteristic = await service.getCharacteristic("supported_power_range");
+    const powerRangeValue = await supportedPowerRangeCharacteristic.readValue();
+    powerRange = parseSupportedPowerRangeCharacteristic(powerRangeValue);
+  } catch {
+    // Optional FTMS characteristic; not all trainers expose it.
+  }
+
+  const supported = supportsControl;
+  const unsupportedReason = supported
+    ? null
+    : controlInfo?.error || "Trainer control point unavailable for ERG target control.";
+
+  return {
+    supported,
+    unsupportedReason,
+    powerRange,
+  };
+}
+
+function clampErgTargetWattsToTrainerRange(targetWattsInput, powerRangeInput) {
+  const targetWatts = normalizeWorkoutTargetWatts(targetWattsInput, 0);
+  const powerRange = powerRangeInput && typeof powerRangeInput === "object" ? powerRangeInput : {};
+  const minWatts = Number.isFinite(Number(powerRange.minWatts)) ? Math.max(0, Math.round(Number(powerRange.minWatts))) : null;
+  const maxWatts = Number.isFinite(Number(powerRange.maxWatts)) ? Math.max(0, Math.round(Number(powerRange.maxWatts))) : null;
+  const incrementWatts = Number.isFinite(Number(powerRange.incrementWatts))
+    ? Math.max(1, Math.round(Number(powerRange.incrementWatts)))
+    : null;
+
+  let clamped = targetWatts;
+  if (minWatts != null) clamped = Math.max(minWatts, clamped);
+  if (maxWatts != null) clamped = Math.min(maxWatts, clamped);
+  if (incrementWatts != null && incrementWatts > 1) {
+    clamped = Math.round(clamped / incrementWatts) * incrementWatts;
+    if (minWatts != null) clamped = Math.max(minWatts, clamped);
+    if (maxWatts != null) clamped = Math.min(maxWatts, clamped);
+  }
+
+  return Math.max(0, Math.round(clamped));
+}
+
+function getTrainerErgAvailability(trainerInput = state.devices.trainer) {
+  const trainer = trainerInput && typeof trainerInput === "object" ? trainerInput : null;
+  if (!trainer || !trainer.connected) {
+    return { available: false, reason: "Trainer not connected" };
+  }
+  if (!trainer.controlSupported) {
+    return { available: false, reason: "Trainer control not supported" };
+  }
+  if (!trainer.controlGranted) {
+    return { available: false, reason: "Trainer control not granted" };
+  }
+  if (!trainer.controlCharacteristic) {
+    return { available: false, reason: "Trainer control characteristic missing" };
+  }
+  if (trainer.erg?.supported === false) {
+    return { available: false, reason: trainer.erg?.unsupportedReason || "Trainer does not support ERG control" };
+  }
+  return { available: true, reason: null };
+}
+
+function getSessionWorkoutPlaybackSnapshot(sessionInput = getCurrentSession(), nowMs = currentMs()) {
+  const session = sessionInput && typeof sessionInput === "object" ? sessionInput : null;
+  const workoutPlan = buildSessionWorkoutPlan(session?.workoutPlan);
+  if (!workoutPlan) {
+    return {
+      workoutPlan: null,
+      playback: { entries: [], totalDurationSeconds: 0 },
+      elapsedSeconds: 0,
+      currentEntry: null,
+      currentEntryKey: null,
+    };
+  }
+
+  const playback = buildWorkoutPlaybackTimeline(workoutPlan.segments, workoutPlan.ftpReferenceWatts);
+  const startedAt = Number(session?.startedAt) || 0;
+  const hasStarted = startedAt > 0;
+  const elapsedSeconds = hasStarted ? Math.max(0, Math.round((nowMs - startedAt) / 1000)) : 0;
+  const clampedElapsedSeconds = Math.min(elapsedSeconds, playback.totalDurationSeconds);
+  const currentEntry = playback.entries.find(
+    (entry) => clampedElapsedSeconds >= entry.startSeconds && clampedElapsedSeconds < entry.endSeconds,
+  );
+  const currentEntryKey = currentEntry
+    ? `${currentEntry.kind}:${currentEntry.topIndex}:${currentEntry.repIndex ?? "n"}:${currentEntry.setSegmentIndex ?? "n"}`
+    : null;
+
+  return {
+    workoutPlan,
+    playback,
+    elapsedSeconds: clampedElapsedSeconds,
+    currentEntry,
+    currentEntryKey,
+  };
+}
+
+async function setTrainerErgTargetWatts(targetWattsInput) {
+  const trainer = state.devices.trainer;
+  const availability = getTrainerErgAvailability(trainer);
+  if (!availability.available) {
+    throw new Error(availability.reason || "ERG unavailable");
+  }
+  const targetWatts = clampErgTargetWattsToTrainerRange(targetWattsInput, trainer.erg?.powerRange);
+  await queueTrainerControlWrite(() => writeBluetoothValue(trainer.controlCharacteristic, buildFtmsSetTargetPowerCommand(targetWatts)));
+  trainer.erg.lastSentTargetWatts = targetWatts;
+  trainer.erg.currentTargetWatts = targetWatts;
+  trainer.erg.error = null;
+  trainer.erg.lastSyncAt = currentMs();
+  trainer.lastControlError = null;
+  return targetWatts;
+}
+
+async function syncErgControlForCurrentSession({ force = false, reason = "tick", nowMs = currentMs() } = {}) {
+  const session = getCurrentSession();
+  const user = getCurrentUser();
+  const trainer = state.devices.trainer;
+  const erg = trainer?.erg;
+  if (!session || !user || !trainer || !erg) return { ok: false, skipped: true, reason: "no-session" };
+
+  const availability = getTrainerErgAvailability(trainer);
+  if (!availability.available) {
+    erg.supported = false;
+    erg.unsupportedReason = availability.reason;
+    if (erg.desiredEnabled) {
+      erg.state = trainer.connected ? ERG_STATE_INTERRUPTED : ERG_STATE_UNAVAILABLE;
+      erg.error = availability.reason;
+    } else {
+      erg.state = ERG_STATE_UNAVAILABLE;
+      erg.error = null;
+    }
+    erg.currentTargetWatts = null;
+    return { ok: false, skipped: true, reason: availability.reason };
+  }
+
+  erg.supported = true;
+  erg.unsupportedReason = null;
+  if (!erg.desiredEnabled) {
+    erg.state = ERG_STATE_DISABLED;
+    erg.currentTargetWatts = null;
+    erg.lastAppliedEntryKey = null;
+    erg.error = null;
+    return { ok: true, skipped: true, reason: "erg-disabled" };
+  }
+
+  const playbackSnapshot = getSessionWorkoutPlaybackSnapshot(session, nowMs);
+  const currentEntry = playbackSnapshot.currentEntry;
+  if (!currentEntry) {
+    erg.state = ERG_STATE_AVAILABLE;
+    erg.currentTargetWatts = null;
+    erg.lastAppliedEntryKey = null;
+    return { ok: true, skipped: true, reason: "no-active-workout-entry" };
+  }
+
+  const nextTargetWatts = clampErgTargetWattsToTrainerRange(currentEntry.targetWatts, erg.powerRange);
+  const nextEntryKey = playbackSnapshot.currentEntryKey || `entry:${currentEntry.timelineIndex}`;
+  const shouldSend =
+    force || erg.state !== ERG_STATE_ACTIVE || erg.lastAppliedEntryKey !== nextEntryKey || erg.lastSentTargetWatts !== nextTargetWatts;
+  if (!shouldSend) {
+    erg.state = ERG_STATE_ACTIVE;
+    erg.currentTargetWatts = nextTargetWatts;
+    return { ok: true, skipped: true, reason: "target-unchanged", targetWatts: nextTargetWatts };
+  }
+
+  if (erg.syncInFlight) {
+    return { ok: false, skipped: true, reason: "sync-in-flight" };
+  }
+
+  erg.syncInFlight = true;
+  erg.state = ERG_STATE_ENABLING;
+  try {
+    const appliedTargetWatts = await setTrainerErgTargetWatts(nextTargetWatts);
+    erg.state = ERG_STATE_ACTIVE;
+    erg.lastAppliedEntryKey = nextEntryKey;
+    erg.currentTargetWatts = appliedTargetWatts;
+    console.log("[ERG] Target applied", { reason, targetWatts: appliedTargetWatts, entryKey: nextEntryKey });
+    return { ok: true, targetWatts: appliedTargetWatts };
+  } catch (error) {
+    const message = error?.message || "Failed to send ERG target";
+    erg.state = ERG_STATE_ERROR;
+    erg.error = message;
+    erg.desiredEnabled = false;
+    erg.currentTargetWatts = null;
+    trainer.lastControlError = message;
+    console.warn("[ERG] Target write failed", { reason, error: message });
+    return { ok: false, error: message };
+  } finally {
+    erg.syncInFlight = false;
+  }
+}
+
+async function setErgModeEnabled(nextEnabledInput, { reason = "manual-toggle", showToasts = true } = {}) {
+  const trainer = state.devices.trainer;
+  if (!trainer?.erg) {
+    return { ok: false, error: "Trainer unavailable." };
+  }
+  const nextEnabled = nextEnabledInput === true;
+  const availability = getTrainerErgAvailability(trainer);
+
+  if (nextEnabled) {
+    if (!availability.available) {
+      trainer.erg.desiredEnabled = false;
+      trainer.erg.state = ERG_STATE_UNAVAILABLE;
+      trainer.erg.supported = false;
+      trainer.erg.unsupportedReason = availability.reason;
+      trainer.erg.error = availability.reason;
+      if (showToasts) showToast(availability.reason || "ERG unavailable.");
+      return { ok: false, error: availability.reason || "ERG unavailable." };
+    }
+
+    trainer.erg.desiredEnabled = true;
+    trainer.erg.state = ERG_STATE_ENABLING;
+    trainer.erg.error = null;
+    console.log("[ERG] Enable requested");
+    const syncResult = await syncErgControlForCurrentSession({ force: true, reason });
+    if (!syncResult.ok) {
+      if (showToasts) showToast(syncResult.error || "Could not enable ERG.");
+      return syncResult;
+    }
+    if (showToasts) {
+      showToast(
+        syncResult.targetWatts != null ? `ERG active at ${Math.round(syncResult.targetWatts)} W.` : "ERG enabled.",
+      );
+    }
+    return { ok: true, targetWatts: syncResult.targetWatts ?? null };
+  }
+
+  trainer.erg.desiredEnabled = false;
+  trainer.erg.currentTargetWatts = null;
+  trainer.erg.lastAppliedEntryKey = null;
+  trainer.erg.error = null;
+  trainer.erg.state = availability.available ? ERG_STATE_DISABLED : ERG_STATE_UNAVAILABLE;
+  console.log("[ERG] Disabled by user");
+  if (showToasts) showToast("ERG disabled.");
+  return { ok: true };
+}
+
 async function initializeTrainerControl(service) {
   try {
     const controlCharacteristic = await service.getCharacteristic("fitness_machine_control_point");
@@ -3721,10 +4695,17 @@ async function initializeTrainerControl(service) {
 function getTrainerControlStatusText() {
   const trainer = state.devices.trainer;
   if (!trainer.connected) return "No trainer";
-  if (!trainer.controlSupported) return "Trainer connected (read-only)";
-  if (!trainer.controlGranted) return "Trainer control unavailable";
-  if (trainer.lastControlError) return `Control issue: ${trainer.lastControlError}`;
-  return "Simulation control active";
+  const availability = getTrainerErgAvailability(trainer);
+  if (!availability.available) return `Trainer connected (${availability.reason})`;
+  const ergState = trainer.erg?.state || ERG_STATE_DISABLED;
+  if (ergState === ERG_STATE_ACTIVE) {
+    const target = Number.isFinite(Number(trainer.erg?.currentTargetWatts)) ? `${Math.round(trainer.erg.currentTargetWatts)} W` : "--";
+    return `ERG active (${target})`;
+  }
+  if (ergState === ERG_STATE_ENABLING) return "ERG enabling...";
+  if (ergState === ERG_STATE_INTERRUPTED) return "ERG interrupted";
+  if (ergState === ERG_STATE_ERROR) return `ERG error: ${trainer.erg?.error || "Control failed"}`;
+  return "Trainer control ready";
 }
 
 async function sendResistanceToTrainer(effectiveGrade) {
@@ -3939,6 +4920,7 @@ async function connectTrainer() {
   }
 
   try {
+    const previouslyDesiredErg = state.devices.trainer?.erg?.desiredEnabled === true;
     const device = await navigator.bluetooth.requestDevice({
       filters: [{ services: ["fitness_machine"] }],
       optionalServices: ["fitness_machine"],
@@ -3947,15 +4929,23 @@ async function connectTrainer() {
     const service = await server.getPrimaryService("fitness_machine");
     const characteristic = await service.getCharacteristic("indoor_bike_data");
     const control = await initializeTrainerControl(service);
+    const ergCapabilities = await resolveTrainerErgCapabilities(service, control);
 
     await characteristic.startNotifications();
     characteristic.addEventListener("characteristicvaluechanged", (event) => {
       const value = event.target.value;
       const parsed = parseIndoorBikeData(value);
-      state.devices.trainer.lastReading = parsed;
+      state.devices.trainer.lastReading = {
+        ...parsed,
+        timestamp: currentMs(),
+      };
+      if (state.devices.trainer?.erg) {
+        state.devices.trainer.erg.lastTelemetryAt = currentMs();
+        state.devices.trainer.erg.telemetryStale = false;
+      }
     });
 
-    state.devices.trainer = {
+    state.devices.trainer = createDefaultTrainerDeviceState({
       connected: true,
       name: device.name || "Trainer",
       device,
@@ -3968,10 +4958,26 @@ async function connectTrainer() {
       lastResistancePercent: null,
       lastResistanceAt: 0,
       lastReading: null,
-    };
+      erg: {
+        desiredEnabled: previouslyDesiredErg,
+        state: ergCapabilities.supported ? (previouslyDesiredErg ? ERG_STATE_ENABLING : ERG_STATE_DISABLED) : ERG_STATE_UNAVAILABLE,
+        supported: ergCapabilities.supported,
+        unsupportedReason: ergCapabilities.unsupportedReason,
+        powerRange: ergCapabilities.powerRange,
+        error: null,
+      },
+    });
 
     updateTerrainState({ trainerControlStatus: getTrainerControlStatusText() });
-    showToast(control.granted ? "Trainer connected (control enabled)" : "Trainer connected (read-only)");
+    console.log("[ERG] Capability discovery", {
+      supported: ergCapabilities.supported,
+      reason: ergCapabilities.unsupportedReason,
+      powerRange: ergCapabilities.powerRange,
+    });
+    showToast(ergCapabilities.supported ? "Trainer connected (ERG ready)" : "Trainer connected (ERG unavailable)");
+    if (previouslyDesiredErg && isSessionRunning()) {
+      void syncErgControlForCurrentSession({ force: true, reason: "trainer-reconnect" });
+    }
     render();
   } catch (error) {
     console.error(error);
@@ -4001,14 +5007,14 @@ async function connectHeartRateMonitor() {
       state.devices.hrm.lastReading = parsed;
     });
 
-    state.devices.hrm = {
+    state.devices.hrm = createDefaultHrmDeviceState({
       connected: true,
       name: device.name || "HRM",
       device,
       server,
       characteristic,
       lastReading: null,
-    };
+    });
 
     showToast("Heart rate monitor connected");
     render();
@@ -4021,6 +5027,7 @@ async function connectHeartRateMonitor() {
 function disconnectDevice(type) {
   const entry = state.devices[type];
   if (!entry || !entry.device) return;
+  const desiredErgAfterDisconnect = type === "trainer" && entry.erg?.desiredEnabled === true;
   try {
     if (entry.characteristic) {
       entry.characteristic.removeEventListener("characteristicvaluechanged", () => {});
@@ -4033,20 +5040,18 @@ function disconnectDevice(type) {
     // ignore
   }
 
-  state.devices[type] = {
-    connected: false,
-    name: null,
-    device: null,
-    server: null,
-    characteristic: null,
-    controlCharacteristic: null,
-    controlSupported: false,
-    controlGranted: false,
-    lastControlError: null,
-    lastResistancePercent: null,
-    lastResistanceAt: 0,
-    lastReading: null,
-  };
+  state.devices[type] =
+    type === "trainer"
+      ? createDefaultTrainerDeviceState({
+          erg: {
+            desiredEnabled: desiredErgAfterDisconnect,
+            state: desiredErgAfterDisconnect ? ERG_STATE_INTERRUPTED : ERG_STATE_UNAVAILABLE,
+            supported: false,
+            unsupportedReason: "Trainer disconnected",
+            error: desiredErgAfterDisconnect ? "Trainer disconnected during ERG control" : null,
+          },
+        })
+      : createDefaultHrmDeviceState();
   if (type === "trainer") {
     updateTerrainState({ trainerControlStatus: getTrainerControlStatusText() });
   }
@@ -4813,9 +5818,12 @@ function simulateBotsForCurrentSession(deltaSeconds, nowMs) {
   });
 }
 
-function createSession({ hostUser, routePreset = DEFAULT_ROUTE_PRESET, botConfigs = [] }) {
+function createSession({ hostUser, routePreset = DEFAULT_ROUTE_PRESET, routePlanPresets = [], botConfigs = [], workoutPlan = null }) {
   const code = makeId(6);
   const now = currentMs();
+  const initialRoutePlanSource =
+    Array.isArray(routePlanPresets) && routePlanPresets.length > 0 ? routePlanPresets : [routePreset || DEFAULT_ROUTE_PRESET];
+  const initialRoutePlan = normalizeSessionRoutePlanItems(initialRoutePlanSource, routePreset || DEFAULT_ROUTE_PRESET);
   const session = {
     code,
     hostId: hostUser.id,
@@ -4838,7 +5846,19 @@ function createSession({ hostUser, routePreset = DEFAULT_ROUTE_PRESET, botConfig
       // userId: { caloriesBurned, metrics, ... }
     },
     totalClimbedMeters: 0,
-    course: createCourseFromRoutePreset(routePreset),
+    routePlan: {
+      routes: initialRoutePlan,
+      routeCount: initialRoutePlan.length,
+      totalDistanceMeters: initialRoutePlan.reduce(
+        (total, route) =>
+          total + Math.max(1, Number(route.totalDistanceMeters) || Number(route.lengthMeters) || getCourseLengthMeters(route.segments)),
+        0,
+      ),
+    },
+    course: buildCompositeCourseFromRoutePlan(initialRoutePlan, routePreset || DEFAULT_ROUTE_PRESET),
+    workoutPlan: Array.isArray(workoutPlan)
+      ? buildSessionWorkoutPlanFromSequence(workoutPlan)
+      : buildSessionWorkoutPlan(workoutPlan),
   };
 
   normalizeBotDrafts(botConfigs).forEach((botDraft) => {
@@ -4850,6 +5870,7 @@ function createSession({ hostUser, routePreset = DEFAULT_ROUTE_PRESET, botConfig
 }
 
 function createPlaceholderSession(code, user) {
+  const defaultRoutePlan = normalizeSessionRoutePlanItems([DEFAULT_ROUTE_PRESET], DEFAULT_ROUTE_PRESET);
   return {
     code,
     hostId: null,
@@ -4864,7 +5885,16 @@ function createPlaceholderSession(code, user) {
     xpAwards: {},
     calorieAwards: {},
     totalClimbedMeters: 0,
-    course: createCourseFromRoutePreset(DEFAULT_ROUTE_PRESET),
+    routePlan: {
+      routes: defaultRoutePlan,
+      routeCount: defaultRoutePlan.length,
+      totalDistanceMeters: defaultRoutePlan.reduce(
+        (total, route) =>
+          total + Math.max(1, Number(route.totalDistanceMeters) || Number(route.lengthMeters) || getCourseLengthMeters(route.segments)),
+        0,
+      ),
+    },
+    course: buildCompositeCourseFromRoutePlan(defaultRoutePlan, DEFAULT_ROUTE_PRESET),
   };
 }
 
@@ -5050,6 +6080,167 @@ function getPrivateRiderStatsSnapshot(sessionInput = getCurrentSession(), userIn
 
 function resetPrivateRiderStats() {
   state.privateRiderStats = createEmptyPrivateRiderStats();
+}
+
+function ensureEffortSeismographContext(sessionInput = getCurrentSession(), userInput = getCurrentUser()) {
+  const sessionCode = sessionInput?.code || null;
+  const userId = userInput?.id || null;
+  const existing = state.effortSeismograph || createEmptyEffortSeismographState();
+  if (existing.sessionCode !== sessionCode || existing.userId !== userId) {
+    state.effortSeismograph = createEmptyEffortSeismographState(sessionCode, userId);
+  }
+  return state.effortSeismograph;
+}
+
+function resetEffortSeismograph() {
+  state.effortSeismograph = createEmptyEffortSeismographState();
+}
+
+function getEffortSeismographZoneClass(zoneInput) {
+  const zone = getWorkoutZoneConfig(zoneInput).zone;
+  return `seismo-zone-${zone}`;
+}
+
+function recordEffortSeismographTelemetrySample(
+  telemetryInput,
+  ftpWattsInput = WORKOUT_DEFAULT_FTP_WATTS,
+  sessionInput = getCurrentSession(),
+  userInput = getCurrentUser(),
+) {
+  const context = ensureEffortSeismographContext(sessionInput, userInput);
+  if (!context) return;
+
+  let remainingSeconds = clamp(Number(telemetryInput?.deltaTimeSeconds) || 0, 0, 30);
+  if (remainingSeconds <= 0) return;
+
+  const watts = Math.max(0, Number(telemetryInput?.power) || 0);
+  const heartRate = Number(telemetryInput?.heartRate);
+  const ftpWatts = normalizeWorkoutFtpWatts(ftpWattsInput, WORKOUT_DEFAULT_FTP_WATTS);
+  const sampleTimestampMs = Number(telemetryInput?.timestamp) || currentMs();
+
+  while (remainingSeconds > 0) {
+    const frameSeconds = Math.max(1, Number(context.frameSeconds) || EFFORT_SEISMOGRAPH_FRAME_SECONDS);
+    const availableInFrame = Math.max(0, frameSeconds - (Number(context.pendingElapsedSeconds) || 0));
+    const consumeSeconds = Math.min(remainingSeconds, availableInFrame > 0 ? availableInFrame : frameSeconds);
+
+    context.pendingElapsedSeconds += consumeSeconds;
+    context.pendingPowerSeconds += watts * consumeSeconds;
+    if (Number.isFinite(heartRate) && heartRate > 0) {
+      context.pendingHeartRateSeconds += heartRate * consumeSeconds;
+      context.pendingHeartRateWeightSeconds += consumeSeconds;
+    }
+
+    remainingSeconds = Math.max(0, remainingSeconds - consumeSeconds);
+    const frameTimestampMs = Math.round(sampleTimestampMs - remainingSeconds * 1000);
+
+    if (context.pendingElapsedSeconds + 1e-9 < frameSeconds) {
+      continue;
+    }
+
+    const elapsedSeconds = Math.max(0.001, Number(context.pendingElapsedSeconds) || frameSeconds);
+    const averageWatts = context.pendingPowerSeconds / elapsedSeconds;
+    const averageHeartRate =
+      context.pendingHeartRateWeightSeconds > 0 ? context.pendingHeartRateSeconds / context.pendingHeartRateWeightSeconds : null;
+    const frameWatts = Math.max(0, Math.round(averageWatts));
+    const frameHeartRate = Number.isFinite(averageHeartRate) ? Math.round(averageHeartRate) : null;
+    const frameZone = getWorkoutZoneForWatts(frameWatts, ftpWatts);
+    const frame = {
+      timestamp: frameTimestampMs,
+      watts: frameWatts,
+      heartRate: frameHeartRate,
+      zone: frameZone,
+    };
+
+    context.frames.push(frame);
+    if (context.frames.length > context.maxFrames) {
+      context.frames.splice(0, context.frames.length - context.maxFrames);
+    }
+    context.lastFrameTimestampMs = frame.timestamp;
+    context.pendingElapsedSeconds = 0;
+    context.pendingPowerSeconds = 0;
+    context.pendingHeartRateSeconds = 0;
+    context.pendingHeartRateWeightSeconds = 0;
+  }
+}
+
+function buildEffortSeismographHtml(framesInput, ftpWattsInput = WORKOUT_DEFAULT_FTP_WATTS) {
+  const frames = Array.isArray(framesInput) ? framesInput.slice(-EFFORT_SEISMOGRAPH_MAX_FRAMES) : [];
+  if (frames.length === 0) {
+    return `<div class="small">Graph starts after the first 5-second frame is captured.</div>`;
+  }
+
+  const ftpWatts = normalizeWorkoutFtpWatts(ftpWattsInput, WORKOUT_DEFAULT_FTP_WATTS);
+  const powerCapWatts = Math.max(1, Math.round(ftpWatts * EFFORT_SEISMOGRAPH_POWER_CAP_FTP_MULTIPLIER));
+  const filledWidthPercent = clamp((frames.length / EFFORT_SEISMOGRAPH_MAX_FRAMES) * 100, 0, 100);
+  const frameWidthPercent = 100 / Math.max(1, frames.length);
+  const barsHtml = frames
+    .map((frame, frameIndex) => {
+      const watts = Math.max(0, Number(frame?.watts) || 0);
+      const zone = getWorkoutZoneConfig(frame?.zone).zone;
+      const heightPercent = clamp((watts / powerCapWatts) * 100, 0, 100);
+      const heartRate = Number(frame?.heartRate);
+      const tooltip = `Frame ${frameIndex + 1}: ${Math.round(watts)} W, ${
+        Number.isFinite(heartRate) && heartRate > 0 ? `${Math.round(heartRate)} bpm` : "no HR"
+      }, Zone ${zone}`;
+      return `
+        <div
+          class="seismo-bar workout-tooltip-trigger ${getEffortSeismographZoneClass(zone)}"
+          style="width:${frameWidthPercent.toFixed(4)}%;height:${heightPercent.toFixed(3)}%;"
+          data-tooltip="${escapeHtml(tooltip)}"
+        ></div>
+      `;
+    })
+    .join("");
+
+  const hrRange = Math.max(1, EFFORT_SEISMOGRAPH_HEART_RATE_MAX - EFFORT_SEISMOGRAPH_HEART_RATE_MIN);
+  const polylineSegments = [];
+  let activeSegmentPoints = [];
+  frames.forEach((frame, index) => {
+    const heartRate = Number(frame?.heartRate);
+    if (!Number.isFinite(heartRate) || heartRate <= 0) {
+      if (activeSegmentPoints.length > 1) {
+        polylineSegments.push(activeSegmentPoints.join(" "));
+      }
+      activeSegmentPoints = [];
+      return;
+    }
+    const normalizedHr = clamp((heartRate - EFFORT_SEISMOGRAPH_HEART_RATE_MIN) / hrRange, 0, 1);
+    const x = ((index + 0.5) / Math.max(1, frames.length)) * 100;
+    const y = (1 - normalizedHr) * 100;
+    activeSegmentPoints.push(`${x.toFixed(3)},${y.toFixed(3)}`);
+  });
+  if (activeSegmentPoints.length > 1) {
+    polylineSegments.push(activeSegmentPoints.join(" "));
+  }
+  const hrPolylineHtml = polylineSegments
+    .map(
+      (points) => `
+      <polyline class="seismo-hr-line" points="${points}" />
+    `,
+    )
+    .join("");
+
+  return `
+    <div class="seismo-chart-shell">
+      <div class="small">Last 10 minutes · 5s frames · FTP ${ftpWatts} W</div>
+      <div class="seismo-chart-window">
+        <div class="seismo-chart-inner" style="width:${filledWidthPercent.toFixed(3)}%;">
+          <div class="seismo-hr-lane">
+            <svg class="seismo-hr-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+              ${hrPolylineHtml}
+            </svg>
+          </div>
+          <div class="seismo-bars-lane">
+            <div class="seismo-bars">${barsHtml}</div>
+          </div>
+        </div>
+      </div>
+      <div class="seismo-axis small">
+        <span>10m ago</span>
+        <span>Now</span>
+      </div>
+    </div>
+  `;
 }
 
 function createPowerUpFromType(typeInput) {
@@ -5540,10 +6731,22 @@ function startSession() {
   });
   sendSessionCommand("session-start");
   state.simulation.lastSmoothedGrade = 0;
+  if (state.devices.trainer?.erg?.desiredEnabled) {
+    void syncErgControlForCurrentSession({ force: true, reason: "session-start" });
+  }
   showToast("Session started");
 }
 
 function endSession() {
+  if (state.devices.trainer?.erg) {
+    state.devices.trainer.erg.desiredEnabled = false;
+    state.devices.trainer.erg.currentTargetWatts = null;
+    state.devices.trainer.erg.lastAppliedEntryKey = null;
+    state.devices.trainer.erg.error = null;
+    state.devices.trainer.erg.state = getTrainerErgAvailability(state.devices.trainer).available
+      ? ERG_STATE_DISABLED
+      : ERG_STATE_UNAVAILABLE;
+  }
   updateSessionOnStorage((session) => {
     if (session.startedAt && !session.endedAt) {
       session.endedAt = currentMs();
@@ -5563,6 +6766,7 @@ function endSession() {
   }
   closeWebRTCPeers();
   resetFtpProposalState();
+  resetEffortSeismograph();
   state.view = "summary";
   state.simulation.lastSmoothedGrade = 0;
   showToast("Session ended");
@@ -5573,6 +6777,15 @@ function leaveSession() {
   const session = getCurrentSession();
   const user = getCurrentUser();
   if (!session || !user) return;
+  if (state.devices.trainer?.erg) {
+    state.devices.trainer.erg.desiredEnabled = false;
+    state.devices.trainer.erg.currentTargetWatts = null;
+    state.devices.trainer.erg.lastAppliedEntryKey = null;
+    state.devices.trainer.erg.error = null;
+    state.devices.trainer.erg.state = getTrainerErgAvailability(state.devices.trainer).available
+      ? ERG_STATE_DISABLED
+      : ERG_STATE_UNAVAILABLE;
+  }
 
   updateSessionOnStorage((s) => {
     delete s.users?.[user.id];
@@ -5585,6 +6798,7 @@ function leaveSession() {
   resetPrivateRiderStats();
   resetPowerUpState();
   resetFtpProposalState();
+  resetEffortSeismograph();
   state.user = null;
   state.session = null;
   state.view = "lobby";
@@ -5628,7 +6842,6 @@ function pollTelemetry() {
   const speedMps = applyPowerUpEffects(speedAfterPhysics, activePowerUp);
   const resistancePercent = mapGradeToResistancePercent(smoothedGrade);
   const resistanceLabel = getResistanceFeelLabel(resistancePercent);
-  const trainerControlStatus = getTrainerControlStatusText();
   const activePowerUpPayload = serializeActivePowerUp(activePowerUp);
 
   const telemetry = {
@@ -5647,6 +6860,29 @@ function pollTelemetry() {
 
   const distance = computeDistanceMeters(previousDistance, speedMps, sample.deltaSeconds);
   grantPowerUpsFromDistance(powerUpState, distance);
+  const trainer = state.devices.trainer;
+  const trainerErg = trainer?.erg;
+  if (trainerErg) {
+    const telemetryTimestamp = Number(trainer?.lastReading?.timestamp);
+    if (Number.isFinite(telemetryTimestamp) && telemetryTimestamp > 0) {
+      trainerErg.lastTelemetryAt = telemetryTimestamp;
+    }
+    const lastTelemetryAt = Number(trainerErg.lastTelemetryAt);
+    trainerErg.telemetryStale =
+      trainer.connected && Number.isFinite(lastTelemetryAt) ? now - lastTelemetryAt > TRAINER_TELEMETRY_STALE_MS : trainer.connected;
+    if (trainerErg.desiredEnabled && trainerErg.telemetryStale && trainerErg.state !== ERG_STATE_ERROR) {
+      trainerErg.state = ERG_STATE_INTERRUPTED;
+      trainerErg.error = "Trainer telemetry is stale.";
+    }
+  }
+  const ergControlRequested = trainerErg?.desiredEnabled === true;
+  if (!ergControlRequested) {
+    void sendResistanceToTrainer(smoothedGrade);
+  }
+  if (trainerErg?.desiredEnabled) {
+    void syncErgControlForCurrentSession({ reason: "telemetry-tick", nowMs: now });
+  }
+  const trainerControlStatus = getTrainerControlStatusText();
   updateTerrainState({
     currentGrade,
     effectiveGrade: smoothedGrade,
@@ -5657,10 +6893,10 @@ function pollTelemetry() {
     resistanceLabel,
     trainerControlStatus,
   });
-
-  void sendResistanceToTrainer(smoothedGrade);
   // Keep rider peak-power/speed stats local only. Do not sync these to shared session data.
   recordPrivateRiderTelemetrySample(telemetry, session, user);
+  const seismographFtpWatts = normalizeWorkoutFtpWatts(getUserFtp(getCurrentAccountProfile()), WORKOUT_DEFAULT_FTP_WATTS);
+  recordEffortSeismographTelemetrySample(telemetry, seismographFtpWatts, session, user);
   evaluateFtpProposalFromCurrentEffort(session, user);
   addTelemetrySample(user.id, telemetry, distance);
   // Host simulates bot riders so all clients receive shared pacing/challenge telemetry.
@@ -5871,7 +7107,44 @@ function getLobbySelectedRoute(routeSelectionModeInput = null) {
 
 function renderLobby() {
   const summaries = loadSummaries();
-  const savedWorkouts = loadWorkouts();
+  const customSavedWorkouts = loadWorkouts();
+  const templateSavedWorkouts = loadTemplateWorkouts();
+  const savedWorkouts = [...templateSavedWorkouts, ...customSavedWorkouts];
+  const savedWorkoutIdSet = new Set(savedWorkouts.map((workout) => String(workout.id || "").trim()).filter(Boolean));
+  state.lobby.createSessionSelectedWorkoutId =
+    state.lobby.createSessionSelectedWorkoutId != null && String(state.lobby.createSessionSelectedWorkoutId).trim()
+      ? String(state.lobby.createSessionSelectedWorkoutId).trim()
+      : null;
+  if (state.lobby.createSessionSelectedWorkoutId && !savedWorkoutIdSet.has(state.lobby.createSessionSelectedWorkoutId)) {
+    state.lobby.createSessionSelectedWorkoutId = null;
+  }
+  state.lobby.createSessionAdditionalWorkoutIds = Array.isArray(state.lobby.createSessionAdditionalWorkoutIds)
+    ? state.lobby.createSessionAdditionalWorkoutIds
+        .map((id) => String(id || "").trim())
+        .filter((id) => id && savedWorkoutIdSet.has(id))
+    : [];
+  if (state.lobby.createSessionSelectedWorkoutId) {
+    state.lobby.createSessionAdditionalWorkoutIds = state.lobby.createSessionAdditionalWorkoutIds.filter(
+      (id) => id !== state.lobby.createSessionSelectedWorkoutId,
+    );
+  }
+  state.lobby.showCreateSessionWorkoutPickerModal = state.lobby.showCreateSessionWorkoutPickerModal === true;
+  state.lobby.createSessionWorkoutPickerTab = normalizeSavedWorkoutsActiveTab(state.lobby.createSessionWorkoutPickerTab);
+  state.lobby.createSessionWorkoutPickerExpandedId =
+    state.lobby.createSessionWorkoutPickerExpandedId != null && String(state.lobby.createSessionWorkoutPickerExpandedId).trim()
+      ? String(state.lobby.createSessionWorkoutPickerExpandedId).trim()
+      : null;
+  if (state.lobby.createSessionWorkoutPickerExpandedId && !savedWorkoutIdSet.has(state.lobby.createSessionWorkoutPickerExpandedId)) {
+    state.lobby.createSessionWorkoutPickerExpandedId = null;
+  }
+  state.lobby.createSessionAdditionalRoutes = Array.isArray(state.lobby.createSessionAdditionalRoutes)
+    ? state.lobby.createSessionAdditionalRoutes
+        .map((route) => {
+          if (!route || typeof route !== "object") return null;
+          return ensureRoutePresetShape(route, DEFAULT_ROUTE_PRESET);
+        })
+        .filter(Boolean)
+    : [];
   state.lobby.workoutDraftName = normalizeWorkoutName(state.lobby.workoutDraftName);
   state.lobby.workoutDraftNotes = normalizeWorkoutNotes(state.lobby.workoutDraftNotes);
   state.lobby.workoutDraftTags = normalizeWorkoutTags(state.lobby.workoutDraftTags);
@@ -5915,7 +7188,13 @@ function renderLobby() {
           name: normalizeWorkoutName(state.lobby.workoutCreateNewModal.name),
         }
       : null;
+  state.lobby.savedWorkoutsExpandedId =
+    state.lobby.savedWorkoutsExpandedId != null && String(state.lobby.savedWorkoutsExpandedId).trim()
+      ? String(state.lobby.savedWorkoutsExpandedId).trim()
+      : null;
+  state.lobby.savedWorkoutsActiveTab = normalizeSavedWorkoutsActiveTab(state.lobby.savedWorkoutsActiveTab);
   state.lobby.savedWorkoutsFiltersExpanded = state.lobby.savedWorkoutsFiltersExpanded === true;
+  const savedWorkoutsActiveTab = state.lobby.savedWorkoutsActiveTab;
   const selectedWorkoutEntity = getSelectedWorkoutEntity(state.lobby.workoutDraftSegments, state.lobby.workoutSelection);
   const selectedWorkoutSegment = selectedWorkoutEntity.segment;
   const selectedWorkoutSet = selectedWorkoutEntity.setItem;
@@ -5939,9 +7218,11 @@ function renderLobby() {
   const showingEnd = Math.min(paginatedSummaries.endIndex, summaries.length);
   state.lobby.savedWorkoutsMinDurationSeconds = normalizeSavedWorkoutsMinDurationSeconds(state.lobby.savedWorkoutsMinDurationSeconds);
   state.lobby.savedWorkoutsMinDifficulty = normalizeSavedWorkoutsMinDifficulty(state.lobby.savedWorkoutsMinDifficulty);
+  state.lobby.savedWorkoutsFavoritesOnly = normalizeSavedWorkoutsFavoritesOnly(state.lobby.savedWorkoutsFavoritesOnly);
   state.lobby.savedWorkoutsFilterTags = normalizeWorkoutTags(state.lobby.savedWorkoutsFilterTags);
   const savedWorkoutsMinDurationSeconds = state.lobby.savedWorkoutsMinDurationSeconds;
   const savedWorkoutsMinDifficulty = state.lobby.savedWorkoutsMinDifficulty;
+  const savedWorkoutsFavoritesOnly = state.lobby.savedWorkoutsFavoritesOnly;
   const savedWorkoutsFilterTags = state.lobby.savedWorkoutsFilterTags;
   const savedWorkoutsMinDurationMinutes =
     savedWorkoutsMinDurationSeconds > 0 ? Math.floor(savedWorkoutsMinDurationSeconds / 60) : 0;
@@ -5960,34 +7241,133 @@ function renderLobby() {
     );
     return workoutDifficulty >= savedWorkoutsMinDifficulty;
   }).filter((workout) => {
+    if (!savedWorkoutsFavoritesOnly) return true;
+    return normalizeWorkoutFavorite(workout.isFavorite);
+  }).filter((workout) => {
     if (savedWorkoutsFilterTags.length === 0) return true;
     const workoutTags = normalizeWorkoutTags(workout.tags);
     return savedWorkoutsFilterTags.some((tag) => workoutTags.includes(tag));
   });
+  const filteredTemplateWorkouts = filteredSavedWorkouts.filter(
+    (workout) => workout.source === WORKOUT_SOURCE_TEMPLATE,
+  );
+  const filteredCustomWorkouts = filteredSavedWorkouts.filter(
+    (workout) => workout.source !== WORKOUT_SOURCE_TEMPLATE,
+  );
+  const isTemplateWorkoutsTab = savedWorkoutsActiveTab === SAVED_WORKOUTS_TAB_TEMPLATE;
+  const totalTemplateWorkouts = templateSavedWorkouts.length;
+  const totalCustomWorkouts = customSavedWorkouts.length;
   const paginatedSavedWorkouts = getPaginatedSessions(
-    filteredSavedWorkouts,
+    filteredCustomWorkouts,
     state.lobby.savedWorkoutsPage,
     SAVED_WORKOUTS_PAGE_SIZE,
   );
   state.lobby.savedWorkoutsPage = paginatedSavedWorkouts.currentPage;
-  const showSavedWorkoutsPagination = filteredSavedWorkouts.length > SAVED_WORKOUTS_PAGE_SIZE;
-  const showingSavedWorkoutsStart = filteredSavedWorkouts.length === 0 ? 0 : paginatedSavedWorkouts.startIndex + 1;
-  const showingSavedWorkoutsEnd = Math.min(paginatedSavedWorkouts.endIndex, filteredSavedWorkouts.length);
+  const showSavedWorkoutsPagination = filteredCustomWorkouts.length > SAVED_WORKOUTS_PAGE_SIZE;
+  const showingSavedWorkoutsStart = filteredCustomWorkouts.length === 0 ? 0 : paginatedSavedWorkouts.startIndex + 1;
+  const showingSavedWorkoutsEnd = Math.min(paginatedSavedWorkouts.endIndex, filteredCustomWorkouts.length);
   const savedWorkoutsDurationLabel =
     savedWorkoutsMinDurationMinutes > 0 ? `${savedWorkoutsMinDurationMinutes} min and up` : "No minimum";
   const savedWorkoutsDurationActiveLabel =
     savedWorkoutsMinDurationMinutes > 0 ? `Duration: ${savedWorkoutsMinDurationMinutes}+ min` : "";
   const savedWorkoutsDifficultyActiveLabel =
     savedWorkoutsMinDifficulty > 0 ? `Difficulty: ${savedWorkoutsMinDifficulty}+ / 10` : "";
+  const savedWorkoutsFavoritesActiveLabel = savedWorkoutsFavoritesOnly ? "Favorites only" : "";
   const savedWorkoutsTagsActiveLabel =
     savedWorkoutsFilterTags.length > 0 ? `Tags: ${savedWorkoutsFilterTags.length}` : "";
   const hasSavedWorkoutsActiveFilter =
-    savedWorkoutsMinDurationSeconds > 0 || savedWorkoutsMinDifficulty > 0 || savedWorkoutsFilterTags.length > 0;
+    savedWorkoutsMinDurationSeconds > 0 ||
+    savedWorkoutsMinDifficulty > 0 ||
+    savedWorkoutsFavoritesOnly ||
+    savedWorkoutsFilterTags.length > 0;
   const savedWorkoutsActiveFilterCount =
     (savedWorkoutsMinDurationSeconds > 0 ? 1 : 0) +
     (savedWorkoutsMinDifficulty > 0 ? 1 : 0) +
+    (savedWorkoutsFavoritesOnly ? 1 : 0) +
     (savedWorkoutsFilterTags.length > 0 ? 1 : 0);
   const savedWorkoutsFiltersExpanded = state.lobby.savedWorkoutsFiltersExpanded === true;
+  const activeSavedWorkoutsForTable = isTemplateWorkoutsTab ? filteredTemplateWorkouts : paginatedSavedWorkouts.sessions;
+  const activeSavedWorkoutIdSet = new Set(activeSavedWorkoutsForTable.map((workout) => workout.id));
+  if (state.lobby.savedWorkoutsExpandedId && !activeSavedWorkoutIdSet.has(state.lobby.savedWorkoutsExpandedId)) {
+    state.lobby.savedWorkoutsExpandedId = null;
+  }
+  const selectedCreateSessionWorkout = state.lobby.createSessionSelectedWorkoutId
+    ? savedWorkouts.find((workout) => workout.id === state.lobby.createSessionSelectedWorkoutId) || null
+    : null;
+  if (!selectedCreateSessionWorkout && state.lobby.createSessionSelectedWorkoutId) {
+    state.lobby.createSessionSelectedWorkoutId = null;
+  }
+  const savedWorkoutById = new Map(savedWorkouts.map((workout) => [String(workout.id), workout]));
+  const createSessionAdditionalWorkoutIds = Array.isArray(state.lobby.createSessionAdditionalWorkoutIds)
+    ? state.lobby.createSessionAdditionalWorkoutIds
+    : [];
+  const createSessionAdditionalWorkouts = createSessionAdditionalWorkoutIds
+    .map((workoutId) => savedWorkoutById.get(String(workoutId)) || null)
+    .filter(Boolean);
+  if (createSessionAdditionalWorkouts.length !== createSessionAdditionalWorkoutIds.length) {
+    state.lobby.createSessionAdditionalWorkoutIds = createSessionAdditionalWorkouts.map((workout) => workout.id);
+  }
+  const createSessionWorkoutSequence = [
+    ...createSessionAdditionalWorkouts,
+    ...(selectedCreateSessionWorkout ? [selectedCreateSessionWorkout] : []),
+  ];
+  const createSessionWorkoutSequenceRowsHtml = createSessionWorkoutSequence
+    .map((workout, index) => {
+      const workoutDifficulty = calculateWorkoutDifficulty(
+        workout.segments,
+        normalizeWorkoutFtpWatts(workout.ftpReferenceWatts, WORKOUT_DEFAULT_FTP_WATTS),
+      );
+      const isCurrentSelection = index === createSessionWorkoutSequence.length - 1 && selectedCreateSessionWorkout != null;
+      const actionHtml = isCurrentSelection
+        ? `<span class="small">Current</span>`
+        : `<button type="button" class="secondary" data-remove-create-workout-step-index="${index}" style="padding:4px 8px;">Remove</button>`;
+      return `
+        <div class="flex-space" style="gap:10px; align-items:center; border:1px solid #d6e2f3; border-radius:8px; padding:8px 10px; margin-top:${
+          index === 0 ? "0" : "8px"
+        };">
+          <div style="min-width:0;">
+            <div><strong>Step ${index + 1}</strong> - ${escapeHtml(workout.name)}</div>
+            <div class="small">${workoutDifficulty}/10 • ${formatDuration(workout.totalDurationSeconds)}</div>
+          </div>
+          ${actionHtml}
+        </div>
+      `;
+    })
+    .join("");
+  const hasCreateSessionWorkoutSequence = createSessionWorkoutSequence.length > 0;
+  const hasCreateSessionAdditionalWorkouts = createSessionAdditionalWorkouts.length > 0;
+  const selectedCreateSessionWorkoutDifficulty = selectedCreateSessionWorkout
+    ? calculateWorkoutDifficulty(
+        selectedCreateSessionWorkout.segments,
+        normalizeWorkoutFtpWatts(selectedCreateSessionWorkout.ftpReferenceWatts, WORKOUT_DEFAULT_FTP_WATTS),
+      )
+    : null;
+  const createSessionWorkoutPickerTab = state.lobby.createSessionWorkoutPickerTab;
+  const isCreateSessionWorkoutPickerTemplateTab = createSessionWorkoutPickerTab === SAVED_WORKOUTS_TAB_TEMPLATE;
+  const createSessionWorkoutPickerPaginatedCustom = getPaginatedSessions(
+    customSavedWorkouts,
+    state.lobby.createSessionWorkoutPickerPage,
+    SAVED_WORKOUTS_PAGE_SIZE,
+  );
+  state.lobby.createSessionWorkoutPickerPage = createSessionWorkoutPickerPaginatedCustom.currentPage;
+  const createSessionWorkoutPickerWorkouts = isCreateSessionWorkoutPickerTemplateTab
+    ? templateSavedWorkouts
+    : createSessionWorkoutPickerPaginatedCustom.sessions;
+  const createSessionWorkoutPickerVisibleIds = new Set(createSessionWorkoutPickerWorkouts.map((workout) => workout.id));
+  if (
+    state.lobby.createSessionWorkoutPickerExpandedId &&
+    !createSessionWorkoutPickerVisibleIds.has(state.lobby.createSessionWorkoutPickerExpandedId)
+  ) {
+    state.lobby.createSessionWorkoutPickerExpandedId = null;
+  }
+  const showCreateSessionWorkoutPickerPagination =
+    !isCreateSessionWorkoutPickerTemplateTab && customSavedWorkouts.length > SAVED_WORKOUTS_PAGE_SIZE;
+  const createSessionWorkoutPickerShowingStart =
+    customSavedWorkouts.length === 0 ? 0 : createSessionWorkoutPickerPaginatedCustom.startIndex + 1;
+  const createSessionWorkoutPickerShowingEnd = Math.min(
+    createSessionWorkoutPickerPaginatedCustom.endIndex,
+    customSavedWorkouts.length,
+  );
   const profile = getCurrentAccountProfile();
   const loggedIn = isAuthenticated() && !!profile;
   const bluetoothSupported = isWebBluetoothSupported();
@@ -6055,6 +7435,29 @@ function renderLobby() {
           : generatedConfirmed
             ? "Generated route confirmed and ready for session start."
             : "Generate a route, review the profile, then confirm.";
+  const createSessionAdditionalRoutes = state.lobby.createSessionAdditionalRoutes;
+  const createSessionRoutePlanPreviewRoutes = [selectedRoute, ...createSessionAdditionalRoutes];
+  const createSessionRoutePlanRowsHtml = createSessionRoutePlanPreviewRoutes
+    .map((route, index) => {
+      const stepDistanceKm = Number(route.distanceKm) || (Number(route.totalDistanceMeters) || 0) / 1000;
+      const removeButtonHtml =
+        index > 0
+          ? `<button type="button" class="secondary" data-remove-create-route-step-index="${index - 1}" style="padding:4px 8px;">Remove</button>`
+          : `<span class="small">Current</span>`;
+      return `
+        <div class="flex-space" style="gap:10px; align-items:center; border:1px solid #d6e2f3; border-radius:8px; padding:8px 10px; margin-top:${
+          index === 0 ? "0" : "8px"
+        };">
+          <div style="min-width:0;">
+            <div><strong>Step ${index + 1}</strong> - ${escapeHtml(route.name || `Route ${index + 1}`)}</div>
+            <div class="small">${escapeHtml(route.country || "Unknown")} • ${stepDistanceKm.toFixed(1)} km</div>
+          </div>
+          ${removeButtonHtml}
+        </div>
+      `;
+    })
+    .join("");
+  const hasCreateSessionAdditionalRoutes = createSessionAdditionalRoutes.length > 0;
   state.lobby.botDrafts = normalizeBotDrafts(state.lobby.botDrafts);
   const botDrafts = state.lobby.botDrafts;
   const canAddMoreBots = botDrafts.length < MAX_SESSION_BOTS;
@@ -6377,10 +7780,11 @@ function renderLobby() {
     `;
   }
 
-  const defaultLobbySection = loggedIn ? "create" : "account";
+  const defaultLobbySection = "home";
   state.lobby.activeSection = normalizeLobbySection(state.lobby.activeSection, defaultLobbySection);
   const activeLobbySection = state.lobby.activeSection;
   const lobbyMenuSections = [
+    { id: "home", label: "Home" },
     { id: "account", label: "Account" },
     { id: "create", label: "Create a session" },
     { id: "join", label: "Join a session" },
@@ -6407,6 +7811,77 @@ function renderLobby() {
       </div>
     </div>
   `;
+  const buildWorkoutPreviewTimelineHtml = (workout) => {
+    const workoutFtpReferenceWatts = normalizeWorkoutFtpWatts(workout.ftpReferenceWatts, workoutFtpWatts);
+    const workoutSegments = normalizeWorkoutSegments(workout.segments, workoutFtpReferenceWatts);
+    const totalDurationSeconds = Math.max(1, computeWorkoutTotalDurationSeconds(workoutSegments));
+    if (workoutSegments.length === 0) {
+      return `<div class="small">No segments in this workout yet.</div>`;
+    }
+    const previewBlocksHtml = workoutSegments
+      .map((item, index) => {
+        if (item.type === WORKOUT_ITEM_TYPE_SET) {
+          const repetitions = normalizeWorkoutSetRepetitions(item.repetitions);
+          const setCycleDurationSeconds = Math.max(
+            1,
+            item.segments.reduce(
+              (setTotal, segment) => setTotal + normalizeWorkoutDurationSeconds(segment.durationSeconds),
+              0,
+            ),
+          );
+          const setTotalDurationSeconds = setCycleDurationSeconds * repetitions;
+          const setWidthPercent = Math.max(0.8, (setTotalDurationSeconds / totalDurationSeconds) * 100);
+          const setTooltip = `Set ${index + 1}: ${repetitions} repetitions`;
+          const setSegmentsHtml =
+            item.segments.length > 0
+              ? item.segments
+                  .map((segment, segmentIndex) => {
+                    const segmentDurationSeconds = normalizeWorkoutDurationSeconds(segment.durationSeconds);
+                    const segmentWidthPercent = Math.max(0.8, (segmentDurationSeconds / setCycleDurationSeconds) * 100);
+                    const segmentZone = getWorkoutSegmentZone(segment, workoutFtpReferenceWatts);
+                    const segmentTargetWatts = getWorkoutSegmentTargetWatts(segment, workoutFtpReferenceWatts);
+                    const segmentCadenceLabel = formatWorkoutCadenceTargetLabel(segment);
+                    const setSegmentTooltip = `Set ${index + 1}, Segment ${segmentIndex + 1}: Zone ${segmentZone}, ${segmentTargetWatts} W, ${segmentCadenceLabel}, ${formatDuration(segmentDurationSeconds)}`;
+                    return `
+                      <div
+                        class="workout-preview-set-segment workout-tooltip-trigger ${getWorkoutEffortClass(segmentZone)}"
+                        style="width:${segmentWidthPercent.toFixed(4)}%; flex-basis:${segmentWidthPercent.toFixed(4)}%;"
+                        data-tooltip="${escapeHtml(setSegmentTooltip)}"
+                      ></div>
+                    `;
+                  })
+                  .join("")
+              : `<div class="workout-preview-set-empty">Empty</div>`;
+          return `
+            <div
+              class="workout-preview-set workout-tooltip-trigger"
+              style="width:${setWidthPercent.toFixed(4)}%; flex-basis:${setWidthPercent.toFixed(4)}%;"
+              data-tooltip="${escapeHtml(setTooltip)}"
+            >
+              <div class="workout-preview-set-label">${repetitions}x</div>
+              <div class="workout-preview-set-track">
+                ${setSegmentsHtml}
+              </div>
+            </div>
+          `;
+        }
+        const segmentDurationSeconds = normalizeWorkoutDurationSeconds(item.durationSeconds);
+        const segmentWidthPercent = Math.max(0.8, (segmentDurationSeconds / totalDurationSeconds) * 100);
+        const segmentZone = getWorkoutSegmentZone(item, workoutFtpReferenceWatts);
+        const segmentTargetWatts = getWorkoutSegmentTargetWatts(item, workoutFtpReferenceWatts);
+        const segmentCadenceLabel = formatWorkoutCadenceTargetLabel(item);
+        const segmentTooltip = `Segment ${index + 1}: Zone ${segmentZone}, ${segmentTargetWatts} W, ${segmentCadenceLabel}, ${formatDuration(segmentDurationSeconds)}`;
+        return `
+          <div
+            class="workout-preview-block workout-tooltip-trigger ${getWorkoutEffortClass(segmentZone)}"
+            style="width:${segmentWidthPercent.toFixed(4)}%; flex-basis:${segmentWidthPercent.toFixed(4)}%;"
+            data-tooltip="${escapeHtml(segmentTooltip)}"
+          ><span class="workout-preview-watts-label">${segmentTargetWatts}W</span></div>
+        `;
+      })
+      .join("");
+    return `<div class="workout-preview-track">${previewBlocksHtml}</div>`;
+  };
   const createSessionCard = `
     <div class="card">
       <h2>Create a session</h2>
@@ -6478,12 +7953,87 @@ function renderLobby() {
       <div id="createRouteProfile" class="elevation-profile-card" style="margin-top:10px;">
         ${selectedRoutePreviewHtml}
       </div>
+      <div class="card" style="margin-top:12px;">
+        <div class="flex-space" style="gap:10px; flex-wrap:wrap;">
+          <div>
+            <h2 style="margin-bottom:6px;">Route Sequence</h2>
+            <div class="small">Routes are completed in order. Add steps to ride multiple routes back to back.</div>
+          </div>
+          <div class="flex" style="gap:8px; flex-wrap:wrap;">
+            <button id="createRouteAddStepBtn" type="button" class="secondary">Add Route Step</button>
+            ${
+              hasCreateSessionAdditionalRoutes
+                ? `<button id="createRouteClearStepsBtn" type="button" class="secondary">Clear Added Steps</button>`
+                : ""
+            }
+          </div>
+        </div>
+        <div style="margin-top:10px;">
+          ${createSessionRoutePlanRowsHtml}
+        </div>
+      </div>
       <div style="margin-top:12px;max-width:320px;">
         <label class="label">Bike choice</label>
         <select id="createBike">${bikeOptionsHtml}</select>
       </div>
       <div class="bike-choice-card" style="margin-top:12px;">
         ${selectedBikeDetailsHtml}
+      </div>
+      <div class="card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">Workout</h2>
+        <div class="small">Optionally attach one or more saved workouts to run in order during the session.</div>
+        <div class="flex-space" style="margin-top:10px; gap:10px; flex-wrap:wrap;">
+          <div style="min-width:220px;">
+            <div class="code">${escapeHtml(selectedCreateSessionWorkout?.name || "No current workout selected")}</div>
+            <div class="small" style="margin-top:6px;">
+              ${
+                selectedCreateSessionWorkout
+                  ? `${selectedCreateSessionWorkoutDifficulty}/10 • ${formatDuration(selectedCreateSessionWorkout.totalDurationSeconds)}`
+                  : "Select a workout, then add it as a step in your sequence."
+              }
+            </div>
+          </div>
+          <div class="flex" style="gap:8px;flex-wrap:wrap;">
+            <button id="createSessionSelectWorkoutBtn" type="button" class="secondary">
+              ${selectedCreateSessionWorkout ? "Change Current" : "Select Workout"}
+            </button>
+            ${
+              selectedCreateSessionWorkout
+                ? `<button id="createSessionClearWorkoutBtn" type="button" class="secondary">Clear Current</button>`
+                : ""
+            }
+            ${
+              selectedCreateSessionWorkout
+                ? `<button id="createSessionAddWorkoutStepBtn" type="button" class="secondary">Add Workout Step</button>`
+                : ""
+            }
+            ${
+              hasCreateSessionAdditionalWorkouts
+                ? `<button id="createSessionClearWorkoutStepsBtn" type="button" class="secondary">Clear Added Steps</button>`
+                : ""
+            }
+          </div>
+        </div>
+        ${
+          selectedCreateSessionWorkout
+            ? `
+        <div class="workout-preview-panel" style="margin-top:10px;">
+          ${buildWorkoutPreviewTimelineHtml(selectedCreateSessionWorkout)}
+        </div>
+        `
+            : ""
+        }
+        <div style="margin-top:10px;">
+          <h2 style="margin-bottom:6px;">Workout Sequence</h2>
+          <div class="small">Step order is applied exactly as shown.</div>
+          <div style="margin-top:8px;">
+            ${
+              hasCreateSessionWorkoutSequence
+                ? createSessionWorkoutSequenceRowsHtml
+                : `<div class="small">No workout steps added yet.</div>`
+            }
+          </div>
+        </div>
       </div>
       <div class="card" style="margin-top:12px;">
         <h2 style="margin-bottom:8px;">Bot Riders (MVP)</h2>
@@ -6566,8 +8116,10 @@ function renderLobby() {
   const selectedWorkoutTargetWatts = selectedWorkoutSegment
     ? getWorkoutSegmentTargetWatts(selectedWorkoutSegment, workoutFtpWatts)
     : null;
-  const selectedWorkoutResolvedZone = selectedWorkoutSegment ? getWorkoutSegmentZone(selectedWorkoutSegment, workoutFtpWatts) : null;
-  const selectedWorkoutZone = selectedWorkoutResolvedZone != null ? getWorkoutZoneConfig(selectedWorkoutResolvedZone) : null;
+  const selectedWorkoutTargetCadenceRpm = selectedWorkoutSegment
+    ? getWorkoutSegmentTargetCadenceRpm(selectedWorkoutSegment)
+    : null;
+  const selectedWorkoutHasCadenceTarget = selectedWorkoutTargetCadenceRpm != null;
   const selectedWorkoutDuration = selectedWorkoutSegment ? getWorkoutDurationParts(selectedWorkoutSegment.durationSeconds) : null;
   const selectedWorkoutSetRepetitions = selectedWorkoutSet ? normalizeWorkoutSetRepetitions(selectedWorkoutSet.repetitions) : null;
   const workoutDraftDifficulty = calculateWorkoutDifficulty(state.lobby.workoutDraftSegments, workoutFtpWatts);
@@ -6677,6 +8229,7 @@ function renderLobby() {
               selectedWorkoutSelection.setIndex === index &&
               selectedWorkoutSelection.segmentIndex === segmentIndex;
             const segmentDuration = normalizeWorkoutDurationSeconds(segment.durationSeconds);
+            const segmentCadenceLabel = formatWorkoutCadenceTargetLabel(segment);
             const segmentWidthPercent = Math.max(
               0.001,
               (segmentDuration / Math.max(setCycleDurationSeconds || WORKOUT_DEFAULT_SEGMENT_DURATION_SECONDS, 1)) * 100,
@@ -6689,9 +8242,9 @@ function renderLobby() {
                 data-workout-set-parent-index="${index}"
                 draggable="true"
                 style="width:${segmentWidthPercent.toFixed(4)}%; flex-basis:${segmentWidthPercent.toFixed(4)}%;"
-                title="Set ${index + 1}, Segment ${segmentIndex + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${segmentTargetWatts} W target, ${formatDuration(segment.durationSeconds)}"
-                aria-label="Set ${index + 1}, Segment ${segmentIndex + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${segmentTargetWatts} watts target, ${formatDuration(segment.durationSeconds)}"
-              ></button>
+                title="Set ${index + 1}, Segment ${segmentIndex + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${segmentTargetWatts} W target, ${segmentCadenceLabel}, ${formatDuration(segment.durationSeconds)}"
+                aria-label="Set ${index + 1}, Segment ${segmentIndex + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${segmentTargetWatts} watts target, ${segmentCadenceLabel}, ${formatDuration(segment.durationSeconds)}"
+              ><span class="workout-watts-label">${segmentTargetWatts}W</span></button>
             `;
           })
           .join("");
@@ -6724,7 +8277,7 @@ function renderLobby() {
             <div class="workout-set-segments" data-workout-set-segments-index="${index}">
               ${
                 setSegmentsHtml ||
-                `<div class="small workout-set-empty">Drop zones here</div>`
+                `<div class="small workout-set-empty">+</div>`
               }
             </div>
           </div>
@@ -6734,6 +8287,7 @@ function renderLobby() {
       const itemZone = getWorkoutSegmentZone(item, workoutFtpWatts);
       const zoneDef = getWorkoutZoneConfig(itemZone);
       const itemTargetWatts = getWorkoutSegmentTargetWatts(item, workoutFtpWatts);
+      const itemCadenceLabel = formatWorkoutCadenceTargetLabel(item);
       const isSelected = selectedWorkoutSelection?.kind === "segment" && selectedWorkoutSelection.index === index;
       const durationSeconds = normalizeWorkoutDurationSeconds(item.durationSeconds);
       const widthPercent = Math.max(0.001, (durationSeconds / workoutTimelineWindowSeconds) * 100);
@@ -6745,56 +8299,205 @@ function renderLobby() {
           data-workout-segment-index="${index}"
           draggable="true"
           style="width:${widthPercent.toFixed(4)}%; flex-basis:${widthPercent.toFixed(4)}%;"
-          title="Segment ${index + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${itemTargetWatts} W target, ${formatDuration(item.durationSeconds)}"
-          aria-label="Segment ${index + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${itemTargetWatts} watts target, ${formatDuration(item.durationSeconds)}"
-        ></button>
+          title="Segment ${index + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${itemTargetWatts} W target, ${itemCadenceLabel}, ${formatDuration(item.durationSeconds)}"
+          aria-label="Segment ${index + 1}: Zone ${zoneDef.zone} (${zoneDef.label}), ${itemTargetWatts} watts target, ${itemCadenceLabel}, ${formatDuration(item.durationSeconds)}"
+        ><span class="workout-watts-label">${itemTargetWatts}W</span></button>
       `;
     })
     .join("");
-  const workoutSavedRows = paginatedSavedWorkouts.sessions
-    .map((workout) => {
-      const isEditing = workout.id === state.lobby.workoutEditingId;
-      const workoutDifficulty = calculateWorkoutDifficulty(workout.segments, workoutFtpWatts);
-      const isFavorite = normalizeWorkoutFavorite(workout.isFavorite);
-      const rating = normalizeWorkoutRating(workout.rating, null);
-      const ratingButtonLabel = rating == null ? "Rate ★" : `★ ${rating}`;
-      const tags = normalizeWorkoutTags(workout.tags);
-      const tagCount = tags.length;
-      const tagCountLabel = `${tagCount} tag${tagCount === 1 ? "" : "s"}`;
-      const tagHoverText = tagCount > 0 ? tags.join(", ") : "No tags";
-      return `
-        <tr class="${isEditing ? "highlight" : ""}">
-          <td class="workout-favorite-cell">
+  const buildSavedWorkoutPreviewTimelineHtml = (workout) => buildWorkoutPreviewTimelineHtml(workout);
+  const createSessionWorkoutSelectedIdsSet = new Set([
+    ...createSessionAdditionalWorkouts.map((workout) => workout.id),
+    ...(selectedCreateSessionWorkout ? [selectedCreateSessionWorkout.id] : []),
+  ]);
+
+  const buildWorkoutSavedRow = (workout) => {
+    const isTemplateWorkout = workout.source === WORKOUT_SOURCE_TEMPLATE;
+    const isEditing = !isTemplateWorkout && workout.id === state.lobby.workoutEditingId;
+    const isExpanded = state.lobby.savedWorkoutsExpandedId === workout.id;
+    const workoutDifficulty = calculateWorkoutDifficulty(workout.segments, workoutFtpWatts);
+    const isFavorite = normalizeWorkoutFavorite(workout.isFavorite);
+    const rating = normalizeWorkoutRating(workout.rating, null);
+    const ratingButtonLabel = rating == null ? "Rate ★" : `★ ${rating}`;
+    const tags = normalizeWorkoutTags(workout.tags);
+    const tagCount = tags.length;
+    const tagCountLabel = `${tagCount} tag${tagCount === 1 ? "" : "s"}`;
+    const tagHoverText = tagCount > 0 ? tags.join(", ") : "No tags";
+    const previewTimelineHtml = buildSavedWorkoutPreviewTimelineHtml(workout);
+    const previewDurationLabel = formatDuration(computeWorkoutTotalDurationSeconds(workout.segments));
+    const actionButtonsHtml = isTemplateWorkout
+      ? `
+        <button type="button" class="secondary workout-rate-btn ${rating != null ? "is-rated" : ""}" data-workout-rate-id="${escapeHtml(workout.id)}">${ratingButtonLabel}</button>
+        <span class="workout-tags-count workout-tooltip-trigger" data-tooltip="${escapeHtml(tagHoverText)}">${tagCountLabel}</span>
+        <button type="button" class="secondary" data-workout-load-id="${escapeHtml(workout.id)}">View</button>
+        <button type="button" class="secondary workout-copy-btn" data-workout-copy-id="${escapeHtml(workout.id)}">Copy</button>
+      `
+      : `
+        <button type="button" class="secondary workout-rate-btn ${rating != null ? "is-rated" : ""}" data-workout-rate-id="${escapeHtml(workout.id)}">${ratingButtonLabel}</button>
+        <button type="button" class="secondary" data-workout-view-notes-id="${escapeHtml(workout.id)}">Notes</button>
+        <span class="workout-tags-count workout-tooltip-trigger" data-tooltip="${escapeHtml(tagHoverText)}">${tagCountLabel}</span>
+        <button type="button" class="secondary" data-workout-load-id="${escapeHtml(workout.id)}">Edit</button>
+        <button
+          type="button"
+          class="danger workout-delete-btn"
+          data-workout-delete-id="${escapeHtml(workout.id)}"
+          title="Remove ${escapeHtml(workout.name)}"
+          aria-label="Remove ${escapeHtml(workout.name)}"
+        >🗑</button>
+      `;
+    return `
+      <tr
+        class="${isEditing ? "highlight " : ""}workout-preview-trigger ${isExpanded ? "is-expanded" : ""}"
+        data-workout-preview-row-id="${escapeHtml(workout.id)}"
+        aria-expanded="${isExpanded ? "true" : "false"}"
+        tabindex="0"
+      >
+        <td class="workout-favorite-cell">
+          <button
+            type="button"
+            class="secondary workout-favorite-btn ${isFavorite ? "is-favorite" : ""}"
+            data-workout-favorite-id="${escapeHtml(workout.id)}"
+            title="${isFavorite ? "Remove favorite" : "Mark as favorite"}"
+            aria-label="${isFavorite ? "Remove favorite" : "Mark as favorite"}"
+          >${isFavorite ? "★" : "☆"}</button>
+        </td>
+        <td>
+          ${escapeHtml(workout.name)}
+        </td>
+        <td>${workoutDifficulty}/10</td>
+        <td>${formatDuration(workout.totalDurationSeconds)}</td>
+      </tr>
+      <tr class="workout-preview-row ${isExpanded ? "is-expanded" : ""}" ${isExpanded ? "" : "hidden"}>
+        <td colspan="4">
+          <div class="workout-preview-panel">
+            <div class="workout-preview-actions">
+              <div class="workout-preview-actions-row">
+                <div class="small">Duration: ${previewDurationLabel}</div>
+                <div class="flex" style="gap:8px; justify-content:flex-end; flex-wrap:wrap;">
+                  ${actionButtonsHtml}
+                </div>
+              </div>
+            </div>
+            ${previewTimelineHtml}
+          </div>
+        </td>
+      </tr>
+    `;
+  };
+  const buildCreateSessionWorkoutPickerRow = (workout) => {
+    const isExpanded = state.lobby.createSessionWorkoutPickerExpandedId === workout.id;
+    const isSelected = createSessionWorkoutSelectedIdsSet.has(workout.id);
+    const workoutDifficulty = calculateWorkoutDifficulty(
+      workout.segments,
+      normalizeWorkoutFtpWatts(workout.ftpReferenceWatts, WORKOUT_DEFAULT_FTP_WATTS),
+    );
+    const previewTimelineHtml = buildSavedWorkoutPreviewTimelineHtml(workout);
+    const previewDurationLabel = formatDuration(computeWorkoutTotalDurationSeconds(workout.segments));
+    return `
+      <tr
+        class="${isSelected ? "highlight " : ""}workout-preview-trigger ${isExpanded ? "is-expanded" : ""}"
+        data-create-session-workout-row-id="${escapeHtml(workout.id)}"
+        aria-expanded="${isExpanded ? "true" : "false"}"
+        tabindex="0"
+      >
+        <td>${escapeHtml(workout.name)}</td>
+        <td>${workoutDifficulty}/10</td>
+        <td>${formatDuration(workout.totalDurationSeconds)}</td>
+      </tr>
+      <tr class="workout-preview-row ${isExpanded ? "is-expanded" : ""}" ${isExpanded ? "" : "hidden"}>
+        <td colspan="3">
+          <div class="workout-preview-panel">
+            <div class="workout-preview-actions">
+              <div class="workout-preview-actions-row">
+                <div class="small">Duration: ${previewDurationLabel}</div>
+                <div class="flex" style="gap:8px; justify-content:flex-end; flex-wrap:wrap;">
+                  <button
+                    type="button"
+                    class="${isSelected ? "secondary" : ""}"
+                    data-create-session-workout-select-id="${escapeHtml(workout.id)}"
+                    ${isSelected ? "disabled" : ""}
+                  >${isSelected ? "Added" : "Select Workout"}</button>
+                </div>
+              </div>
+            </div>
+            ${previewTimelineHtml}
+          </div>
+        </td>
+      </tr>
+    `;
+  };
+  const workoutTemplateRows = filteredTemplateWorkouts.map((workout) => buildWorkoutSavedRow(workout)).join("");
+  const workoutCustomRows = paginatedSavedWorkouts.sessions.map((workout) => buildWorkoutSavedRow(workout)).join("");
+  const activeSavedWorkoutRows = isTemplateWorkoutsTab ? workoutTemplateRows : workoutCustomRows;
+  const createSessionWorkoutPickerRows = createSessionWorkoutPickerWorkouts
+    .map((workout) => buildCreateSessionWorkoutPickerRow(workout))
+    .join("");
+  const createSessionWorkoutPickerModalHtml = state.lobby.showCreateSessionWorkoutPickerModal
+    ? `
+      <div class="workout-modal-backdrop" id="createSessionWorkoutPickerModalBackdrop">
+        <div class="workout-modal workout-modal-wide">
+          <div class="flex-space" style="gap:10px;align-items:flex-start;">
+            <div>
+              <h2 style="margin-bottom:8px;">Select Workout</h2>
+              <div class="small">Choose a saved workout to attach to this session.</div>
+            </div>
+            <button id="createSessionWorkoutPickerCloseBtn" class="secondary">Close</button>
+          </div>
+          <div class="workout-source-tabs" role="tablist" aria-label="Workout sources">
             <button
               type="button"
-              class="secondary workout-favorite-btn ${isFavorite ? "is-favorite" : ""}"
-              data-workout-favorite-id="${escapeHtml(workout.id)}"
-              title="${isFavorite ? "Remove favorite" : "Mark as favorite"}"
-              aria-label="${isFavorite ? "Remove favorite" : "Mark as favorite"}"
-            >${isFavorite ? "★" : "☆"}</button>
-          </td>
-          <td>${escapeHtml(workout.name)}</td>
-          <td>${workoutDifficulty}/10</td>
-          <td>${formatDuration(workout.totalDurationSeconds)}</td>
-          <td>
-            <div class="flex" style="gap:8px; justify-content:flex-end; flex-wrap:wrap;">
-              <button type="button" class="secondary workout-rate-btn ${rating != null ? "is-rated" : ""}" data-workout-rate-id="${escapeHtml(workout.id)}">${ratingButtonLabel}</button>
-              <button type="button" class="secondary" data-workout-view-notes-id="${escapeHtml(workout.id)}">Notes</button>
-              <span class="workout-tags-count workout-tooltip-trigger" data-tooltip="${escapeHtml(tagHoverText)}">${tagCountLabel}</span>
-              <button type="button" class="secondary" data-workout-load-id="${escapeHtml(workout.id)}">Edit</button>
-              <button
-                type="button"
-                class="danger workout-delete-btn"
-                data-workout-delete-id="${escapeHtml(workout.id)}"
-                title="Remove ${escapeHtml(workout.name)}"
-                aria-label="Remove ${escapeHtml(workout.name)}"
-              >🗑</button>
-            </div>
-          </td>
-        </tr>
-      `;
-    })
-    .join("");
+              id="createSessionWorkoutPickerTabTemplateBtn"
+              class="secondary workout-source-tab ${isCreateSessionWorkoutPickerTemplateTab ? "is-active" : ""}"
+              aria-pressed="${isCreateSessionWorkoutPickerTemplateTab ? "true" : "false"}"
+            >Template (${templateSavedWorkouts.length})</button>
+            <button
+              type="button"
+              id="createSessionWorkoutPickerTabCustomBtn"
+              class="secondary workout-source-tab ${!isCreateSessionWorkoutPickerTemplateTab ? "is-active" : ""}"
+              aria-pressed="${!isCreateSessionWorkoutPickerTemplateTab ? "true" : "false"}"
+            >Custom (${customSavedWorkouts.length})</button>
+          </div>
+          ${
+            createSessionWorkoutPickerWorkouts.length === 0
+              ? `<p class="small" style="margin-top:10px;">No ${
+                  isCreateSessionWorkoutPickerTemplateTab ? "template" : "custom"
+                } workouts available.</p>`
+              : `
+          <table class="table" style="margin-top:10px;">
+            <thead>
+              <tr><th>Name</th><th>Difficulty</th><th>Total Duration</th></tr>
+            </thead>
+            <tbody>${createSessionWorkoutPickerRows}</tbody>
+          </table>
+          `
+          }
+          ${
+            showCreateSessionWorkoutPickerPagination
+              ? `
+          <div class="flex-space" style="margin-top:12px; gap:10px; flex-wrap:wrap;">
+            <button
+              id="createSessionWorkoutPickerPrevBtn"
+              class="secondary"
+              ${createSessionWorkoutPickerPaginatedCustom.currentPage <= 1 ? "disabled" : ""}
+            >Previous</button>
+            <div class="small">Custom page ${createSessionWorkoutPickerPaginatedCustom.currentPage} of ${createSessionWorkoutPickerPaginatedCustom.totalPages}</div>
+            <button
+              id="createSessionWorkoutPickerNextBtn"
+              class="secondary"
+              ${createSessionWorkoutPickerPaginatedCustom.currentPage >= createSessionWorkoutPickerPaginatedCustom.totalPages ? "disabled" : ""}
+            >Next</button>
+          </div>
+          <div class="small" style="margin-top:6px;">Showing ${createSessionWorkoutPickerShowingStart}-${createSessionWorkoutPickerShowingEnd} of ${customSavedWorkouts.length} custom workouts</div>
+          `
+              : ""
+          }
+        </div>
+      </div>
+    `
+    : "";
+  const activeSavedWorkoutTotalCount = isTemplateWorkoutsTab ? filteredTemplateWorkouts.length : filteredCustomWorkouts.length;
+  const activeSavedWorkoutTabLabel = isTemplateWorkoutsTab ? "template" : "custom";
+  const showSavedWorkoutsPaginationForActiveTab = !isTemplateWorkoutsTab && showSavedWorkoutsPagination;
   const workoutFtpEditorModalHtml = state.lobby.showWorkoutFtpModal
     ? `
       <div class="workout-modal-backdrop" id="workoutFtpModalBackdrop">
@@ -6910,7 +8613,7 @@ function renderLobby() {
     : "";
   const selectedWorkoutDeleteModal = state.lobby.workoutDeleteModal;
   const selectedWorkoutDeleteEntry = selectedWorkoutDeleteModal
-    ? savedWorkouts.find((entry) => entry.id === selectedWorkoutDeleteModal.workoutId) || null
+    ? customSavedWorkouts.find((entry) => entry.id === selectedWorkoutDeleteModal.workoutId) || null
     : null;
   const selectedWorkoutDeleteName = normalizeWorkoutName(
     selectedWorkoutDeleteEntry?.name || selectedWorkoutDeleteModal?.name || "this workout",
@@ -7042,9 +8745,6 @@ function renderLobby() {
           `
               : selectedWorkoutSegment
               ? `
-            <div class="workout-zone-readonly ${getWorkoutEffortClass(selectedWorkoutZone.zone)}">
-              <strong>Zone ${selectedWorkoutZone.zone}</strong> - ${escapeHtml(selectedWorkoutZone.label)} (${selectedWorkoutTargetWatts ?? 0} W target)
-            </div>
             <div class="flex" style="margin-top:10px; gap:10px; align-items:flex-end; flex-wrap:wrap;">
               <div style="width:140px;">
                 <label class="label" for="workoutSegmentWattsInput">Target Watts</label>
@@ -7054,6 +8754,24 @@ function renderLobby() {
                   min="0"
                   step="1"
                   value="${selectedWorkoutTargetWatts ?? 0}"
+                />
+              </div>
+              <div style="min-width:180px;">
+                <label class="label" for="workoutSegmentCadenceToggle">Cadence</label>
+                <label style="display:flex;align-items:center;gap:8px;min-height:42px;">
+                  <input id="workoutSegmentCadenceToggle" type="checkbox" ${selectedWorkoutHasCadenceTarget ? "checked" : ""} />
+                  <span class="small">Add cadence target</span>
+                </label>
+              </div>
+              <div style="width:150px;${selectedWorkoutHasCadenceTarget ? "" : "display:none;"}">
+                <label class="label" for="workoutSegmentCadenceInput">Target Cadence</label>
+                <input
+                  id="workoutSegmentCadenceInput"
+                  type="number"
+                  min="${WORKOUT_TARGET_CADENCE_MIN_RPM}"
+                  max="${WORKOUT_TARGET_CADENCE_MAX_RPM}"
+                  step="1"
+                  value="${selectedWorkoutTargetCadenceRpm ?? 85}"
                 />
               </div>
               <div style="width:120px;">
@@ -7127,6 +8845,20 @@ function renderLobby() {
         savedWorkouts.length === 0
           ? "<p class='small' style='margin-top:10px;'>No saved workouts yet.</p>"
           : `
+      <div class="workout-source-tabs" role="tablist" aria-label="Saved workout categories">
+        <button
+          type="button"
+          id="savedWorkoutsTabTemplateBtn"
+          class="secondary workout-source-tab ${isTemplateWorkoutsTab ? "is-active" : ""}"
+          aria-pressed="${isTemplateWorkoutsTab ? "true" : "false"}"
+        >Template (${filteredTemplateWorkouts.length})</button>
+        <button
+          type="button"
+          id="savedWorkoutsTabCustomBtn"
+          class="secondary workout-source-tab ${!isTemplateWorkoutsTab ? "is-active" : ""}"
+          aria-pressed="${!isTemplateWorkoutsTab ? "true" : "false"}"
+        >Custom (${filteredCustomWorkouts.length})</button>
+      </div>
       <div class="workout-filters-accordion">
         <button
           id="savedWorkoutsToggleFiltersBtn"
@@ -7151,6 +8883,11 @@ function renderLobby() {
             ${
               savedWorkoutsDifficultyActiveLabel
                 ? `<span class="workout-tags-count">${escapeHtml(savedWorkoutsDifficultyActiveLabel)}</span>`
+                : ""
+            }
+            ${
+              savedWorkoutsFavoritesActiveLabel
+                ? `<span class="workout-tags-count">${escapeHtml(savedWorkoutsFavoritesActiveLabel)}</span>`
                 : ""
             }
             ${
@@ -7183,6 +8920,14 @@ function renderLobby() {
                 <label class="label" for="savedWorkoutsMinDifficultySelect">Difficulty</label>
                 <select id="savedWorkoutsMinDifficultySelect">${savedWorkoutsDifficultyOptionsHtml}</select>
               </div>
+              <label class="workout-filter-checkbox" for="savedWorkoutsFavoritesOnlyInput">
+                <input
+                  id="savedWorkoutsFavoritesOnlyInput"
+                  type="checkbox"
+                  ${savedWorkoutsFavoritesOnly ? "checked" : ""}
+                />
+                <span>Favorited only</span>
+              </label>
             </div>
             <div style="margin-top:10px;">
               <div class="workout-tag-list">${savedWorkoutsTagFilterButtonsHtml}</div>
@@ -7201,23 +8946,23 @@ function renderLobby() {
         >Clear Filters</button>
       </div>
       ${
-        filteredSavedWorkouts.length === 0
-          ? "<p class='small' style='margin-top:10px;'>No saved workouts match the current filter.</p>"
+        activeSavedWorkoutTotalCount === 0
+          ? `<p class='small' style='margin-top:10px;'>No ${activeSavedWorkoutTabLabel} workouts match the current filter.</p>`
           : `
       <table class="table" style="margin-top:10px;">
         <thead>
-          <tr><th></th><th>Name</th><th>Difficulty</th><th>Total Duration</th><th>Actions</th></tr>
+          <tr><th></th><th>Name</th><th>Difficulty</th><th>Total Duration</th></tr>
         </thead>
-        <tbody>${workoutSavedRows}</tbody>
+        <tbody>${activeSavedWorkoutRows}</tbody>
       </table>
       `
       }
       ${
-        showSavedWorkoutsPagination
+        showSavedWorkoutsPaginationForActiveTab
           ? `
       <div class="flex-space" style="margin-top:12px; gap:10px; flex-wrap:wrap;">
         <button id="savedWorkoutsPrevBtn" class="secondary" ${paginatedSavedWorkouts.currentPage <= 1 ? "disabled" : ""}>Previous</button>
-        <div class="small">Page ${paginatedSavedWorkouts.currentPage} of ${paginatedSavedWorkouts.totalPages}</div>
+        <div class="small">Custom page ${paginatedSavedWorkouts.currentPage} of ${paginatedSavedWorkouts.totalPages}</div>
         <button id="savedWorkoutsNextBtn" class="secondary" ${paginatedSavedWorkouts.currentPage >= paginatedSavedWorkouts.totalPages ? "disabled" : ""}>Next</button>
       </div>
       `
@@ -7225,11 +8970,19 @@ function renderLobby() {
       }
       <div class="small" style="margin-top:6px;">
         ${
-          filteredSavedWorkouts.length > 0
-            ? `Showing ${showingSavedWorkoutsStart}-${showingSavedWorkoutsEnd} of ${filteredSavedWorkouts.length} workouts`
-            : `Showing 0 of ${filteredSavedWorkouts.length} workouts`
+          isTemplateWorkoutsTab
+            ? `Showing ${filteredTemplateWorkouts.length} of ${totalTemplateWorkouts} template workouts`
+            : activeSavedWorkoutTotalCount > 0
+              ? `Showing ${showingSavedWorkoutsStart}-${showingSavedWorkoutsEnd} of ${filteredCustomWorkouts.length} custom workouts`
+              : `Showing 0 of ${filteredCustomWorkouts.length} custom workouts`
         }
-        ${hasSavedWorkoutsActiveFilter ? `(filtered from ${savedWorkouts.length})` : ""}
+        ${
+          hasSavedWorkoutsActiveFilter
+            ? isTemplateWorkoutsTab
+              ? `(filtered from ${totalTemplateWorkouts})`
+              : `(filtered from ${totalCustomWorkouts})`
+            : ""
+        }
       </div>
       `
       }
@@ -7238,11 +8991,9 @@ function renderLobby() {
 
   appEl.innerHTML = `
     ${lobbyMenuHtml}
-    ${activeLobbySection === "account" ? accountCard : ""}
-    ${activeLobbySection === "create" ? createSessionCard : ""}
-    ${activeLobbySection === "join" ? joinSessionCard : ""}
-    ${activeLobbySection === "devices" ? devicesCard : ""}
-    ${activeLobbySection === "workouts" ? workoutsCard : ""}
+    ${
+      activeLobbySection === "home"
+        ? `
     <div class="card">
       <h2>Recent sessions</h2>
       <p class="small">Tap a code to reopen a completed summary.</p>
@@ -7289,6 +9040,15 @@ function renderLobby() {
           : ""
       }
     </div>
+    `
+        : ""
+    }
+    ${activeLobbySection === "account" ? accountCard : ""}
+    ${activeLobbySection === "create" ? createSessionCard : ""}
+    ${activeLobbySection === "join" ? joinSessionCard : ""}
+    ${activeLobbySection === "devices" ? devicesCard : ""}
+    ${activeLobbySection === "workouts" ? workoutsCard : ""}
+    ${activeLobbySection === "create" ? createSessionWorkoutPickerModalHtml : ""}
   `;
 
   document.querySelectorAll("[data-lobby-section]").forEach((btn) => {
@@ -7526,6 +9286,173 @@ function renderLobby() {
     });
   }
 
+  const createSessionSelectWorkoutBtn = document.getElementById("createSessionSelectWorkoutBtn");
+  if (createSessionSelectWorkoutBtn) {
+    createSessionSelectWorkoutBtn.addEventListener("click", () => {
+      state.lobby.showCreateSessionWorkoutPickerModal = true;
+      state.lobby.createSessionWorkoutPickerExpandedId = state.lobby.createSessionSelectedWorkoutId;
+      render();
+    });
+  }
+
+  const createSessionClearWorkoutBtn = document.getElementById("createSessionClearWorkoutBtn");
+  if (createSessionClearWorkoutBtn) {
+    createSessionClearWorkoutBtn.addEventListener("click", () => {
+      state.lobby.createSessionSelectedWorkoutId = null;
+      showToast("Current workout cleared.");
+      render();
+    });
+  }
+
+  const createSessionAddWorkoutStepBtn = document.getElementById("createSessionAddWorkoutStepBtn");
+  if (createSessionAddWorkoutStepBtn) {
+    createSessionAddWorkoutStepBtn.addEventListener("click", () => {
+      const selectedWorkoutId = state.lobby.createSessionSelectedWorkoutId;
+      if (!selectedWorkoutId) {
+        showToast("Select a workout first.");
+        return;
+      }
+      const additionalIds = Array.isArray(state.lobby.createSessionAdditionalWorkoutIds)
+        ? state.lobby.createSessionAdditionalWorkoutIds
+        : [];
+      if (additionalIds.includes(selectedWorkoutId)) {
+        showToast("Workout already in sequence.");
+        return;
+      }
+      state.lobby.createSessionAdditionalWorkoutIds = [...additionalIds, selectedWorkoutId];
+      state.lobby.createSessionSelectedWorkoutId = null;
+      state.lobby.createSessionWorkoutPickerExpandedId = null;
+      showToast("Workout step added. Select the next workout.");
+      render();
+    });
+  }
+
+  const createSessionClearWorkoutStepsBtn = document.getElementById("createSessionClearWorkoutStepsBtn");
+  if (createSessionClearWorkoutStepsBtn) {
+    createSessionClearWorkoutStepsBtn.addEventListener("click", () => {
+      state.lobby.createSessionAdditionalWorkoutIds = [];
+      showToast("Added workout steps cleared.");
+      render();
+    });
+  }
+
+  const createSessionWorkoutPickerCloseBtn = document.getElementById("createSessionWorkoutPickerCloseBtn");
+  if (createSessionWorkoutPickerCloseBtn) {
+    createSessionWorkoutPickerCloseBtn.addEventListener("click", () => {
+      state.lobby.showCreateSessionWorkoutPickerModal = false;
+      render();
+    });
+  }
+
+  const createSessionWorkoutPickerModalBackdrop = document.getElementById("createSessionWorkoutPickerModalBackdrop");
+  if (createSessionWorkoutPickerModalBackdrop) {
+    createSessionWorkoutPickerModalBackdrop.addEventListener("click", (event) => {
+      if (event.target !== createSessionWorkoutPickerModalBackdrop) return;
+      state.lobby.showCreateSessionWorkoutPickerModal = false;
+      render();
+    });
+  }
+
+  const createSessionWorkoutPickerTabTemplateBtn = document.getElementById("createSessionWorkoutPickerTabTemplateBtn");
+  if (createSessionWorkoutPickerTabTemplateBtn) {
+    createSessionWorkoutPickerTabTemplateBtn.addEventListener("click", () => {
+      if (state.lobby.createSessionWorkoutPickerTab === SAVED_WORKOUTS_TAB_TEMPLATE) return;
+      state.lobby.createSessionWorkoutPickerTab = SAVED_WORKOUTS_TAB_TEMPLATE;
+      state.lobby.createSessionWorkoutPickerPage = 1;
+      state.lobby.createSessionWorkoutPickerExpandedId = null;
+      render();
+    });
+  }
+
+  const createSessionWorkoutPickerTabCustomBtn = document.getElementById("createSessionWorkoutPickerTabCustomBtn");
+  if (createSessionWorkoutPickerTabCustomBtn) {
+    createSessionWorkoutPickerTabCustomBtn.addEventListener("click", () => {
+      if (state.lobby.createSessionWorkoutPickerTab === SAVED_WORKOUTS_TAB_CUSTOM) return;
+      state.lobby.createSessionWorkoutPickerTab = SAVED_WORKOUTS_TAB_CUSTOM;
+      state.lobby.createSessionWorkoutPickerPage = 1;
+      state.lobby.createSessionWorkoutPickerExpandedId = null;
+      render();
+    });
+  }
+
+  document.querySelectorAll("[data-create-session-workout-row-id]").forEach((rowEl) => {
+    const togglePreview = () => {
+      const workoutId = String(rowEl.getAttribute("data-create-session-workout-row-id") || "").trim();
+      if (!workoutId) return;
+      state.lobby.createSessionWorkoutPickerExpandedId =
+        state.lobby.createSessionWorkoutPickerExpandedId === workoutId ? null : workoutId;
+      render();
+    };
+    rowEl.addEventListener("click", (event) => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        (target.closest("button, input, select, textarea, a, label") || target.closest(".workout-tooltip-trigger"))
+      ) {
+        return;
+      }
+      togglePreview();
+    });
+    rowEl.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      togglePreview();
+    });
+  });
+
+  document.querySelectorAll("[data-create-session-workout-select-id]").forEach((selectBtn) => {
+    selectBtn.addEventListener("click", () => {
+      const workoutId = String(selectBtn.getAttribute("data-create-session-workout-select-id") || "").trim();
+      const workout = savedWorkouts.find((entry) => entry.id === workoutId);
+      if (!workout) {
+        showToast("Workout not found.");
+        return;
+      }
+      state.lobby.createSessionSelectedWorkoutId = workout.id;
+      state.lobby.createSessionWorkoutPickerExpandedId = workout.id;
+      state.lobby.showCreateSessionWorkoutPickerModal = false;
+      showToast(`${workout.name} selected as current workout.`);
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-remove-create-workout-step-index]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const index = Math.max(0, Math.round(Number(btn.getAttribute("data-remove-create-workout-step-index")) || 0));
+      const additionalIds = Array.isArray(state.lobby.createSessionAdditionalWorkoutIds)
+        ? state.lobby.createSessionAdditionalWorkoutIds
+        : [];
+      if (index >= additionalIds.length) return;
+      const nextAdditionalIds = additionalIds.slice();
+      nextAdditionalIds.splice(index, 1);
+      state.lobby.createSessionAdditionalWorkoutIds = nextAdditionalIds;
+      showToast("Workout step removed.");
+      render();
+    });
+  });
+
+  const createSessionWorkoutPickerPrevBtn = document.getElementById("createSessionWorkoutPickerPrevBtn");
+  if (createSessionWorkoutPickerPrevBtn) {
+    createSessionWorkoutPickerPrevBtn.addEventListener("click", () => {
+      state.lobby.createSessionWorkoutPickerPage = clampPage(
+        state.lobby.createSessionWorkoutPickerPage - 1,
+        createSessionWorkoutPickerPaginatedCustom.totalPages,
+      );
+      render();
+    });
+  }
+
+  const createSessionWorkoutPickerNextBtn = document.getElementById("createSessionWorkoutPickerNextBtn");
+  if (createSessionWorkoutPickerNextBtn) {
+    createSessionWorkoutPickerNextBtn.addEventListener("click", () => {
+      state.lobby.createSessionWorkoutPickerPage = clampPage(
+        state.lobby.createSessionWorkoutPickerPage + 1,
+        createSessionWorkoutPickerPaginatedCustom.totalPages,
+      );
+      render();
+    });
+  }
+
   const addBotDraftBtn = document.getElementById("addBotDraftBtn");
   if (addBotDraftBtn) {
     addBotDraftBtn.addEventListener("click", () => {
@@ -7638,6 +9565,81 @@ function renderLobby() {
     });
   }
 
+  const resolveCurrentCreateRouteSelection = () => {
+    const currentRouteMode = normalizeRouteSelectionMode(state.lobby.routeSelectionMode);
+    if (currentRouteMode === "generated") {
+      const confirmed = state.lobby.generatedRouteConfirmed ? ensureRoutePresetShape(state.lobby.generatedRouteConfirmed) : null;
+      if (!confirmed) {
+        return { ok: false, error: "Generate and confirm a route first." };
+      }
+      const activeDraft = state.lobby.generatedRouteDraft ? ensureRoutePresetShape(state.lobby.generatedRouteDraft) : null;
+      const previewDiffersFromConfirmed =
+        activeDraft &&
+        activeDraft.generatedAt &&
+        confirmed.generatedAt &&
+        activeDraft.generatedAt !== confirmed.generatedAt;
+      if (previewDiffersFromConfirmed) {
+        return { ok: false, error: "Confirm the latest generated route before using it." };
+      }
+      const settingsDrifted =
+        Math.abs((Number(confirmed.distanceKm) || 0) - normalizeGeneratedRouteDistanceKm(state.lobby.generatedRouteDistanceKm)) >= 0.01 ||
+        normalizeGeneratedHilliness(confirmed.hillinessPreset) !== normalizeGeneratedHilliness(state.lobby.generatedRouteHilliness);
+      if (settingsDrifted) {
+        return { ok: false, error: "Regenerate and confirm to match the current generated-route settings." };
+      }
+      const validation =
+        confirmed._validation ||
+        validateGeneratedRoute(confirmed, state.lobby.generatedRouteDistanceKm, state.lobby.generatedRouteHilliness);
+      if (!validation.valid) {
+        return { ok: false, error: validation.errors[0] || "Generated route is invalid. Regenerate and confirm again." };
+      }
+      return { ok: true, routePreset: confirmed };
+    }
+
+    const routeId = document.getElementById("createRoute")?.value || state.lobby.selectedRouteId || DEFAULT_ROUTE_PRESET.id;
+    state.lobby.selectedRouteId = routeId;
+    return { ok: true, routePreset: getRoutePresetById(routeId) };
+  };
+
+  const createRouteAddStepBtn = document.getElementById("createRouteAddStepBtn");
+  if (createRouteAddStepBtn) {
+    createRouteAddStepBtn.addEventListener("click", () => {
+      const resolved = resolveCurrentCreateRouteSelection();
+      if (!resolved.ok || !resolved.routePreset) {
+        showToast(resolved.error || "Could not add route step.");
+        return;
+      }
+      state.lobby.createSessionAdditionalRoutes = [
+        ...(Array.isArray(state.lobby.createSessionAdditionalRoutes) ? state.lobby.createSessionAdditionalRoutes : []),
+        cloneJson(resolved.routePreset),
+      ];
+      showToast(`${resolved.routePreset.name} added to route sequence.`);
+      render();
+    });
+  }
+
+  const createRouteClearStepsBtn = document.getElementById("createRouteClearStepsBtn");
+  if (createRouteClearStepsBtn) {
+    createRouteClearStepsBtn.addEventListener("click", () => {
+      state.lobby.createSessionAdditionalRoutes = [];
+      showToast("Route sequence reset to a single route.");
+      render();
+    });
+  }
+
+  document.querySelectorAll("[data-remove-create-route-step-index]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const removeIndex = Math.max(0, Math.round(Number(btn.getAttribute("data-remove-create-route-step-index")) || 0));
+      const currentRoutes = Array.isArray(state.lobby.createSessionAdditionalRoutes) ? state.lobby.createSessionAdditionalRoutes : [];
+      if (removeIndex >= currentRoutes.length) return;
+      const nextRoutes = currentRoutes.slice();
+      nextRoutes.splice(removeIndex, 1);
+      state.lobby.createSessionAdditionalRoutes = nextRoutes;
+      showToast("Route step removed.");
+      render();
+    });
+  });
+
   const createBtn = document.getElementById("createBtn");
   if (createBtn) {
     createBtn.addEventListener("click", () => {
@@ -7645,47 +9647,30 @@ function renderLobby() {
       const weight = Number(document.getElementById("createWeight").value.trim());
       const bikeId = normalizeBikeId(document.getElementById("createBike")?.value || state.lobby.selectedBikeId);
       state.lobby.selectedBikeId = bikeId;
-      const routeSelectionMode = normalizeRouteSelectionMode(state.lobby.routeSelectionMode);
-      let routePreset = null;
-      if (routeSelectionMode === "generated") {
-        const confirmed = state.lobby.generatedRouteConfirmed ? ensureRoutePresetShape(state.lobby.generatedRouteConfirmed) : null;
-        if (!confirmed) {
-          showToast("Generate and confirm a route first.");
-          return;
-        }
-        const activeDraft = state.lobby.generatedRouteDraft ? ensureRoutePresetShape(state.lobby.generatedRouteDraft) : null;
-        const previewDiffersFromConfirmed =
-          activeDraft &&
-          activeDraft.generatedAt &&
-          confirmed.generatedAt &&
-          activeDraft.generatedAt !== confirmed.generatedAt;
-        if (previewDiffersFromConfirmed) {
-          showToast("Confirm the latest generated route before creating the session.");
-          return;
-        }
-        const settingsDrifted =
-          Math.abs((Number(confirmed.distanceKm) || 0) - normalizeGeneratedRouteDistanceKm(state.lobby.generatedRouteDistanceKm)) >= 0.01 ||
-          normalizeGeneratedHilliness(confirmed.hillinessPreset) !== normalizeGeneratedHilliness(state.lobby.generatedRouteHilliness);
-        if (settingsDrifted) {
-          showToast("Regenerate and confirm to match the current generated-route settings.");
-          return;
-        }
-        const validation =
-          confirmed._validation ||
-          validateGeneratedRoute(confirmed, state.lobby.generatedRouteDistanceKm, state.lobby.generatedRouteHilliness);
-        if (!validation.valid) {
-          showToast(validation.errors[0] || "Generated route is invalid. Regenerate and confirm again.");
-          return;
-        }
-        routePreset = confirmed;
-      } else {
-        const routeId = document.getElementById("createRoute")?.value || state.lobby.selectedRouteId || DEFAULT_ROUTE_PRESET.id;
-        routePreset = getRoutePresetById(routeId);
-        state.lobby.selectedRouteId = routeId;
+      const resolvedCurrentRoute = resolveCurrentCreateRouteSelection();
+      if (!resolvedCurrentRoute.ok || !resolvedCurrentRoute.routePreset) {
+        showToast(resolvedCurrentRoute.error || "Select a valid route first.");
+        return;
       }
+
+      const additionalRoutes = Array.isArray(state.lobby.createSessionAdditionalRoutes) ? state.lobby.createSessionAdditionalRoutes : [];
+      const routePlanPresets = [resolvedCurrentRoute.routePreset, ...additionalRoutes];
       const accountProfile = getCurrentAccountProfile();
       const resolvedName = name || accountProfile?.displayName || "";
       const resolvedWeight = Number.isFinite(weight) ? weight : Number.isFinite(accountProfile?.weightKg) ? accountProfile.weightKg : null;
+      const selectedWorkoutForSession = state.lobby.createSessionSelectedWorkoutId
+        ? savedWorkouts.find((workout) => workout.id === state.lobby.createSessionSelectedWorkoutId) || null
+        : null;
+      const additionalWorkoutIdsForSession = Array.isArray(state.lobby.createSessionAdditionalWorkoutIds)
+        ? state.lobby.createSessionAdditionalWorkoutIds
+        : [];
+      const additionalWorkoutsForSession = additionalWorkoutIdsForSession
+        .map((workoutId) => savedWorkouts.find((workout) => workout.id === workoutId) || null)
+        .filter(Boolean);
+      const workoutSequenceForSession = [
+        ...additionalWorkoutsForSession,
+        ...(selectedWorkoutForSession ? [selectedWorkoutForSession] : []),
+      ];
       const user = createUser({
         id: state.account.userId,
         name: resolvedName,
@@ -7695,8 +9680,10 @@ function renderLobby() {
       });
       const session = createSession({
         hostUser: user,
-        routePreset,
+        routePreset: routePlanPresets[0],
+        routePlanPresets,
         botConfigs: normalizeBotDrafts(state.lobby.botDrafts),
+        workoutPlan: workoutSequenceForSession,
       });
       persistLocalSession(session.code, user.id);
       setUser(user);
@@ -7969,6 +9956,7 @@ function renderLobby() {
     const workoutId = existingWorkout?.id || `workout_${currentMs()}_${makeId(6).toLowerCase()}`;
     const workoutRecord = normalizeWorkoutRecord({
       id: workoutId,
+      source: WORKOUT_SOURCE_CUSTOM,
       name: validation.name,
       createdAt: existingWorkout?.createdAt || currentMs(),
       ftpReferenceWatts: workoutFtpWatts,
@@ -8633,6 +10621,8 @@ function renderLobby() {
   const workoutSegmentMinutesInput = document.getElementById("workoutSegmentMinutesInput");
   const workoutSegmentSecondsSelect = document.getElementById("workoutSegmentSecondsSelect");
   const workoutSegmentWattsInput = document.getElementById("workoutSegmentWattsInput");
+  const workoutSegmentCadenceToggle = document.getElementById("workoutSegmentCadenceToggle");
+  const workoutSegmentCadenceInput = document.getElementById("workoutSegmentCadenceInput");
   const applyWorkoutSegmentDurationFromInputs = () => {
     const currentSegments = normalizeWorkoutSegments(state.lobby.workoutDraftSegments);
     const selected = normalizeWorkoutSelection(state.lobby.workoutSelection, currentSegments);
@@ -8730,6 +10720,55 @@ function renderLobby() {
   };
   if (workoutSegmentWattsInput) {
     workoutSegmentWattsInput.addEventListener("change", applyWorkoutSegmentWattsFromInput);
+  }
+
+  const updateSelectedWorkoutSegmentCadence = (nextTargetCadenceRpm) => {
+    const currentSegments = normalizeWorkoutSegments(state.lobby.workoutDraftSegments);
+    const selected = normalizeWorkoutSelection(state.lobby.workoutSelection, currentSegments);
+    if (!selected || (selected.kind !== "segment" && selected.kind !== "set-segment")) return;
+    if (selected.kind === "segment") {
+      state.lobby.workoutDraftSegments = currentSegments.map((segment, segmentIndex) =>
+        segmentIndex === selected.index
+          ? {
+            ...segment,
+              targetCadenceRpm: nextTargetCadenceRpm,
+            }
+          : segment,
+      );
+    } else {
+      state.lobby.workoutDraftSegments = currentSegments.map((item, itemIndex) =>
+        itemIndex === selected.setIndex
+          ? {
+              ...item,
+              segments: item.segments.map((segment, segmentIndex) =>
+                segmentIndex === selected.segmentIndex
+                  ? {
+                      ...segment,
+                      targetCadenceRpm: nextTargetCadenceRpm,
+                    }
+                  : segment,
+              ),
+            }
+          : item,
+      );
+    }
+    render();
+  };
+  const applyWorkoutSegmentCadenceFromInput = () => {
+    const nextTargetCadenceRpm = normalizeWorkoutTargetCadenceRpm(workoutSegmentCadenceInput?.value, null);
+    updateSelectedWorkoutSegmentCadence(nextTargetCadenceRpm);
+  };
+  if (workoutSegmentCadenceToggle) {
+    workoutSegmentCadenceToggle.addEventListener("change", () => {
+      if (workoutSegmentCadenceToggle.checked) {
+        updateSelectedWorkoutSegmentCadence(85);
+        return;
+      }
+      updateSelectedWorkoutSegmentCadence(null);
+    });
+  }
+  if (workoutSegmentCadenceInput) {
+    workoutSegmentCadenceInput.addEventListener("change", applyWorkoutSegmentCadenceFromInput);
   }
 
   const applyWorkoutSetRepetitions = (setIndexInput, repetitionsInput) => {
@@ -8863,6 +10902,15 @@ function renderLobby() {
     });
   }
 
+  const savedWorkoutsFavoritesOnlyInput = document.getElementById("savedWorkoutsFavoritesOnlyInput");
+  if (savedWorkoutsFavoritesOnlyInput) {
+    savedWorkoutsFavoritesOnlyInput.addEventListener("change", () => {
+      state.lobby.savedWorkoutsFavoritesOnly = savedWorkoutsFavoritesOnlyInput.checked === true;
+      state.lobby.savedWorkoutsPage = 1;
+      render();
+    });
+  }
+
   document.querySelectorAll("[data-saved-workouts-filter-tag]").forEach((tagBtn) => {
     tagBtn.addEventListener("click", () => {
       const tag = normalizeWorkoutTag(tagBtn.getAttribute("data-saved-workouts-filter-tag"));
@@ -8880,11 +10928,59 @@ function renderLobby() {
     savedWorkoutsClearFiltersBtn.addEventListener("click", () => {
       state.lobby.savedWorkoutsMinDurationSeconds = 0;
       state.lobby.savedWorkoutsMinDifficulty = 0;
+      state.lobby.savedWorkoutsFavoritesOnly = false;
       state.lobby.savedWorkoutsFilterTags = [];
       state.lobby.savedWorkoutsPage = 1;
       render();
     });
   }
+
+  const savedWorkoutsTabTemplateBtn = document.getElementById("savedWorkoutsTabTemplateBtn");
+  if (savedWorkoutsTabTemplateBtn) {
+    savedWorkoutsTabTemplateBtn.addEventListener("click", () => {
+      if (state.lobby.savedWorkoutsActiveTab === SAVED_WORKOUTS_TAB_TEMPLATE) return;
+      state.lobby.savedWorkoutsActiveTab = SAVED_WORKOUTS_TAB_TEMPLATE;
+      state.lobby.savedWorkoutsPage = 1;
+      state.lobby.savedWorkoutsExpandedId = null;
+      render();
+    });
+  }
+
+  const savedWorkoutsTabCustomBtn = document.getElementById("savedWorkoutsTabCustomBtn");
+  if (savedWorkoutsTabCustomBtn) {
+    savedWorkoutsTabCustomBtn.addEventListener("click", () => {
+      if (state.lobby.savedWorkoutsActiveTab === SAVED_WORKOUTS_TAB_CUSTOM) return;
+      state.lobby.savedWorkoutsActiveTab = SAVED_WORKOUTS_TAB_CUSTOM;
+      state.lobby.savedWorkoutsPage = 1;
+      state.lobby.savedWorkoutsExpandedId = null;
+      render();
+    });
+  }
+
+  document.querySelectorAll("[data-workout-preview-row-id]").forEach((rowEl) => {
+    const toggleWorkoutPreview = () => {
+      const workoutId = String(rowEl.getAttribute("data-workout-preview-row-id") || "").trim();
+      if (!workoutId) return;
+      state.lobby.savedWorkoutsExpandedId =
+        state.lobby.savedWorkoutsExpandedId === workoutId ? null : workoutId;
+      render();
+    };
+    rowEl.addEventListener("click", (event) => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        (target.closest("button, input, select, textarea, a, label") || target.closest(".workout-tooltip-trigger"))
+      ) {
+        return;
+      }
+      toggleWorkoutPreview();
+    });
+    rowEl.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      toggleWorkoutPreview();
+    });
+  });
 
   document.querySelectorAll("[data-workout-load-id]").forEach((loadBtn) => {
     loadBtn.addEventListener("click", () => {
@@ -8894,13 +10990,52 @@ function renderLobby() {
         showToast("Workout not found.");
         return;
       }
-      state.lobby.workoutEditingId = workout.id;
+      const isTemplateWorkout = workout.source === WORKOUT_SOURCE_TEMPLATE;
+      state.lobby.workoutEditingId = isTemplateWorkout ? null : workout.id;
       state.lobby.workoutDraftName = workout.name;
       state.lobby.workoutDraftNotes = normalizeWorkoutNotes(workout.notes);
       state.lobby.workoutDraftTags = normalizeWorkoutTags(workout.tags);
       state.lobby.workoutDraftSegments = normalizeWorkoutSegments(workout.segments);
       state.lobby.workoutSelection = findFirstWorkoutSelection(state.lobby.workoutDraftSegments);
-      showToast(`Loaded ${workout.name}.`);
+      showToast(
+        isTemplateWorkout
+          ? `Viewing template ${workout.name}. Save to create a custom workout.`
+          : `Loaded ${workout.name}.`,
+      );
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-workout-copy-id]").forEach((copyBtn) => {
+    copyBtn.addEventListener("click", () => {
+      const workoutId = String(copyBtn.getAttribute("data-workout-copy-id") || "").trim();
+      const workout = savedWorkouts.find((entry) => entry.id === workoutId);
+      if (!workout || workout.source !== WORKOUT_SOURCE_TEMPLATE) {
+        showToast("Template workout not found.");
+        return;
+      }
+      const existingCustomWorkouts = loadWorkouts();
+      const copyName = buildWorkoutCopyName(workout.name, existingCustomWorkouts.map((entry) => entry.name));
+      const workoutCopy = normalizeWorkoutRecord({
+        id: `workout_${currentMs()}_${makeId(6).toLowerCase()}`,
+        source: WORKOUT_SOURCE_CUSTOM,
+        name: copyName,
+        createdAt: currentMs(),
+        ftpReferenceWatts: normalizeWorkoutFtpWatts(workout.ftpReferenceWatts, WORKOUT_DEFAULT_FTP_WATTS),
+        notes: normalizeWorkoutNotes(workout.notes),
+        isFavorite: false,
+        rating: null,
+        tags: normalizeWorkoutTags(workout.tags),
+        segments: normalizeWorkoutSegments(workout.segments),
+      });
+      saveWorkouts([workoutCopy, ...existingCustomWorkouts]);
+      state.lobby.workoutEditingId = workoutCopy.id;
+      state.lobby.workoutDraftName = workoutCopy.name;
+      state.lobby.workoutDraftNotes = normalizeWorkoutNotes(workoutCopy.notes);
+      state.lobby.workoutDraftTags = normalizeWorkoutTags(workoutCopy.tags);
+      state.lobby.workoutDraftSegments = normalizeWorkoutSegments(workoutCopy.segments);
+      state.lobby.workoutSelection = findFirstWorkoutSelection(state.lobby.workoutDraftSegments);
+      showToast(`${workout.name} copied to ${workoutCopy.name}.`);
       render();
     });
   });
@@ -8967,15 +11102,25 @@ function renderLobby() {
         showToast("Select a rating from 1 to 5.");
         return;
       }
-      const nextWorkouts = savedWorkouts.map((entry) =>
-        entry.id === workout.id
-          ? normalizeWorkoutRecord({
-              ...entry,
-              rating: selectedRating,
-            })
-          : entry,
-      );
-      saveWorkouts(nextWorkouts);
+      if (workout.source === WORKOUT_SOURCE_TEMPLATE) {
+        const templateMeta = loadWorkoutTemplateMeta();
+        templateMeta[workout.id] = normalizeWorkoutTemplateMetaRecord({
+          ...templateMeta[workout.id],
+          rating: selectedRating,
+        });
+        saveWorkoutTemplateMeta(templateMeta);
+      } else {
+        const nextWorkouts = customSavedWorkouts.map((entry) =>
+          entry.id === workout.id
+            ? normalizeWorkoutRecord({
+                ...entry,
+                source: WORKOUT_SOURCE_CUSTOM,
+                rating: selectedRating,
+              })
+            : entry,
+        );
+        saveWorkouts(nextWorkouts);
+      }
       state.lobby.workoutRatingModal = null;
       showToast(`${workout.name} rated ${selectedRating}/5.`);
       render();
@@ -8991,15 +11136,25 @@ function renderLobby() {
         return;
       }
       const nextFavoriteValue = !normalizeWorkoutFavorite(workout.isFavorite);
-      const nextWorkouts = savedWorkouts.map((entry) =>
-        entry.id === workoutId
-          ? normalizeWorkoutRecord({
-              ...entry,
-              isFavorite: nextFavoriteValue,
-            })
-          : entry,
-      );
-      saveWorkouts(nextWorkouts);
+      if (workout.source === WORKOUT_SOURCE_TEMPLATE) {
+        const templateMeta = loadWorkoutTemplateMeta();
+        templateMeta[workout.id] = normalizeWorkoutTemplateMetaRecord({
+          ...templateMeta[workout.id],
+          isFavorite: nextFavoriteValue,
+        });
+        saveWorkoutTemplateMeta(templateMeta);
+      } else {
+        const nextWorkouts = customSavedWorkouts.map((entry) =>
+          entry.id === workoutId
+            ? normalizeWorkoutRecord({
+                ...entry,
+                source: WORKOUT_SOURCE_CUSTOM,
+                isFavorite: nextFavoriteValue,
+              })
+            : entry,
+        );
+        saveWorkouts(nextWorkouts);
+      }
       showToast(nextFavoriteValue ? `${workout.name} favorited.` : `${workout.name} unfavorited.`);
       render();
     });
@@ -9011,6 +11166,10 @@ function renderLobby() {
       const workout = savedWorkouts.find((entry) => entry.id === workoutId);
       if (!workout) {
         showToast("Workout not found.");
+        return;
+      }
+      if (workout.source === WORKOUT_SOURCE_TEMPLATE) {
+        showToast("Template notes are read-only.");
         return;
       }
       state.lobby.savedWorkoutNotesView = {
@@ -9035,7 +11194,7 @@ function renderLobby() {
     savedWorkoutNotesSaveBtn.addEventListener("click", () => {
       const modalState = state.lobby.savedWorkoutNotesView;
       if (!modalState) return;
-      const workout = savedWorkouts.find((entry) => entry.id === modalState.workoutId);
+      const workout = customSavedWorkouts.find((entry) => entry.id === modalState.workoutId);
       if (!workout) {
         showToast("Workout not found.");
         state.lobby.savedWorkoutNotesView = null;
@@ -9044,10 +11203,11 @@ function renderLobby() {
       }
       const nextNotesInput = document.getElementById("savedWorkoutNotesText")?.value ?? "";
       const nextNotes = normalizeWorkoutNotes(nextNotesInput);
-      const nextWorkouts = savedWorkouts.map((entry) =>
+      const nextWorkouts = customSavedWorkouts.map((entry) =>
         entry.id === workout.id
           ? normalizeWorkoutRecord({
               ...entry,
+              source: WORKOUT_SOURCE_CUSTOM,
               notes: nextNotes,
             })
           : entry,
@@ -9074,7 +11234,7 @@ function renderLobby() {
   document.querySelectorAll("[data-workout-delete-id]").forEach((deleteBtn) => {
     deleteBtn.addEventListener("click", () => {
       const workoutId = String(deleteBtn.getAttribute("data-workout-delete-id") || "").trim();
-      const workout = savedWorkouts.find((entry) => entry.id === workoutId);
+      const workout = customSavedWorkouts.find((entry) => entry.id === workoutId);
       if (!workout) {
         showToast("Workout not found.");
         return;
@@ -9110,14 +11270,14 @@ function renderLobby() {
       const modalState = state.lobby.workoutDeleteModal;
       if (!modalState) return;
       const workoutId = String(modalState.workoutId || "").trim();
-      const workout = savedWorkouts.find((entry) => entry.id === workoutId);
+      const workout = customSavedWorkouts.find((entry) => entry.id === workoutId);
       if (!workout) {
         showToast("Workout not found.");
         state.lobby.workoutDeleteModal = null;
         render();
         return;
       }
-      const nextWorkouts = savedWorkouts.filter((entry) => entry.id !== workoutId);
+      const nextWorkouts = customSavedWorkouts.filter((entry) => entry.id !== workoutId);
       saveWorkouts(nextWorkouts);
       if (state.lobby.workoutEditingId === workoutId) {
         state.lobby.workoutEditingId = null;
@@ -9247,6 +11407,7 @@ function renderSession() {
 
   const now = currentMs();
   const startedAt = session.startedAt;
+  const hasSessionStarted = Boolean(startedAt);
   const durationSec = startedAt ? Math.round((now - startedAt) / 1000) : 0;
   const timerLabel = startedAt ? formatDuration(durationSec) : "00:00";
 
@@ -9294,20 +11455,205 @@ function renderSession() {
     })
     .sort((a, b) => b.distance - a.distance);
   const currentRider = rows.find((row) => row.id === user.id) || rows[0] || null;
+  const localTelemetryRow = rows.find((row) => row.id === user.id) || currentRider || null;
   const currentDistanceMeters = currentRider ? currentRider.distance : 0;
   const sessionRoute = getSessionRoute(session);
-  const routeDistanceMeters = normalizeCourseDistance(currentDistanceMeters, courseSegments);
-  const currentElevationMeters = getElevationAtDistance(sessionRoute, routeDistanceMeters);
-  const next500mGradient = getAverageGradientAhead(sessionRoute, routeDistanceMeters, 500);
-  const remainingDistanceMeters = getRemainingDistance(sessionRoute, routeDistanceMeters);
-  const remainingClimbMeters = getRemainingClimb(sessionRoute, routeDistanceMeters);
-  const routeDistanceKm = Number.isFinite(Number(sessionRoute.distanceKm))
-    ? Number(sessionRoute.distanceKm)
-    : (Number(sessionRoute.totalDistanceMeters) || 0) / 1000;
-  const routeProfile = buildRouteProfileFromSegments(courseSegments);
+  const sessionRoutePosition = getSessionRoutePosition(session, currentDistanceMeters);
+  const sessionRouteSequence = sessionRoutePosition.sequence;
+  const activeRouteEntry = sessionRoutePosition.currentEntry;
+  const nextRouteEntry = sessionRoutePosition.nextEntry;
+  const activeSessionRoute = activeRouteEntry?.route || sessionRoute;
+  const activeRouteSegments =
+    Array.isArray(activeSessionRoute.segments) && activeSessionRoute.segments.length > 0
+      ? activeSessionRoute.segments
+      : courseSegments;
+  const routeDistanceMeters =
+    activeRouteEntry && Number.isFinite(Number(sessionRoutePosition.routeDistanceMeters))
+      ? Number(sessionRoutePosition.routeDistanceMeters)
+      : normalizeCourseDistance(currentDistanceMeters, activeRouteSegments);
+  const activeRouteLengthMeters = Math.max(
+    1,
+    Number(activeRouteEntry?.lengthMeters) || Number(activeSessionRoute.totalDistanceMeters) || getCourseLengthMeters(activeRouteSegments),
+  );
+  const currentElevationMeters = getElevationAtDistance(activeSessionRoute, routeDistanceMeters);
+  const next500mGradient = getAverageGradientAhead(activeSessionRoute, routeDistanceMeters, 500);
+  const remainingDistanceMeters = getRemainingDistance(activeSessionRoute, routeDistanceMeters);
+  const remainingClimbMeters = getRemainingClimb(activeSessionRoute, routeDistanceMeters);
+  const routeDistanceKm = Number.isFinite(Number(activeSessionRoute.distanceKm))
+    ? Number(activeSessionRoute.distanceKm)
+    : activeRouteLengthMeters / 1000;
+  const routeSequenceLabel =
+    sessionRouteSequence.routeCount > 1 && activeRouteEntry
+      ? `Route ${activeRouteEntry.index + 1} of ${sessionRouteSequence.routeCount}`
+      : "Single route";
+  const nextRouteLabel = nextRouteEntry
+    ? `${nextRouteEntry.route.name || `Route ${nextRouteEntry.index + 1}`} (${(Math.max(1, nextRouteEntry.lengthMeters) / 1000).toFixed(1)} km)`
+    : "None";
+  const accountProfile = getCurrentAccountProfile();
+  const currentFtpWatts = getUserFtp(accountProfile);
+  const effortSeismographFtpWatts = normalizeWorkoutFtpWatts(currentFtpWatts, WORKOUT_DEFAULT_FTP_WATTS);
+  const effortSeismographContext = ensureEffortSeismographContext(session, user);
+  const effortSeismographFrames = Array.isArray(effortSeismographContext?.frames) ? effortSeismographContext.frames : [];
+  const effortSeismographHtml = buildEffortSeismographHtml(effortSeismographFrames, effortSeismographFtpWatts);
+  const sessionWorkoutPlan = buildSessionWorkoutPlan(session.workoutPlan);
+  const sessionWorkoutDifficulty = sessionWorkoutPlan
+    ? calculateWorkoutDifficulty(
+        sessionWorkoutPlan.segments,
+        normalizeWorkoutFtpWatts(sessionWorkoutPlan.ftpReferenceWatts, WORKOUT_DEFAULT_FTP_WATTS),
+      )
+    : null;
+  const sessionWorkoutSummaryText = sessionWorkoutPlan
+    ? `${sessionWorkoutPlan.name} • ${sessionWorkoutDifficulty}/10 • ${formatDuration(sessionWorkoutPlan.totalDurationSeconds)}`
+    : "None selected";
+  const trainerErgState = state.devices.trainer?.erg || createDefaultTrainerErgState();
+  const ergAvailability = getTrainerErgAvailability(state.devices.trainer);
+  const ergState = trainerErgState.state || ERG_STATE_UNAVAILABLE;
+  const ergStatusLabelMap = {
+    [ERG_STATE_UNAVAILABLE]: "Unavailable",
+    [ERG_STATE_AVAILABLE]: "Available",
+    [ERG_STATE_ENABLING]: "Enabling",
+    [ERG_STATE_ACTIVE]: "Active",
+    [ERG_STATE_INTERRUPTED]: "Interrupted",
+    [ERG_STATE_ERROR]: "Error",
+    [ERG_STATE_DISABLED]: "Off",
+  };
+  const ergToggleDisabled = !ergAvailability.available && trainerErgState.desiredEnabled !== true;
+  const ergToggleLabel = trainerErgState.desiredEnabled ? "Turn ERG Off" : "Turn ERG On";
+  const ergStatusLabel = ergStatusLabelMap[ergState] || "Unavailable";
+  const ergStatusDetail =
+    trainerErgState.error ||
+    trainerErgState.unsupportedReason ||
+    (trainerErgState.telemetryStale ? "Trainer telemetry is stale." : ergAvailability.reason) ||
+    "Ready";
+  const ergTargetWattsText = Number.isFinite(Number(trainerErgState.currentTargetWatts))
+    ? `${Math.round(trainerErgState.currentTargetWatts)} W`
+    : "--";
+  const ergActualWattsText =
+    localTelemetryRow && Number.isFinite(Number(localTelemetryRow.power)) && Number(localTelemetryRow.power) > 0
+      ? `${Math.round(Number(localTelemetryRow.power))} W`
+      : "--";
+  const ergCadenceText =
+    localTelemetryRow && Number.isFinite(Number(localTelemetryRow.cadence)) && Number(localTelemetryRow.cadence) > 0
+      ? `${Math.round(Number(localTelemetryRow.cadence))} rpm`
+      : "--";
+  const trainerConnectionLabel = state.devices.trainer.connected ? "Connected" : "Disconnected";
+  const sessionWorkoutPlayback = sessionWorkoutPlan
+    ? buildWorkoutPlaybackTimeline(sessionWorkoutPlan.segments, sessionWorkoutPlan.ftpReferenceWatts)
+    : { entries: [], totalDurationSeconds: 0 };
+  const sessionWorkoutEntries = sessionWorkoutPlayback.entries;
+  const sessionWorkoutTotalDurationSeconds = sessionWorkoutPlayback.totalDurationSeconds;
+  const sessionWorkoutElapsedSecondsRaw = hasSessionStarted ? Math.max(0, durationSec) : 0;
+  const sessionWorkoutElapsedSeconds = Math.min(sessionWorkoutElapsedSecondsRaw, sessionWorkoutTotalDurationSeconds);
+  const sessionWorkoutRemainingSeconds = Math.max(0, sessionWorkoutTotalDurationSeconds - sessionWorkoutElapsedSeconds);
+  const sessionWorkoutCompletedSegments = sessionWorkoutEntries.filter((entry) => sessionWorkoutElapsedSeconds >= entry.endSeconds).length;
+  const sessionWorkoutCurrentEntry = sessionWorkoutEntries.find(
+    (entry) => sessionWorkoutElapsedSeconds >= entry.startSeconds && sessionWorkoutElapsedSeconds < entry.endSeconds,
+  );
+  const sessionWorkoutDisplayEntry = hasSessionStarted ? sessionWorkoutCurrentEntry || null : sessionWorkoutEntries[0] || null;
+  const sessionWorkoutCurrentSegmentRemainingSeconds = sessionWorkoutCurrentEntry
+    ? Math.max(0, sessionWorkoutCurrentEntry.endSeconds - sessionWorkoutElapsedSeconds)
+    : 0;
+  const sessionWorkoutProgressPct =
+    sessionWorkoutTotalDurationSeconds > 0
+      ? clamp((sessionWorkoutElapsedSeconds / sessionWorkoutTotalDurationSeconds) * 100, 0, 100)
+      : 0;
+  const sessionWorkoutStatusText =
+    sessionWorkoutEntries.length === 0
+      ? "No workout steps available."
+      : !hasSessionStarted
+        ? "Workout timeline is armed and will begin when the session starts."
+        : sessionWorkoutCurrentEntry
+          ? `Current step: ${sessionWorkoutCurrentEntry.label}`
+          : "Workout complete.";
+  const sessionWorkoutTimelineHtml = sessionWorkoutPlan
+    ? (() => {
+        if (sessionWorkoutEntries.length === 0) return `<div class="small">No segments in this workout.</div>`;
+        const previewBlocksHtml = sessionWorkoutEntries
+          .map((entry) => {
+            const widthPercent = Math.max(0.8, (entry.durationSeconds / Math.max(1, sessionWorkoutTotalDurationSeconds)) * 100);
+            const isComplete = hasSessionStarted && sessionWorkoutElapsedSeconds >= entry.endSeconds;
+            const isActive = hasSessionStarted && sessionWorkoutElapsedSeconds >= entry.startSeconds && sessionWorkoutElapsedSeconds < entry.endSeconds;
+            const cadenceLabel = entry.targetCadenceRpm != null ? `${entry.targetCadenceRpm} rpm cadence` : "No cadence target";
+            const tooltip = `${entry.label}: Z${entry.zone}, ${entry.targetWatts} W, ${cadenceLabel}, ${formatDuration(entry.durationSeconds)}`;
+            return `
+              <div
+                class="workout-preview-block workout-tooltip-trigger ${getWorkoutEffortClass(entry.zone)} ${isComplete ? "is-complete" : ""} ${isActive ? "is-active" : ""}"
+                style="width:${widthPercent.toFixed(4)}%; flex-basis:${widthPercent.toFixed(4)}%;"
+                data-tooltip="${escapeHtml(tooltip)}"
+              ><span class="workout-preview-watts-label">${entry.targetWatts}W</span></div>
+            `;
+          })
+          .join("");
+        return `<div class="workout-preview-track">${previewBlocksHtml}</div>`;
+      })()
+    : "";
+  const sessionWorkoutTimelineCardHtml = sessionWorkoutPlan
+    ? `
+      <div class="elevation-profile-card workout-progress-card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">Workout Timeline</h2>
+        <div class="small">${escapeHtml(sessionWorkoutSummaryText)}</div>
+        <div class="workout-progress-grid" style="margin-top:10px;">
+          <div>
+            <div class="small">Workout Countdown</div>
+            <div class="code">${formatDuration(sessionWorkoutRemainingSeconds)}</div>
+          </div>
+          <div>
+            <div class="small">${hasSessionStarted ? "Current Step" : "First Step"}</div>
+            <div class="code">${escapeHtml(sessionWorkoutDisplayEntry ? sessionWorkoutDisplayEntry.label : "Complete")}</div>
+          </div>
+          <div>
+            <div class="small">Step Remaining</div>
+            <div class="code">${
+              hasSessionStarted
+                ? sessionWorkoutCurrentEntry
+                  ? formatDuration(sessionWorkoutCurrentSegmentRemainingSeconds)
+                  : "00:00"
+                : sessionWorkoutDisplayEntry
+                  ? formatDuration(sessionWorkoutDisplayEntry.durationSeconds)
+                  : "--:--"
+            }</div>
+          </div>
+          <div>
+            <div class="small">Steps Complete</div>
+            <div class="code">${sessionWorkoutCompletedSegments}/${sessionWorkoutEntries.length}</div>
+          </div>
+        </div>
+        <div class="workout-progress-bar" style="margin-top:10px;">
+          <div class="workout-progress-bar-fill" style="width:${sessionWorkoutProgressPct.toFixed(2)}%;"></div>
+        </div>
+        <div class="small" style="margin-top:6px;">Elapsed ${formatDuration(sessionWorkoutElapsedSeconds)} of ${formatDuration(sessionWorkoutTotalDurationSeconds)} (${Math.round(
+          sessionWorkoutProgressPct,
+        )}%)</div>
+        <div class="small" style="margin-top:2px;">${escapeHtml(sessionWorkoutStatusText)}</div>
+        <div style="margin-top:10px;">${sessionWorkoutTimelineHtml}</div>
+        <div style="margin-top:14px;">
+          <h2 style="margin-bottom:8px;">Effort Seismograph</h2>
+          ${effortSeismographHtml}
+        </div>
+      </div>
+    `
+    : "";
+  const sessionErgControlCardHtml = `
+    <div class="card" style="margin-top:12px;">
+      <h2 style="margin-bottom:8px;">ERG Mode</h2>
+      <div class="flex-space" style="gap:10px; flex-wrap:wrap;">
+        <div>
+          <div class="small">Status</div>
+          <div class="code">${escapeHtml(ergStatusLabel)}</div>
+        </div>
+        <div class="flex" style="gap:8px; align-items:center; flex-wrap:wrap;">
+          <div class="small">Target ${ergTargetWattsText} · Actual ${ergActualWattsText} · Cadence ${ergCadenceText}</div>
+          <button id="ergToggleBtn" class="secondary" ${ergToggleDisabled ? "disabled" : ""}>${ergToggleLabel}</button>
+        </div>
+      </div>
+      <div class="small" style="margin-top:6px;">Trainer: ${trainerConnectionLabel}</div>
+      <div class="small" style="margin-top:2px;">${escapeHtml(ergStatusDetail)}</div>
+    </div>
+  `;
+  const routeProfile = buildRouteProfileFromSegments(activeRouteSegments);
   const elevationProfileHtml = renderElevationProfile({
     routeProfile,
-    distanceTraveledMeters: currentDistanceMeters,
+    distanceTraveledMeters: routeDistanceMeters,
     width: 560,
     height: 120,
   });
@@ -9333,14 +11679,14 @@ function renderSession() {
   const nextGradeText = formatSignedPercent(terrain.nextGrade, 1);
   const distanceToNextText =
     terrain.distanceToNext == null || Number.isNaN(terrain.distanceToNext) ? "--" : `${Math.max(0, Math.round(terrain.distanceToNext))}m`;
-  const routeLength = getCourseLengthMeters(courseSegments);
-  const routeDistanceText = `${Math.round(terrain.routeDistance || 0)}m / ${Math.round(routeLength)}m`;
+  const routeDistanceText = `${Math.round(routeDistanceMeters)}m / ${Math.round(activeRouteLengthMeters)}m`;
   const sessionClimbedText = formatClimbedMeters(session.totalClimbedMeters || 0);
   const privateRiderStats = getPrivateRiderStatsSnapshot(session, user);
   const sessionAvgWattsText = Number.isFinite(privateRiderStats.avgWatts) ? `${Math.round(privateRiderStats.avgWatts)} W` : "--";
   const privateSpeedText = formatSpeedMpsAsKph(privateRiderStats.speedMps);
-  const accountProfile = getCurrentAccountProfile();
-  const currentFtpWatts = getUserFtp(accountProfile);
+  const cadenceRpm = Number(localTelemetryRow?.cadence);
+  const cadenceText = Number.isFinite(cadenceRpm) && cadenceRpm > 0 ? `${Math.round(cadenceRpm)} rpm` : "--";
+  const cadenceSourceText = state.devices.trainer.connected ? "Trainer cadence" : "Mock cadence";
   const pendingFtpProposal = getPendingFtpProposal(session, user);
   const currentBike = getBikeById(user.bikeId);
   const sessionBikeOptionsHtml = buildBikeOptionsHtml(currentBike.id);
@@ -9424,7 +11770,11 @@ function renderSession() {
         <div>
           <h2>Session <span class="code">${session.code}</span></h2>
           <div class="small">${session.users ? Object.keys(session.users).length : 0} rider(s)</div>
-          <div class="small">${escapeHtml(sessionRoute.name || "Route")} (${escapeHtml(sessionRoute.country || "Unknown")}) • ${routeDistanceKm.toFixed(1)} km</div>
+          <div class="small">${escapeHtml(activeSessionRoute.name || "Route")} (${escapeHtml(activeSessionRoute.country || "Unknown")}) • ${routeDistanceKm.toFixed(
+            1,
+          )} km • ${escapeHtml(routeSequenceLabel)}</div>
+          <div class="small">Next route: ${escapeHtml(nextRouteLabel)}</div>
+          <div class="small">Workout: ${escapeHtml(sessionWorkoutSummaryText)}</div>
         </div>
         <div class="flex" style="align-items:center; gap:12px;">
           <div class="small">Timer</div>
@@ -9494,16 +11844,21 @@ function renderSession() {
         <div class="small" style="margin-top:2px;">Trainer control: ${escapeHtml(terrain.trainerControlStatus || "--")}</div>
       </div>
 
+      ${sessionErgControlCardHtml}
+
       <div class="elevation-profile-card" style="margin-top:12px;">
         <h2 style="margin-bottom:8px;">Session Side-Scroller (Prototype)</h2>
         <div class="small">Local rider is centered. Riders ahead are right, behind are left.</div>
         <div id="sessionSideScrollMount">${sideScrollRaceViewHtml}</div>
       </div>
 
+      ${sessionWorkoutTimelineCardHtml}
+
       <div class="elevation-profile-card" style="margin-top:12px;">
         <h2 style="margin-bottom:8px;">Route Side View</h2>
-        <div class="small">Live progress along the route elevation profile.</div>
+        <div class="small">Live progress along the current route profile.</div>
         ${elevationProfileHtml}
+        <div class="small" style="margin-top:8px;">Next route: ${escapeHtml(nextRouteLabel)}</div>
       </div>
 
       <div class="card private-rider-stats-card" style="margin-top:12px;">
@@ -9517,6 +11872,11 @@ function renderSession() {
           <div style="flex:1;min-width:180px;">
             <label class="label">Current speed</label>
             <div class="code">${privateSpeedText}</div>
+          </div>
+          <div style="flex:1;min-width:180px;">
+            <label class="label">Current cadence</label>
+            <div class="code">${cadenceText}</div>
+            <div class="small" style="margin-top:4px;">${cadenceSourceText}</div>
           </div>
         </div>
         <table class="table" style="margin-top:12px;">
@@ -9552,6 +11912,9 @@ function renderSession() {
         <div class="small" style="margin-top:2px;">Cons: ${escapeHtml(currentBike.cons)}</div>
       </div>
 
+      ${
+        hasSessionStarted
+          ? `
       <div class="card powerup-card" style="margin-top:12px;">
         <h2 style="margin-bottom:8px;">Power-Ups</h2>
         <div class="small">Gain 1 BOOST every ${Math.round(POWER_UP_GRANT_DISTANCE_METERS / 1000)} km. Queue is FIFO (left slot is used first).</div>
@@ -9577,6 +11940,9 @@ function renderSession() {
           ${renderTelemetryZoneRows(zoneParticipants)}
         </div>
       </div>
+      `
+          : ""
+      }
 
       <table class="table" style="margin-top: 16px;">
         <thead>
@@ -9750,6 +12116,17 @@ function renderSession() {
         };
       });
       showToast(`${getBikeById(nextBikeId).name} selected.`);
+    });
+  }
+
+  const ergToggleBtn = document.getElementById("ergToggleBtn");
+  if (ergToggleBtn) {
+    ergToggleBtn.addEventListener("click", async () => {
+      const enableErg = !(state.devices.trainer?.erg?.desiredEnabled === true);
+      ergToggleBtn.disabled = true;
+      await setErgModeEnabled(enableErg, { reason: "session-ui-toggle", showToasts: true });
+      updateTerrainState({ trainerControlStatus: getTrainerControlStatusText() });
+      render();
     });
   }
 

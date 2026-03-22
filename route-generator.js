@@ -31,6 +31,14 @@
       supportMax: 4.5,
       targetAscentPerKmMin: 6,
       targetAscentPerKmMax: 18,
+      flatRangeMin: -1.0,
+      flatRangeMax: 1.0,
+      flatTargetMin: -0.35,
+      flatTargetMax: 0.65,
+      flatShareMin: 0.42,
+      flatSegmentShareMin: 0.2,
+      longRouteFlatShareBonusMax: 0.1,
+      longRouteFlatSegmentBonusMax: 0.05,
     }),
     rolling: Object.freeze({
       key: "rolling",
@@ -51,6 +59,14 @@
       supportMax: 5.8,
       targetAscentPerKmMin: 18,
       targetAscentPerKmMax: 44,
+      flatRangeMin: -1.2,
+      flatRangeMax: 1.2,
+      flatTargetMin: -0.6,
+      flatTargetMax: 0.8,
+      flatShareMin: 0.18,
+      flatSegmentShareMin: 0.14,
+      longRouteFlatShareBonusMax: 0.14,
+      longRouteFlatSegmentBonusMax: 0.08,
     }),
     hilly: Object.freeze({
       key: "hilly",
@@ -71,6 +87,14 @@
       supportMax: 8,
       targetAscentPerKmMin: 32,
       targetAscentPerKmMax: 72,
+      flatRangeMin: -1.2,
+      flatRangeMax: 1.2,
+      flatTargetMin: -0.5,
+      flatTargetMax: 0.8,
+      flatShareMin: 0.14,
+      flatSegmentShareMin: 0.12,
+      longRouteFlatShareBonusMax: 0.14,
+      longRouteFlatSegmentBonusMax: 0.08,
     }),
     climbing: Object.freeze({
       key: "climbing",
@@ -91,6 +115,14 @@
       supportMax: 12,
       targetAscentPerKmMin: 52,
       targetAscentPerKmMax: 130,
+      flatRangeMin: -1.1,
+      flatRangeMax: 1.1,
+      flatTargetMin: -0.25,
+      flatTargetMax: 0.9,
+      flatShareMin: 0.1,
+      flatSegmentShareMin: 0.1,
+      longRouteFlatShareBonusMax: 0.1,
+      longRouteFlatSegmentBonusMax: 0.06,
     }),
   });
 
@@ -317,7 +349,121 @@
     return smoothed.map((grade) => clamp(grade, preset.supportMin, preset.supportMax));
   }
 
-  function finalizeGrades(segmentLengths, rawGrades, preset) {
+  function isFlatGrade(gradeInput, preset) {
+    const grade = Number(gradeInput) || 0;
+    return grade >= preset.flatRangeMin && grade <= preset.flatRangeMax;
+  }
+
+  function computeFlatCoverage(segmentLengths, grades, preset) {
+    const totalDistance = Math.max(1, sum(segmentLengths));
+    let flatDistance = 0;
+    let flatCount = 0;
+    for (let i = 0; i < grades.length; i += 1) {
+      if (!isFlatGrade(grades[i], preset)) continue;
+      flatCount += 1;
+      flatDistance += Number(segmentLengths[i]) || 0;
+    }
+    return {
+      totalDistance,
+      flatDistance,
+      flatCount,
+      flatShare: flatDistance / totalDistance,
+    };
+  }
+
+  function chooseFlatTargetGrade(preset, rng) {
+    return Number(randomRange(preset.flatTargetMin, preset.flatTargetMax, rng).toFixed(2));
+  }
+
+  function resolveFlatCoverageTargets(preset, totalDistanceMetersInput) {
+    const totalDistanceMeters = Math.max(0, Number(totalDistanceMetersInput) || 0);
+    const distanceKm = totalDistanceMeters / 1000;
+    const longRouteProgress = clamp((distanceKm - 10) / 30, 0, 1); // Starts increasing >10km, maxes at ~40km.
+    const baseFlatShare = clamp(Number(preset.flatShareMin) || 0, 0, 0.9);
+    const baseFlatSegmentShare = clamp(Number(preset.flatSegmentShareMin) || 0, 0, 0.9);
+    const longRouteFlatShareBonusMax = Math.max(0, Number(preset.longRouteFlatShareBonusMax) || 0);
+    const longRouteFlatSegmentBonusMax = Math.max(0, Number(preset.longRouteFlatSegmentBonusMax) || 0);
+    const requiredFlatShare = clamp(baseFlatShare + longRouteFlatShareBonusMax * longRouteProgress, 0, 0.95);
+    const requiredFlatSegmentShare = clamp(baseFlatSegmentShare + longRouteFlatSegmentBonusMax * longRouteProgress, 0, 0.95);
+    return {
+      requiredFlatShare,
+      requiredFlatSegmentShare,
+      longRouteProgress,
+    };
+  }
+
+  function injectFlatSections(segmentLengths, gradesInput, preset, rng) {
+    const grades = gradesInput.slice();
+    if (grades.length === 0) return grades;
+    const flatTargets = resolveFlatCoverageTargets(preset, sum(segmentLengths));
+    const requiredFlatShare = flatTargets.requiredFlatShare;
+    const requiredFlatSegmentShare = flatTargets.requiredFlatSegmentShare;
+    const requiredFlatSegments = Math.min(
+      grades.length,
+      Math.max(1, Math.round(grades.length * requiredFlatSegmentShare)),
+    );
+    const coverageGoalDistance = Math.max(0, sum(segmentLengths) * requiredFlatShare);
+    const flatIndices = [];
+    for (let i = 0; i < grades.length; i += 1) {
+      if (isFlatGrade(grades[i], preset)) flatIndices.push(i);
+    }
+
+    let coverage = computeFlatCoverage(segmentLengths, grades, preset);
+    if (coverage.flatDistance >= coverageGoalDistance && coverage.flatCount >= requiredFlatSegments) {
+      return grades;
+    }
+
+    const sortedCandidates = grades
+      .map((grade, index) => ({
+        index,
+        absGrade: Math.abs(Number(grade) || 0),
+        distance: Number(segmentLengths[index]) || 0,
+      }))
+      .sort((a, b) => {
+        if (a.absGrade !== b.absGrade) return a.absGrade - b.absGrade;
+        return b.distance - a.distance;
+      });
+
+    const isNearFlatNeighbor = (index) => flatIndices.some((existing) => Math.abs(existing - index) <= 1);
+
+    for (const candidate of sortedCandidates) {
+      if (coverage.flatDistance >= coverageGoalDistance && coverage.flatCount >= requiredFlatSegments) {
+        break;
+      }
+      const index = candidate.index;
+      if (isFlatGrade(grades[index], preset)) continue;
+
+      const needsDistance = coverage.flatDistance < coverageGoalDistance - 1e-6;
+      const needsCount = coverage.flatCount < requiredFlatSegments;
+      if (!needsDistance && !needsCount) break;
+
+      // Prefer spacing flat sections out so climbs/rollers stand out between them.
+      if (isNearFlatNeighbor(index) && !needsDistance) continue;
+
+      grades[index] = chooseFlatTargetGrade(preset, rng);
+      flatIndices.push(index);
+      coverage = computeFlatCoverage(segmentLengths, grades, preset);
+    }
+
+    if (coverage.flatDistance >= coverageGoalDistance && coverage.flatCount >= requiredFlatSegments) {
+      return grades;
+    }
+
+    // Fallback pass: remove spacing constraint if still short on flat coverage.
+    for (const candidate of sortedCandidates) {
+      if (coverage.flatDistance >= coverageGoalDistance && coverage.flatCount >= requiredFlatSegments) {
+        break;
+      }
+      const index = candidate.index;
+      if (isFlatGrade(grades[index], preset)) continue;
+      grades[index] = chooseFlatTargetGrade(preset, rng);
+      coverage = computeFlatCoverage(segmentLengths, grades, preset);
+    }
+
+    return grades;
+  }
+
+  function finalizeGrades(segmentLengths, rawGrades, preset, rng) {
     const limitedSupport = rawGrades.map((grade) => clamp(grade, preset.supportMin, preset.supportMax));
     const smoothed = smoothGrades(limitedSupport, preset.smoothPasses);
     const transitionLimited = limitTransitions(smoothed, preset.transitionLimit);
@@ -325,7 +471,14 @@
     const closedLoop = rebalanceClosedLoop(segmentLengths, hardLimited, ABSOLUTE_MAX_GRADE);
     const transitionLimitedAgain = limitTransitions(closedLoop, preset.transitionLimit + 0.35);
     const closedLoopAgain = rebalanceClosedLoop(segmentLengths, transitionLimitedAgain, ABSOLUTE_MAX_GRADE);
-    return closedLoopAgain.map((grade) => Number(clamp(grade, -ABSOLUTE_MAX_GRADE, ABSOLUTE_MAX_GRADE).toFixed(2)));
+    const withFlatSections = injectFlatSections(segmentLengths, closedLoopAgain, preset, rng);
+    const transitionLimitedFinal = limitTransitions(withFlatSections, preset.transitionLimit + 0.35);
+    const closedLoopFinal = rebalanceClosedLoop(segmentLengths, transitionLimitedFinal, ABSOLUTE_MAX_GRADE);
+    const withFlatSectionsFinal = injectFlatSections(segmentLengths, closedLoopFinal, preset, rng);
+    const closedLoopFlatFinal = rebalanceClosedLoop(segmentLengths, withFlatSectionsFinal, ABSOLUTE_MAX_GRADE);
+    return closedLoopFlatFinal.map((grade) =>
+      Number(clamp(clamp(grade, preset.supportMin, preset.supportMax), -ABSOLUTE_MAX_GRADE, ABSOLUTE_MAX_GRADE).toFixed(2)),
+    );
   }
 
   function buildSegments(segmentLengths, grades, totalDistanceMeters) {
@@ -414,6 +567,7 @@
     let weightedAbsoluteGrade = 0;
     let totalDistance = 0;
     let mostlyDistance = 0;
+    let flatDistance = 0;
     let climbingWindowDistance = 0;
     let climbingRampDistance = 0;
 
@@ -438,6 +592,9 @@
       if (grade >= preset.mostlyRangeMin && grade <= preset.mostlyRangeMax) {
         mostlyDistance += distance;
       }
+      if (isFlatGrade(grade, preset)) {
+        flatDistance += distance;
+      }
       if (grade >= 6 && grade <= 10) climbingWindowDistance += distance;
       if (grade > 10) climbingRampDistance += distance;
     }
@@ -453,6 +610,7 @@
       endElevationM: endElevation,
       endDeltaM: endElevation - startElevation,
       mostlyShare: totalDistance > 0 ? mostlyDistance / totalDistance : 0,
+      flatShare: totalDistance > 0 ? flatDistance / totalDistance : 0,
       climbingWindowShare: totalDistance > 0 ? climbingWindowDistance / totalDistance : 0,
       climbingRampShare: totalDistance > 0 ? climbingRampDistance / totalDistance : 0,
       avgGradientPct: totalDistance > 0 ? weightedAbsoluteGrade / totalDistance : 0,
@@ -465,7 +623,9 @@
     const balancePenalty = Math.abs(metrics.totalAscentM - metrics.totalDescentM) * 4;
     const gradePenalty = Math.max(0, metrics.maxGradeAbs - ABSOLUTE_MAX_GRADE) * 1000;
     const mostlyPenalty = Math.max(0, preset.mostlyShareMin - metrics.mostlyShare) * 420;
-    return distancePenalty + closurePenalty + balancePenalty + gradePenalty + mostlyPenalty;
+    const flatTargets = resolveFlatCoverageTargets(preset, metrics.totalDistanceMeters);
+    const flatPenalty = Math.max(0, flatTargets.requiredFlatShare - metrics.flatShare) * 380;
+    return distancePenalty + closurePenalty + balancePenalty + gradePenalty + mostlyPenalty + flatPenalty;
   }
 
   function validateRoutePreset(routePreset, options = {}) {
@@ -494,6 +654,10 @@
     }
     if (metrics.mostlyShare < preset.mostlyShareMin) {
       errors.push(`Terrain does not match ${preset.label.toLowerCase()} preset strongly enough.`);
+    }
+    const flatTargets = resolveFlatCoverageTargets(preset, metrics.totalDistanceMeters);
+    if (metrics.flatShare < flatTargets.requiredFlatShare) {
+      errors.push("Route needs more flat sections so climbs and rollers stand out.");
     }
 
     const ascentPerKm = metrics.distanceKm > 0 ? metrics.totalAscentM / metrics.distanceKm : 0;
@@ -526,7 +690,7 @@
       preset.key === "climbing"
         ? generateGradesClimbing(segmentLengths, preset, rng)
         : generateGradesGeneral(segmentLengths, preset, rng);
-    const grades = finalizeGrades(segmentLengths, rawGrades, preset);
+    const grades = finalizeGrades(segmentLengths, rawGrades, preset, rng);
     return buildSegments(segmentLengths, grades, totalDistanceMeters);
   }
 

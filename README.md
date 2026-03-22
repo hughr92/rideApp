@@ -1,5 +1,5 @@
+git add .
 git commit -am "03-20 v2"
-git remote add origin https://github.com/hughr92/rideApp.git
 git push origin master
 
 # RideSync MVP (Web Demo)

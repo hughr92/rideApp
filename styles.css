@@ -711,27 +711,14 @@ button:disabled {
   stroke-width: 1.25;
 }
 
-.sidescroll-wheel {
-  fill: #0d111a;
-  stroke: rgba(255, 255, 255, 0.82);
-  stroke-width: 1.8;
-}
-
-.sidescroll-frame {
-  stroke-width: 2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  fill: none;
-}
-
-.sidescroll-rider-bob {
-  animation: sidescroll-rider-bob 1.3s ease-in-out infinite;
-}
-
-.sidescroll-wheel-spin {
-  transform-origin: center;
+.sidescroll-rider-sprite-layer {
   transform-box: fill-box;
-  animation: sidescroll-wheel-spin 0.95s linear infinite;
+  transform-origin: center;
+}
+
+.sidescroll-rider-sprite {
+  image-rendering: auto;
+  overflow: visible;
 }
 
 .sidescroll-meta {
@@ -742,25 +729,6 @@ button:disabled {
   flex-wrap: wrap;
   font-size: 0.78rem;
   color: var(--muted);
-}
-
-@keyframes sidescroll-wheel-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@keyframes sidescroll-rider-bob {
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-  50% {
-    transform: translateY(-1.8px);
-  }
 }
 
 .route-source-toggle {
@@ -1440,6 +1408,69 @@ button:disabled {
   background: rgba(255, 255, 255, 0.08);
   padding: 2px 6px;
   border-radius: 6px;
+}
+
+.session-settings-backdrop {
+  position: fixed;
+  inset: 0;
+  border: none;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  z-index: 1190;
+}
+
+.session-settings-anchor {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 1200;
+}
+
+.session-settings-toggle {
+  width: 42px;
+  height: 42px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.15rem;
+  padding: 0;
+}
+
+.session-settings-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 190px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.45);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.session-settings-item {
+  width: 100%;
+  text-align: left;
+}
+
+.session-bike-sticky {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 1180;
+  background: rgba(10, 14, 20, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 0.82rem;
+  line-height: 1.2;
+  color: rgba(245, 246, 255, 0.95);
+  pointer-events: none;
 }
 
 .toast {

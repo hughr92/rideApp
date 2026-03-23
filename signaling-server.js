@@ -9,6 +9,10 @@ const WebSocket = require("ws");
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const wss = new WebSocket.Server({ port: PORT });
+const MAX_SESSION_PLAYERS = 6;
+const PLAYER_SPRITE_ASSET_PATHS = Object.freeze(
+  Array.from({ length: MAX_SESSION_PLAYERS }, (_, index) => `imgLib/rider${index + 1}.png`),
+);
 
 // rooms: sessionCode -> Map(peerId -> ws)
 const rooms = new Map();
@@ -29,6 +33,71 @@ function cloneJson(value) {
     return JSON.parse(JSON.stringify(value));
   } catch {
     return null;
+  }
+}
+
+function normalizePlayerJoinOrder(joinOrderInput) {
+  const joinOrder = Math.round(Number(joinOrderInput));
+  if (!Number.isFinite(joinOrder) || joinOrder < 1 || joinOrder > MAX_SESSION_PLAYERS) return null;
+  return joinOrder;
+}
+
+function getPlayerSpriteAssetByJoinOrder(joinOrderInput) {
+  const joinOrder = normalizePlayerJoinOrder(joinOrderInput);
+  if (!joinOrder) return PLAYER_SPRITE_ASSET_PATHS[0];
+  return PLAYER_SPRITE_ASSET_PATHS[joinOrder - 1] || PLAYER_SPRITE_ASSET_PATHS[0];
+}
+
+function getNextAvailablePlayerJoinOrder(usersInput) {
+  const users = usersInput && typeof usersInput === "object" ? Object.values(usersInput) : [];
+  const usedJoinOrders = new Set(
+    users
+      .map((participant) => normalizePlayerJoinOrder(participant?.joinOrder))
+      .filter((joinOrder) => joinOrder != null),
+  );
+  for (let joinOrder = 1; joinOrder <= MAX_SESSION_PLAYERS; joinOrder += 1) {
+    if (!usedJoinOrders.has(joinOrder)) return joinOrder;
+  }
+  return null;
+}
+
+function normalizeSessionParticipants(sessionState) {
+  if (!sessionState || typeof sessionState !== "object") return;
+  const users = sessionState.users && typeof sessionState.users === "object" ? sessionState.users : {};
+  sessionState.users = users;
+  const entries = Object.entries(users);
+  if (entries.length === 0) return;
+  const usedJoinOrders = new Set();
+  const sortedEntries = [...entries].sort((a, b) => {
+    const aJoinOrder = normalizePlayerJoinOrder(a[1]?.joinOrder);
+    const bJoinOrder = normalizePlayerJoinOrder(b[1]?.joinOrder);
+    if (aJoinOrder != null && bJoinOrder != null && aJoinOrder !== bJoinOrder) return aJoinOrder - bJoinOrder;
+    if (aJoinOrder != null && bJoinOrder == null) return -1;
+    if (aJoinOrder == null && bJoinOrder != null) return 1;
+    return 0;
+  });
+  for (const [userId, participant] of sortedEntries) {
+    const participantEntry = participant && typeof participant === "object" ? participant : {};
+    const preferredJoinOrder = normalizePlayerJoinOrder(participantEntry.joinOrder);
+    let assignedJoinOrder = preferredJoinOrder != null && !usedJoinOrders.has(preferredJoinOrder) ? preferredJoinOrder : null;
+    if (assignedJoinOrder == null) {
+      for (let joinOrder = 1; joinOrder <= MAX_SESSION_PLAYERS; joinOrder += 1) {
+        if (!usedJoinOrders.has(joinOrder)) {
+          assignedJoinOrder = joinOrder;
+          break;
+        }
+      }
+    }
+    if (assignedJoinOrder == null) {
+      assignedJoinOrder = preferredJoinOrder || 1;
+    }
+    usedJoinOrders.add(assignedJoinOrder);
+    users[userId] = {
+      ...participantEntry,
+      id: userId,
+      joinOrder: assignedJoinOrder,
+      spriteAsset: getPlayerSpriteAssetByJoinOrder(assignedJoinOrder),
+    };
   }
 }
 
@@ -282,22 +351,60 @@ wss.on("connection", (ws) => {
         if (!Number.isFinite(sessionState.totalClimbedMeters)) {
           sessionState.totalClimbedMeters = 0;
         }
+        normalizeSessionParticipants(sessionState);
         sessions.set(session, sessionState);
       }
 
-      const existingUser = sessionState.users?.[peerId] || {};
       sessionState.users = sessionState.users || {};
       if (!Number.isFinite(sessionState.totalClimbedMeters)) {
         sessionState.totalClimbedMeters = 0;
       }
+      normalizeSessionParticipants(sessionState);
+      const existingUser = sessionState.users?.[peerId] || null;
+      const participantCount = Object.keys(sessionState.users).length;
+      if (!existingUser && participantCount >= MAX_SESSION_PLAYERS) {
+        safeSend(ws, {
+          type: "session-error",
+          session,
+          message: `Session is full (${MAX_SESSION_PLAYERS}/${MAX_SESSION_PLAYERS} players).`,
+        });
+        removePeer(session, peerId, ws);
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      const joinOrder =
+        normalizePlayerJoinOrder(existingUser?.joinOrder) || getNextAvailablePlayerJoinOrder(sessionState.users);
+      if (!joinOrder) {
+        safeSend(ws, {
+          type: "session-error",
+          session,
+          message: `Session is full (${MAX_SESSION_PLAYERS}/${MAX_SESSION_PLAYERS} players).`,
+        });
+        removePeer(session, peerId, ws);
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
       sessionState.users[peerId] = {
+        ...existingUser,
         id: peerId,
-        name: userFromClient?.name || existingUser.name || (ws.isHost ? "Host" : "Rider"),
+        name: userFromClient?.name || existingUser?.name || (ws.isHost ? "Host" : "Rider"),
         weight:
           userFromClient && Object.prototype.hasOwnProperty.call(userFromClient, "weight")
             ? userFromClient.weight
-            : existingUser.weight ?? null,
+            : existingUser?.weight ?? null,
+        bikeId: userFromClient?.bikeId || existingUser?.bikeId || "road_bike",
+        joinOrder,
+        spriteAsset: getPlayerSpriteAssetByJoinOrder(joinOrder),
       };
+      normalizeSessionParticipants(sessionState);
 
       // Notify the joiner about who is already in the room.
       safeSend(ws, {

@@ -43,7 +43,7 @@ const EFFORT_SEISMOGRAPH_MAX_FRAMES = EFFORT_SEISMOGRAPH_WINDOW_SECONDS / EFFORT
 const EFFORT_SEISMOGRAPH_POWER_CAP_FTP_MULTIPLIER = 1.5;
 const EFFORT_SEISMOGRAPH_HEART_RATE_MIN = 80;
 const EFFORT_SEISMOGRAPH_HEART_RATE_MAX = 200;
-const BIKE_SWITCH_SPEED_LIMIT_KPH = 2;
+const BIKE_SWITCH_SPEED_LIMIT_KPH = 5;
 const ERG_STATE_UNAVAILABLE = "unavailable";
 const ERG_STATE_AVAILABLE = "available";
 const ERG_STATE_ENABLING = "enabling";
@@ -99,6 +99,7 @@ const POWER_UP_TYPE_SPEED_BOOST = "speed_boost";
 const FTP_MIN_WATTS = 50;
 const FTP_MAX_WATTS = 600;
 const MAX_SESSION_BOTS = 3;
+const MAX_SESSION_PLAYERS = 6;
 const RECENT_SESSIONS_PAGE_SIZE = 10;
 const SAVED_WORKOUTS_PAGE_SIZE = 8;
 const SAVED_WORKOUTS_DURATION_MIN_MINUTES = 5;
@@ -333,6 +334,9 @@ const SIDE_SCROLL_MAX_EXTRAPOLATION_MS = 1400;
 const SIDE_SCROLL_HORIZON_Y_RATIO = 0.72;
 const SIDE_SCROLL_TERRAIN_TOP_RATIO = 0.7;
 const SIDE_SCROLL_TERRAIN_BOTTOM_MARGIN_PX = 12;
+const PLAYER_SPRITE_ASSET_PATHS = Object.freeze(
+  Array.from({ length: MAX_SESSION_PLAYERS }, (_, index) => `imgLib/rider${index + 1}.png`),
+);
 const SIDE_SCROLL_RIDER_ACCENTS = Object.freeze([
   "#4dd2ff",
   "#ffd166",
@@ -799,6 +803,8 @@ let state = {
     lastSideScrollFrameAt: 0,
   },
   sessionRenderDeferred: false,
+  sessionSettingsMenuOpen: false,
+  sessionBikeModalOpen: false,
   privateRiderStats: createEmptyPrivateRiderStats(),
   effortSeismograph: createEmptyEffortSeismographState(),
   powerUps: createEmptyPowerUpState(),
@@ -824,11 +830,92 @@ function cloneJson(value) {
 
 function loadSessionFromStorage(code) {
   const raw = localStorage.getItem(SESSION_STORE_KEY(code));
-  return raw ? safeJsonParse(raw) : null;
+  const parsed = raw ? safeJsonParse(raw) : null;
+  if (!parsed || typeof parsed !== "object") return null;
+  if (!Number.isFinite(parsed.totalClimbedMeters)) parsed.totalClimbedMeters = 0;
+  normalizeSessionParticipants(parsed);
+  normalizeSessionCourse(parsed);
+  return parsed;
 }
 
 function saveSessionToStorage(session) {
   localStorage.setItem(SESSION_STORE_KEY(session.code), JSON.stringify(session));
+}
+
+function normalizePlayerJoinOrder(joinOrderInput) {
+  const joinOrder = Math.round(Number(joinOrderInput));
+  if (!Number.isFinite(joinOrder) || joinOrder < 1 || joinOrder > MAX_SESSION_PLAYERS) return null;
+  return joinOrder;
+}
+
+function getPlayerSpriteAssetByJoinOrder(joinOrderInput) {
+  const joinOrder = normalizePlayerJoinOrder(joinOrderInput);
+  if (!joinOrder) return PLAYER_SPRITE_ASSET_PATHS[0];
+  return PLAYER_SPRITE_ASSET_PATHS[joinOrder - 1] || PLAYER_SPRITE_ASSET_PATHS[0];
+}
+
+function getNextAvailablePlayerJoinOrder(usersInput) {
+  const users = usersInput && typeof usersInput === "object" ? Object.values(usersInput) : [];
+  const usedJoinOrders = new Set(
+    users
+      .map((participant) => normalizePlayerJoinOrder(participant?.joinOrder))
+      .filter((joinOrder) => joinOrder != null),
+  );
+
+  for (let joinOrder = 1; joinOrder <= MAX_SESSION_PLAYERS; joinOrder += 1) {
+    if (!usedJoinOrders.has(joinOrder)) {
+      return joinOrder;
+    }
+  }
+  return null;
+}
+
+function normalizeSessionParticipants(session) {
+  if (!session || typeof session !== "object") return;
+  const users = session.users && typeof session.users === "object" ? session.users : {};
+  session.users = users;
+  const entries = Object.entries(users);
+  if (entries.length === 0) return;
+
+  const userOrderSeed = new Map(entries.map(([id], index) => [id, index]));
+  const sortedEntries = [...entries].sort((a, b) => {
+    const aJoinOrder = normalizePlayerJoinOrder(a[1]?.joinOrder);
+    const bJoinOrder = normalizePlayerJoinOrder(b[1]?.joinOrder);
+    if (aJoinOrder != null && bJoinOrder != null && aJoinOrder !== bJoinOrder) return aJoinOrder - bJoinOrder;
+    if (aJoinOrder != null && bJoinOrder == null) return -1;
+    if (aJoinOrder == null && bJoinOrder != null) return 1;
+    const aJoinedAt = Number(a[1]?.joinedAt) || Number(a[1]?.createdAt) || Number(a[1]?.addedAt) || 0;
+    const bJoinedAt = Number(b[1]?.joinedAt) || Number(b[1]?.createdAt) || Number(b[1]?.addedAt) || 0;
+    if (aJoinedAt !== bJoinedAt) return aJoinedAt - bJoinedAt;
+    const aSeed = userOrderSeed.get(a[0]) || 0;
+    const bSeed = userOrderSeed.get(b[0]) || 0;
+    return aSeed - bSeed;
+  });
+
+  const usedJoinOrders = new Set();
+  const nextOpenJoinOrder = () => {
+    for (let joinOrder = 1; joinOrder <= MAX_SESSION_PLAYERS; joinOrder += 1) {
+      if (!usedJoinOrders.has(joinOrder)) return joinOrder;
+    }
+    return null;
+  };
+
+  sortedEntries.forEach(([userId, participant]) => {
+    const participantEntry = participant && typeof participant === "object" ? participant : {};
+    const preferredJoinOrder = normalizePlayerJoinOrder(participantEntry.joinOrder);
+    const assignedJoinOrder =
+      preferredJoinOrder != null && !usedJoinOrders.has(preferredJoinOrder)
+        ? preferredJoinOrder
+        : nextOpenJoinOrder() || preferredJoinOrder || 1;
+    usedJoinOrders.add(assignedJoinOrder);
+    users[userId] = {
+      ...participantEntry,
+      id: userId,
+      bikeId: normalizeBikeId(participantEntry.bikeId),
+      joinOrder: assignedJoinOrder,
+      spriteAsset: getPlayerSpriteAssetByJoinOrder(assignedJoinOrder),
+    };
+  });
 }
 
 function loadSummaries() {
@@ -1617,10 +1704,11 @@ function updateBotDraftDifficulty(botDraftId, difficultyLevelInput) {
   return updated ? { ok: true } : { ok: false, error: "Bot not found." };
 }
 
-function createBotRider(botDraftInput, index) {
+function createBotRider(botDraftInput, index, joinOrderInput = null) {
   const draft = botDraftInput && typeof botDraftInput === "object" ? botDraftInput : {};
   const difficulty = getBotDifficultyConfig(draft.difficultyLevel);
   const safeName = String(draft.name || `Bot ${index + 1}`).trim() || `Bot ${index + 1}`;
+  const joinOrder = normalizePlayerJoinOrder(joinOrderInput);
   return {
     id: String(draft.id || `bot_${makeId(8)}`).toLowerCase(),
     name: safeName,
@@ -1629,6 +1717,8 @@ function createBotRider(botDraftInput, index) {
     isBot: true,
     difficultyLevel: difficulty.level,
     ftpWatts: difficulty.ftpWatts,
+    joinOrder: joinOrder || null,
+    spriteAsset: getPlayerSpriteAssetByJoinOrder(joinOrder || 1),
   };
 }
 
@@ -1636,12 +1726,21 @@ function addBotToSession(session, botInput) {
   const sessionState = session && typeof session === "object" ? session : null;
   if (!sessionState) return { ok: false, error: "Session unavailable." };
   if (!sessionState.users) sessionState.users = {};
+  normalizeSessionParticipants(sessionState);
+  const participantCount = Object.keys(sessionState.users).length;
+  if (participantCount >= MAX_SESSION_PLAYERS) {
+    return { ok: false, error: `Session is full (${MAX_SESSION_PLAYERS}/${MAX_SESSION_PLAYERS} players).` };
+  }
   const existingBots = Object.values(sessionState.users).filter((participant) => participant?.isBot);
   if (existingBots.length >= MAX_SESSION_BOTS) {
     return { ok: false, error: `You can add up to ${MAX_SESSION_BOTS} bots.` };
   }
 
-  const bot = createBotRider(botInput, existingBots.length);
+  const nextJoinOrder = getNextAvailablePlayerJoinOrder(sessionState.users);
+  if (!nextJoinOrder) {
+    return { ok: false, error: `Session is full (${MAX_SESSION_PLAYERS}/${MAX_SESSION_PLAYERS} players).` };
+  }
+  const bot = createBotRider(botInput, existingBots.length, nextJoinOrder);
   sessionState.users[bot.id] = bot;
   sessionState.telemetry = sessionState.telemetry || {};
   sessionState.aggregates = sessionState.aggregates || {};
@@ -1661,6 +1760,7 @@ function addBotToSession(session, botInput) {
     };
   }
   ensureAggregate(bot.id, sessionState);
+  normalizeSessionParticipants(sessionState);
   return { ok: true, bot };
 }
 
@@ -3207,6 +3307,7 @@ function getSessionRoutePosition(sessionInput = getCurrentSession(), distanceMet
 
 function normalizeSessionCourse(session) {
   if (!session || typeof session !== "object") return;
+  normalizeSessionParticipants(session);
 
   const course = session.course && typeof session.course === "object" ? session.course : createCourseFromRoutePreset(DEFAULT_ROUTE_PRESET);
   const fallbackRoute = getRoutePresetById(course.routeId || course.id || DEFAULT_ROUTE_PRESET.id);
@@ -4108,11 +4209,14 @@ function buildSessionSideScrollViewHtml(session, user, { predictMotion = true, n
         ? getPredictedTelemetryDistanceMeters(telemetryEntry, nowMs)
         : measuredDistance;
       const isLocal = participant.id === user.id;
+      const joinOrder = normalizePlayerJoinOrder(participant.joinOrder) || 1;
       return {
         id: participant.id,
         name: participant.name || "Rider",
         distanceTraveled,
         isLocal,
+        joinOrder,
+        spriteAsset: participant.spriteAsset || getPlayerSpriteAssetByJoinOrder(joinOrder),
         accentColor: getSideScrollRiderAccentColor(participant.id, isLocal),
       };
     })
@@ -4131,6 +4235,8 @@ function buildSessionSideScrollViewHtml(session, user, { predictMotion = true, n
       name: user.name || localRider.name || "You",
       distanceTraveled: localRider.distanceTraveled,
       isLocal: true,
+      joinOrder: localRider.joinOrder,
+      spriteAsset: localRider.spriteAsset,
       accentColor: getSideScrollRiderAccentColor(user.id, true),
     },
     participants: riders,
@@ -4174,31 +4280,30 @@ function TerrainProfileRenderer({ terrainPoints, width, height, centerX }) {
 function RiderVisual({ rider, x, y, slopeDeg }) {
   const safeName = escapeHtml(rider?.name || "Rider");
   const isLocal = !!rider?.isLocal;
-  const accent = rider?.accentColor || getSideScrollRiderAccentColor(rider?.id, isLocal);
   const opacity = clamp(Number(rider?.edgeFade) || 1, 0.35, 1);
   const tilt = clamp(Number(slopeDeg) || 0, -10, 10);
+  const spriteAsset = escapeHtml(rider?.spriteAsset || getPlayerSpriteAssetByJoinOrder(rider?.joinOrder || 1));
 
   return `
     <g class="sidescroll-rider ${isLocal ? "is-local" : ""}" transform="translate(${x.toFixed(2)} ${y.toFixed(2)})" style="opacity:${opacity.toFixed(2)};">
-      <g class="sidescroll-rider-bob">
-        ${
-          isLocal
-            ? '<circle class="sidescroll-local-halo" cx="0" cy="-8" r="18"></circle>'
-            : ""
-        }
-        <g class="sidescroll-bike" transform="rotate(${tilt.toFixed(2)} 0 -6)">
-          <circle class="sidescroll-wheel sidescroll-wheel-spin" cx="-12" cy="-6" r="6"></circle>
-          <circle class="sidescroll-wheel sidescroll-wheel-spin" cx="12" cy="-6" r="6"></circle>
-          <line class="sidescroll-frame" x1="-12" y1="-6" x2="12" y2="-6" stroke="${accent}"></line>
-          <line class="sidescroll-frame" x1="-12" y1="-6" x2="-1" y2="-17" stroke="${accent}"></line>
-          <line class="sidescroll-frame" x1="-1" y1="-17" x2="12" y2="-6" stroke="${accent}"></line>
-          <line class="sidescroll-frame" x1="-1" y1="-17" x2="-4" y2="-21" stroke="${accent}"></line>
-          <line class="sidescroll-frame" x1="-1" y1="-17" x2="3" y2="-23" stroke="${accent}"></line>
-          <line class="sidescroll-frame" x1="3" y1="-23" x2="8" y2="-16" stroke="${accent}"></line>
-          <circle cx="3" cy="-26" r="4.5" fill="${accent}"></circle>
-        </g>
-        <text class="sidescroll-rider-name ${isLocal ? "is-local" : ""}" x="0" y="-40" text-anchor="middle">${safeName}</text>
+      ${
+        isLocal
+          ? '<circle class="sidescroll-local-halo" cx="0" cy="-17" r="20"></circle>'
+          : ""
+      }
+      <g class="sidescroll-rider-sprite-layer" transform="rotate(${tilt.toFixed(2)} 0 -12)">
+        <image
+          class="sidescroll-rider-sprite"
+          href="${spriteAsset}"
+          xlink:href="${spriteAsset}"
+          x="-24"
+          y="-36"
+          width="48"
+          height="30"
+          preserveAspectRatio="xMidYMid meet"
+        ></image>
       </g>
+      <text class="sidescroll-rider-name ${isLocal ? "is-local" : ""}" x="0" y="-44" text-anchor="middle">${safeName}</text>
     </g>
   `;
 }
@@ -5779,7 +5884,14 @@ function createSession({ hostUser, routePreset = DEFAULT_ROUTE_PRESET, routePlan
     endedAt: null,
     createdAt: now,
     users: {
-      [hostUser.id]: { id: hostUser.id, name: hostUser.name, weight: hostUser.weight, bikeId: normalizeBikeId(hostUser.bikeId) },
+      [hostUser.id]: {
+        id: hostUser.id,
+        name: hostUser.name,
+        weight: hostUser.weight,
+        bikeId: normalizeBikeId(hostUser.bikeId),
+        joinOrder: 1,
+        spriteAsset: getPlayerSpriteAssetByJoinOrder(1),
+      },
     },
     telemetry: {
       // userId: { power, heartRate, cadence, distance, updatedAt }
@@ -5813,6 +5925,7 @@ function createSession({ hostUser, routePreset = DEFAULT_ROUTE_PRESET, routePlan
     addBotToSession(session, botDraft);
   });
 
+  normalizeSessionParticipants(session);
   saveSessionToStorage(session);
   return session;
 }
@@ -5826,7 +5939,14 @@ function createPlaceholderSession(code, user) {
     endedAt: null,
     createdAt: currentMs(),
     users: {
-      [user.id]: { id: user.id, name: user.name, weight: user.weight, bikeId: normalizeBikeId(user.bikeId) },
+      [user.id]: {
+        id: user.id,
+        name: user.name,
+        weight: user.weight,
+        bikeId: normalizeBikeId(user.bikeId),
+        joinOrder: 1,
+        spriteAsset: getPlayerSpriteAssetByJoinOrder(1),
+      },
     },
     telemetry: {},
     aggregates: {},
@@ -5858,9 +5978,24 @@ function joinSession({ code, user }) {
   if (!session.telemetry) session.telemetry = {};
   if (!session.aggregates) session.aggregates = {};
   if (!Number.isFinite(session.totalClimbedMeters)) session.totalClimbedMeters = 0;
+  normalizeSessionParticipants(session);
   normalizeSessionCourse(session);
-
-  session.users[user.id] = { id: user.id, name: user.name, weight: user.weight, bikeId: normalizeBikeId(user.bikeId) };
+  const existingParticipant = session.users[user.id];
+  if (!existingParticipant && Object.keys(session.users).length >= MAX_SESSION_PLAYERS) {
+    return { error: `Session is full (${MAX_SESSION_PLAYERS}/${MAX_SESSION_PLAYERS} players).` };
+  }
+  const joinOrder =
+    normalizePlayerJoinOrder(existingParticipant?.joinOrder) || getNextAvailablePlayerJoinOrder(session.users) || 1;
+  session.users[user.id] = {
+    ...existingParticipant,
+    id: user.id,
+    name: user.name,
+    weight: user.weight,
+    bikeId: normalizeBikeId(user.bikeId),
+    joinOrder,
+    spriteAsset: getPlayerSpriteAssetByJoinOrder(joinOrder),
+  };
+  normalizeSessionParticipants(session);
 
   saveSessionToStorage(session);
   return session;
@@ -6717,6 +6852,8 @@ function endSession() {
   resetEffortSeismograph();
   state.view = "summary";
   state.simulation.lastSmoothedGrade = 0;
+  state.sessionSettingsMenuOpen = false;
+  state.sessionBikeModalOpen = false;
   showToast("Session ended");
   render();
 }
@@ -6751,6 +6888,8 @@ function leaveSession() {
   state.session = null;
   state.view = "lobby";
   state.simulation.lastSmoothedGrade = 0;
+  state.sessionSettingsMenuOpen = false;
+  state.sessionBikeModalOpen = false;
   render();
 }
 
@@ -6906,10 +7045,9 @@ function stopSessionSideScrollRenderLoop() {
 
 function shouldDeferSessionRender() {
   if (state.view !== "session") return false;
-  if (state.session?.startedAt) return false;
   const activeEl = document.activeElement;
   if (!activeEl || typeof activeEl.matches !== "function") return false;
-  return activeEl.matches("[data-session-bot-difficulty]");
+  return activeEl.matches("[data-session-bot-difficulty], [data-session-bike-select]");
 }
 
 function flushDeferredSessionRender() {
@@ -11664,6 +11802,42 @@ function renderPairing() {
   const supported = isWebBluetoothSupported();
   const returnView = state.pairingReturnView === "session" && state.session && state.user ? "session" : "lobby";
   const backLabel = returnView === "session" ? "Back to session" : "Back to lobby";
+  const pairingSession = returnView === "session" ? state.session : null;
+  const pairingUser = returnView === "session" ? state.user : null;
+  const pairingTelemetry = pairingSession && pairingUser ? pairingSession?.telemetry?.[pairingUser.id] || null : null;
+  const trainerErgState = trainer?.erg || createDefaultTrainerErgState();
+  const ergAvailability = getTrainerErgAvailability(trainer);
+  const ergState = trainerErgState.state || ERG_STATE_UNAVAILABLE;
+  const ergStatusLabelMap = {
+    [ERG_STATE_UNAVAILABLE]: "Unavailable",
+    [ERG_STATE_AVAILABLE]: "Available",
+    [ERG_STATE_ENABLING]: "Enabling",
+    [ERG_STATE_ACTIVE]: "Active",
+    [ERG_STATE_INTERRUPTED]: "Interrupted",
+    [ERG_STATE_ERROR]: "Error",
+    [ERG_STATE_DISABLED]: "Off",
+  };
+  const hasSessionErgContext = !!(pairingSession && pairingUser);
+  const ergToggleDisabled =
+    (!hasSessionErgContext && trainerErgState.desiredEnabled !== true) ||
+    (!ergAvailability.available && trainerErgState.desiredEnabled !== true);
+  const ergToggleLabel = trainerErgState.desiredEnabled ? "Turn ERG Off" : "Turn ERG On";
+  const ergStatusLabel = ergStatusLabelMap[ergState] || "Unavailable";
+  const ergTargetWattsText = Number.isFinite(Number(trainerErgState.currentTargetWatts))
+    ? `${Math.round(trainerErgState.currentTargetWatts)} W`
+    : "--";
+  const ergActualWattsValue = Number(pairingTelemetry?.power ?? trainer?.lastReading?.power);
+  const ergCadenceValue = Number(pairingTelemetry?.cadence ?? trainer?.lastReading?.cadence);
+  const ergActualWattsText = Number.isFinite(ergActualWattsValue) && ergActualWattsValue > 0 ? `${Math.round(ergActualWattsValue)} W` : "--";
+  const ergCadenceText = Number.isFinite(ergCadenceValue) && ergCadenceValue > 0 ? `${Math.round(ergCadenceValue)} rpm` : "--";
+  const trainerConnectionLabel = trainer.connected ? "Connected" : "Disconnected";
+  const ergStatusDetail =
+    !hasSessionErgContext && trainerErgState.desiredEnabled !== true
+      ? "Start or join a session to enable ERG targets."
+      : trainerErgState.error ||
+        trainerErgState.unsupportedReason ||
+        (trainerErgState.telemetryStale ? "Trainer telemetry is stale." : ergAvailability.reason) ||
+        "Ready";
 
   appEl.innerHTML = `
     <div class="card">
@@ -11683,6 +11857,22 @@ function renderPairing() {
         <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap;">
           ${trainer.connected ? `<button id="disconnectTrainer" class="secondary">Disconnect</button>` : `<button id="connectTrainer">Pair trainer</button>`}
         </div>
+      </div>
+
+      <div class="card" style="margin-top:12px;">
+        <h2 style="margin-bottom:8px;">ERG Mode</h2>
+        <div class="flex-space" style="gap:10px; flex-wrap:wrap;">
+          <div>
+            <div class="small">Status</div>
+            <div class="code">${escapeHtml(ergStatusLabel)}</div>
+          </div>
+          <div class="flex" style="gap:8px; align-items:center; flex-wrap:wrap;">
+            <div class="small">Target ${ergTargetWattsText} · Actual ${ergActualWattsText} · Cadence ${ergCadenceText}</div>
+            <button id="pairingErgToggleBtn" class="secondary" ${ergToggleDisabled ? "disabled" : ""}>${ergToggleLabel}</button>
+          </div>
+        </div>
+        <div class="small" style="margin-top:6px;">Trainer: ${trainerConnectionLabel}</div>
+        <div class="small" style="margin-top:2px;">${escapeHtml(ergStatusDetail)}</div>
       </div>
 
       <div class="card" style="margin-top:12px;">
@@ -11721,6 +11911,20 @@ function renderPairing() {
       disconnectHrmBtn.addEventListener("click", () => disconnectDevice("hrm"));
     }
   }
+
+  const pairingErgToggleBtn = document.getElementById("pairingErgToggleBtn");
+  if (pairingErgToggleBtn) {
+    pairingErgToggleBtn.addEventListener("click", async () => {
+      const enableErg = !(state.devices.trainer?.erg?.desiredEnabled === true);
+      if (enableErg && !(state.session && state.user)) {
+        showToast("Start or join a session to enable ERG.");
+        return;
+      }
+      pairingErgToggleBtn.disabled = true;
+      await setErgModeEnabled(enableErg, { reason: "pairing-ui-toggle", showToasts: true });
+      render();
+    });
+  }
 }
 
 function renderSession() {
@@ -11733,6 +11937,8 @@ function renderSession() {
   }
   normalizeSessionCourse(session);
   user.bikeId = normalizeBikeId(user.bikeId);
+  state.sessionSettingsMenuOpen = state.sessionSettingsMenuOpen === true;
+  state.sessionBikeModalOpen = state.sessionBikeModalOpen === true;
 
   const now = currentMs();
   const startedAt = session.startedAt;
@@ -11774,6 +11980,7 @@ function renderSession() {
         power: t.power || 0,
         heartRate: t.heartRate || 0,
         cadence: t.cadence || 0,
+        speedMps: Number.isFinite(Number(t.speedMps)) ? Number(t.speedMps) : 0,
         activePowerUp: t.activePowerUp || null,
         distance,
         climbMeters,
@@ -11804,10 +12011,6 @@ function renderSession() {
     1,
     Number(activeRouteEntry?.lengthMeters) || Number(activeSessionRoute.totalDistanceMeters) || getCourseLengthMeters(activeRouteSegments),
   );
-  const currentElevationMeters = getElevationAtDistance(activeSessionRoute, routeDistanceMeters);
-  const next500mGradient = getAverageGradientAhead(activeSessionRoute, routeDistanceMeters, 500);
-  const remainingDistanceMeters = getRemainingDistance(activeSessionRoute, routeDistanceMeters);
-  const remainingClimbMeters = getRemainingClimb(activeSessionRoute, routeDistanceMeters);
   const routeDistanceKm = Number.isFinite(Number(activeSessionRoute.distanceKm))
     ? Number(activeSessionRoute.distanceKm)
     : activeRouteLengthMeters / 1000;
@@ -11834,38 +12037,6 @@ function renderSession() {
   const sessionWorkoutSummaryText = sessionWorkoutPlan
     ? `${sessionWorkoutPlan.name} • ${sessionWorkoutDifficulty}/10 • ${formatDuration(sessionWorkoutPlan.totalDurationSeconds)}`
     : "None selected";
-  const trainerErgState = state.devices.trainer?.erg || createDefaultTrainerErgState();
-  const ergAvailability = getTrainerErgAvailability(state.devices.trainer);
-  const ergState = trainerErgState.state || ERG_STATE_UNAVAILABLE;
-  const ergStatusLabelMap = {
-    [ERG_STATE_UNAVAILABLE]: "Unavailable",
-    [ERG_STATE_AVAILABLE]: "Available",
-    [ERG_STATE_ENABLING]: "Enabling",
-    [ERG_STATE_ACTIVE]: "Active",
-    [ERG_STATE_INTERRUPTED]: "Interrupted",
-    [ERG_STATE_ERROR]: "Error",
-    [ERG_STATE_DISABLED]: "Off",
-  };
-  const ergToggleDisabled = !ergAvailability.available && trainerErgState.desiredEnabled !== true;
-  const ergToggleLabel = trainerErgState.desiredEnabled ? "Turn ERG Off" : "Turn ERG On";
-  const ergStatusLabel = ergStatusLabelMap[ergState] || "Unavailable";
-  const ergStatusDetail =
-    trainerErgState.error ||
-    trainerErgState.unsupportedReason ||
-    (trainerErgState.telemetryStale ? "Trainer telemetry is stale." : ergAvailability.reason) ||
-    "Ready";
-  const ergTargetWattsText = Number.isFinite(Number(trainerErgState.currentTargetWatts))
-    ? `${Math.round(trainerErgState.currentTargetWatts)} W`
-    : "--";
-  const ergActualWattsText =
-    localTelemetryRow && Number.isFinite(Number(localTelemetryRow.power)) && Number(localTelemetryRow.power) > 0
-      ? `${Math.round(Number(localTelemetryRow.power))} W`
-      : "--";
-  const ergCadenceText =
-    localTelemetryRow && Number.isFinite(Number(localTelemetryRow.cadence)) && Number(localTelemetryRow.cadence) > 0
-      ? `${Math.round(Number(localTelemetryRow.cadence))} rpm`
-      : "--";
-  const trainerConnectionLabel = state.devices.trainer.connected ? "Connected" : "Disconnected";
   const sessionWorkoutPlayback = sessionWorkoutPlan
     ? buildWorkoutPlaybackTimeline(sessionWorkoutPlan.segments, sessionWorkoutPlan.ftpReferenceWatts)
     : { entries: [], totalDurationSeconds: 0 };
@@ -11962,23 +12133,6 @@ function renderSession() {
       </div>
     `
     : "";
-  const sessionErgControlCardHtml = `
-    <div class="card" style="margin-top:12px;">
-      <h2 style="margin-bottom:8px;">ERG Mode</h2>
-      <div class="flex-space" style="gap:10px; flex-wrap:wrap;">
-        <div>
-          <div class="small">Status</div>
-          <div class="code">${escapeHtml(ergStatusLabel)}</div>
-        </div>
-        <div class="flex" style="gap:8px; align-items:center; flex-wrap:wrap;">
-          <div class="small">Target ${ergTargetWattsText} · Actual ${ergActualWattsText} · Cadence ${ergCadenceText}</div>
-          <button id="ergToggleBtn" class="secondary" ${ergToggleDisabled ? "disabled" : ""}>${ergToggleLabel}</button>
-        </div>
-      </div>
-      <div class="small" style="margin-top:6px;">Trainer: ${trainerConnectionLabel}</div>
-      <div class="small" style="margin-top:2px;">${escapeHtml(ergStatusDetail)}</div>
-    </div>
-  `;
   const routeProfile = buildRouteProfileFromSegments(activeRouteSegments);
   const elevationProfileHtml = renderElevationProfile({
     routeProfile,
@@ -11993,10 +12147,6 @@ function renderSession() {
 
   const terrain = state.simulation.terrain;
   const currentGradeText = formatSignedPercent(terrain.currentGrade, 1);
-  const effectiveGradeText = formatSignedPercent(terrain.effectiveGrade, 1);
-  const nextGradeText = formatSignedPercent(terrain.nextGrade, 1);
-  const distanceToNextText =
-    terrain.distanceToNext == null || Number.isNaN(terrain.distanceToNext) ? "--" : `${Math.max(0, Math.round(terrain.distanceToNext))}m`;
   const routeDistanceText = `${Math.round(routeDistanceMeters)}m / ${Math.round(activeRouteLengthMeters)}m`;
   const sessionClimbedText = formatClimbedMeters(session.totalClimbedMeters || 0);
   const privateRiderStats = getPrivateRiderStatsSnapshot(session, user);
@@ -12007,8 +12157,11 @@ function renderSession() {
   const cadenceSourceText = state.devices.trainer.connected ? "Trainer cadence" : "Mock cadence";
   const pendingFtpProposal = getPendingFtpProposal(session, user);
   const currentBike = getBikeById(user.bikeId);
+  const sessionBikeStickyHtml = `
+    <div class="session-bike-sticky" aria-label="Selected bike">${escapeHtml(currentBike.name)}</div>
+  `;
   const sessionBikeOptionsHtml = buildBikeOptionsHtml(currentBike.id);
-  const bikeSwitchAllowed = !isSessionRunning() || canSwitchBikeAtSpeed(privateRiderStats.speedMps);
+  const bikeSwitchAllowed = !isSessionRunning() || canSwitchBikeAtSpeed(localTelemetryRow?.speedMps);
   const bikeSwitchReason = bikeSwitchAllowed
     ? "Bike can be changed now."
     : `Slow to ${BIKE_SWITCH_SPEED_LIMIT_KPH.toFixed(1)} km/h or less to change bikes during a ride.`;
@@ -12081,12 +12234,70 @@ function renderSession() {
       </div>
     `
       : "";
+  const sessionBikeSelectionModalHtml = state.sessionBikeModalOpen
+    ? `
+      <div class="workout-modal-backdrop" id="sessionBikeModalBackdrop">
+        <div class="workout-modal">
+          <div class="flex-space" style="gap:10px;align-items:flex-start;">
+            <div>
+              <h2 style="margin-bottom:8px;">Bike Selection</h2>
+              <div class="small">Choose your bike before a ride, or during a ride only at low speed.</div>
+            </div>
+            <button id="sessionBikeModalCloseBtn" class="secondary">Close</button>
+          </div>
+          <div style="margin-top:10px;">
+            <label class="label">Current bike</label>
+            <select id="sessionBikeSelect" data-session-bike-select ${bikeSwitchAllowed ? "" : "disabled"}>${sessionBikeOptionsHtml}</select>
+          </div>
+          <div class="small" style="margin-top:8px;">${escapeHtml(bikeSwitchReason)}</div>
+          <div class="small" style="margin-top:8px;"><strong>${escapeHtml(currentBike.name)}</strong> - ${escapeHtml(currentBike.description)}</div>
+          <div class="small" style="margin-top:2px;">Pros: ${escapeHtml(currentBike.pros)}</div>
+          <div class="small" style="margin-top:2px;">Cons: ${escapeHtml(currentBike.cons)}</div>
+          <div class="flex" style="margin-top:12px; gap:8px; justify-content:flex-end;">
+            <button id="applySessionBikeBtn" class="secondary" ${bikeSwitchAllowed ? "" : "disabled"}>Apply Bike</button>
+          </div>
+        </div>
+      </div>
+    `
+    : "";
+  const sessionSettingsMenuHtml = `
+    ${state.sessionSettingsMenuOpen ? `<button id="sessionSettingsBackdrop" class="session-settings-backdrop" type="button" aria-label="Close settings menu"></button>` : ""}
+    <div class="session-settings-anchor">
+      <button
+        id="sessionSettingsToggleBtn"
+        type="button"
+        class="secondary session-settings-toggle"
+        aria-label="Session settings"
+        aria-expanded="${state.sessionSettingsMenuOpen ? "true" : "false"}"
+      >⚙</button>
+      ${
+        state.sessionSettingsMenuOpen
+          ? `
+        <div class="session-settings-panel">
+          <button id="sessionSettingsBikeBtn" type="button" class="secondary session-settings-item">Bike Selection</button>
+          <button id="sessionSettingsErgSetupBtn" type="button" class="secondary session-settings-item">ERG Setup</button>
+        </div>
+      `
+          : ""
+      }
+    </div>
+  `;
 
   appEl.innerHTML = `
     <div class="card">
       <div class="flex-space">
         <div>
-          <h2>Session <span class="code">${session.code}</span></h2>
+          <h2>
+            Session
+            <button
+              id="sessionCodeCopyBtn"
+              type="button"
+              class="secondary"
+              style="padding:4px 8px;"
+              title="Copy session code"
+              aria-label="Copy session code ${escapeHtml(session.code)}"
+            ><span class="code">${session.code}</span></button>
+          </h2>
           <div class="small">${session.users ? Object.keys(session.users).length : 0} rider(s)</div>
           <div class="small">${escapeHtml(activeSessionRoute.name || "Route")} (${escapeHtml(activeSessionRoute.country || "Unknown")}) • ${routeDistanceKm.toFixed(
             1,
@@ -12117,8 +12328,6 @@ function renderSession() {
       </div>
 
       <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
-        <button id="copyCodeBtn" class="secondary">Copy code</button>
-        <button id="pairSessionBtn" class="secondary">Pair devices</button>
         ${canStartSession() ? `<button id="startBtn">Start session</button>` : ""}
         ${isSessionRunning() && user.isHost ? `<button id="endBtn" class="danger">End session</button>` : ""}
         <div class="small" style="margin-left:auto;">${isSessionRunning() ? "Running" : session.endedAt ? "Ended" : "Waiting"}</div>
@@ -12137,32 +12346,8 @@ function renderSession() {
             <div class="small">Current grade</div>
             <div class="grade-readout ${getGradeColorClass(terrain.currentGrade)}">${currentGradeText}</div>
           </div>
-          <div>
-            <div class="small">Effective grade</div>
-            <div class="grade-readout ${getGradeColorClass(terrain.effectiveGrade)}">${effectiveGradeText}</div>
-          </div>
-          <div>
-            <div class="small">Lookahead</div>
-            <div class="grade-next">${nextGradeText} in ${distanceToNextText}</div>
-          </div>
-          <div>
-            <div class="small">Resistance feel</div>
-            <div class="resistance-readout ${getResistanceFeelClass(terrain.resistanceLabel)}">
-              ${terrain.resistanceLabel || "--"} (${Math.round(terrain.resistancePercent || 0)}%)
-            </div>
-          </div>
         </div>
-        <div class="small" style="margin-top:8px;">Route position: ${routeDistanceText}</div>
-        <div class="small" style="margin-top:2px;">
-          Elevation: ${Math.round(currentElevationMeters)}m | Next 500m: ${formatSignedPercent(next500mGradient, 1)} | Remaining: ${formatDistanceKmFloor(
-            remainingDistanceMeters,
-          )} / ${Math.round(remainingClimbMeters)}m climb
-        </div>
-        <div class="small" style="margin-top:2px;">${sessionClimbedText}</div>
-        <div class="small" style="margin-top:2px;">Trainer control: ${escapeHtml(terrain.trainerControlStatus || "--")}</div>
       </div>
-
-      ${sessionErgControlCardHtml}
 
       <div class="elevation-profile-card" style="margin-top:12px;">
         <h2 style="margin-bottom:8px;">Session Side-Scroller (Prototype)</h2>
@@ -12176,6 +12361,7 @@ function renderSession() {
         <h2 style="margin-bottom:8px;">Route Side View</h2>
         <div class="small">Live progress along the current route profile.</div>
         ${elevationProfileHtml}
+        <div class="small" style="margin-top:8px;">Route position: ${routeDistanceText}</div>
         <div class="small" style="margin-top:8px;">Next route: ${escapeHtml(nextRouteLabel)}</div>
       </div>
 
@@ -12196,6 +12382,10 @@ function renderSession() {
             <div class="code">${cadenceText}</div>
             <div class="small" style="margin-top:4px;">${cadenceSourceText}</div>
           </div>
+          <div style="flex:1;min-width:180px;">
+            <label class="label">Elevation climbed</label>
+            <div class="code">${sessionClimbedText}</div>
+          </div>
         </div>
         <table class="table" style="margin-top:12px;">
           <thead>
@@ -12211,24 +12401,6 @@ function renderSession() {
       </div>
 
       ${ftpUpdateCardHtml}
-
-      <div class="bike-choice-card" style="margin-top:12px;">
-        <h2 style="margin-bottom:8px;">Bike Selection</h2>
-        <div class="small">Choose your bike before a ride, or during a ride only at low speed.</div>
-        <div class="flex" style="gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:10px;">
-          <div style="flex:1;min-width:240px;">
-            <label class="label">Current bike</label>
-            <select id="sessionBikeSelect">${sessionBikeOptionsHtml}</select>
-          </div>
-          <div>
-            <button id="applySessionBikeBtn" class="secondary" ${bikeSwitchAllowed ? "" : "disabled"}>Apply Bike</button>
-          </div>
-        </div>
-        <div class="small" style="margin-top:8px;">${escapeHtml(bikeSwitchReason)}</div>
-        <div class="small" style="margin-top:8px;"><strong>${escapeHtml(currentBike.name)}</strong> - ${escapeHtml(currentBike.description)}</div>
-        <div class="small" style="margin-top:2px;">Pros: ${escapeHtml(currentBike.pros)}</div>
-        <div class="small" style="margin-top:2px;">Cons: ${escapeHtml(currentBike.cons)}</div>
-      </div>
 
       ${
         hasSessionStarted
@@ -12285,25 +12457,90 @@ function renderSession() {
         <strong>Note:</strong> This demo uses mock telemetry and WebSocket signaling (with localStorage fallback).
       </div>
     </div>
+    ${sessionBikeSelectionModalHtml}
+    ${sessionSettingsMenuHtml}
+    ${sessionBikeStickyHtml}
   `;
 
   document.getElementById("leaveBtn").addEventListener("click", () => {
     leaveSession();
   });
 
-  const copyBtn = document.getElementById("copyCodeBtn");
-  copyBtn.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(session.code);
-      showToast("Code copied");
-    } catch {
-      showToast("Copy failed");
-    }
-  });
+  const sessionCodeCopyBtn = document.getElementById("sessionCodeCopyBtn");
+  if (sessionCodeCopyBtn) {
+    sessionCodeCopyBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(session.code);
+        showToast("Code copied");
+      } catch {
+        showToast("Copy failed");
+      }
+    });
+  }
 
-  document.getElementById("pairSessionBtn").addEventListener("click", () => {
-    openPairing("session");
-  });
+  const sessionSettingsToggleBtn = document.getElementById("sessionSettingsToggleBtn");
+  if (sessionSettingsToggleBtn) {
+    sessionSettingsToggleBtn.addEventListener("click", () => {
+      state.sessionSettingsMenuOpen = !state.sessionSettingsMenuOpen;
+      render();
+    });
+  }
+
+  const sessionSettingsBackdrop = document.getElementById("sessionSettingsBackdrop");
+  if (sessionSettingsBackdrop) {
+    sessionSettingsBackdrop.addEventListener("click", () => {
+      state.sessionSettingsMenuOpen = false;
+      render();
+    });
+  }
+
+  const sessionSettingsBikeBtn = document.getElementById("sessionSettingsBikeBtn");
+  if (sessionSettingsBikeBtn) {
+    sessionSettingsBikeBtn.addEventListener("click", () => {
+      state.sessionSettingsMenuOpen = false;
+      state.sessionBikeModalOpen = true;
+      render();
+    });
+  }
+
+  const sessionSettingsErgSetupBtn = document.getElementById("sessionSettingsErgSetupBtn");
+  if (sessionSettingsErgSetupBtn) {
+    sessionSettingsErgSetupBtn.addEventListener("click", () => {
+      state.sessionSettingsMenuOpen = false;
+      openPairing("session");
+    });
+  }
+
+  const sessionBikeModalCloseBtn = document.getElementById("sessionBikeModalCloseBtn");
+  if (sessionBikeModalCloseBtn) {
+    sessionBikeModalCloseBtn.addEventListener("click", () => {
+      state.sessionBikeModalOpen = false;
+      render();
+    });
+  }
+
+  const sessionBikeModalBackdrop = document.getElementById("sessionBikeModalBackdrop");
+  if (sessionBikeModalBackdrop) {
+    sessionBikeModalBackdrop.addEventListener("click", (event) => {
+      if (event.target !== sessionBikeModalBackdrop) return;
+      state.sessionBikeModalOpen = false;
+      render();
+    });
+  }
+
+  const sessionBikeSelect = document.getElementById("sessionBikeSelect");
+  if (sessionBikeSelect) {
+    sessionBikeSelect.addEventListener("blur", () => {
+      window.setTimeout(() => {
+        flushDeferredSessionRender();
+      }, 0);
+    });
+    sessionBikeSelect.addEventListener("change", () => {
+      window.setTimeout(() => {
+        flushDeferredSessionRender();
+      }, 0);
+    });
+  }
 
   const addSessionBotBtn = document.getElementById("addSessionBotBtn");
   if (addSessionBotBtn) {
@@ -12394,8 +12631,8 @@ function renderSession() {
   if (applySessionBikeBtn) {
     applySessionBikeBtn.addEventListener("click", () => {
       const nextBikeId = normalizeBikeId(document.getElementById("sessionBikeSelect")?.value || user.bikeId);
-      const latestPrivateStats = getPrivateRiderStatsSnapshot(session, user);
-      const canSwitchNow = !isSessionRunning() || canSwitchBikeAtSpeed(latestPrivateStats.speedMps);
+      const latestSpeedMps = Number(getCurrentSession()?.telemetry?.[user.id]?.speedMps);
+      const canSwitchNow = !isSessionRunning() || canSwitchBikeAtSpeed(latestSpeedMps);
       if (!canSwitchNow) {
         showToast(`Bike can only be changed at ${BIKE_SWITCH_SPEED_LIMIT_KPH.toFixed(1)} km/h or less.`);
         render();
@@ -12411,6 +12648,7 @@ function renderSession() {
         bikeId: nextBikeId,
       };
       state.lobby.selectedBikeId = nextBikeId;
+      state.sessionBikeModalOpen = false;
       updateSessionOnStorage((sessionState) => {
         sessionState.users = sessionState.users || {};
         const existingUser = sessionState.users[user.id] || {};
@@ -12422,17 +12660,6 @@ function renderSession() {
         };
       });
       showToast(`${getBikeById(nextBikeId).name} selected.`);
-    });
-  }
-
-  const ergToggleBtn = document.getElementById("ergToggleBtn");
-  if (ergToggleBtn) {
-    ergToggleBtn.addEventListener("click", async () => {
-      const enableErg = !(state.devices.trainer?.erg?.desiredEnabled === true);
-      ergToggleBtn.disabled = true;
-      await setErgModeEnabled(enableErg, { reason: "session-ui-toggle", showToasts: true });
-      updateTerrainState({ trainerControlStatus: getTrainerControlStatusText() });
-      render();
     });
   }
 

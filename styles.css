@@ -70,6 +70,20 @@ textarea {
   margin-top: 8px;
 }
 
+input[type="checkbox"],
+input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  margin-top: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  box-shadow: none;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 select {
   color-scheme: dark;
 }
@@ -385,6 +399,92 @@ button:disabled {
   height: 100%;
   background: linear-gradient(90deg, #39c464 0%, #f1bf4b 55%, #f45f5f 100%);
   transition: width 0.24s ease;
+}
+
+.workout-set-progress-list {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.workout-set-progress-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1;
+}
+
+.workout-set-progress-chip.is-active {
+  border-color: rgba(50, 214, 255, 0.72);
+  background: rgba(50, 214, 255, 0.16);
+  color: rgba(245, 246, 255, 0.96);
+}
+
+.workout-motivation-prompt {
+  position: fixed;
+  left: 14px;
+  bottom: 58px;
+  z-index: 1190;
+  width: min(360px, calc(100vw - 28px));
+  margin: 0;
+  display: block;
+  pointer-events: none;
+}
+
+.workout-motivation-bubble {
+  position: relative;
+  max-width: 100%;
+  border-radius: 10px;
+  border: 1px solid rgba(50, 214, 255, 0.45);
+  background: rgba(50, 214, 255, 0.14);
+  color: rgba(245, 246, 255, 0.97);
+  padding: 8px 12px;
+  font-size: 0.87rem;
+  line-height: 1.35;
+  letter-spacing: 0.01em;
+}
+
+.workout-motivation-bubble::after {
+  content: "";
+  position: absolute;
+  left: 14px;
+  bottom: -7px;
+  width: 10px;
+  height: 10px;
+  transform: rotate(45deg);
+  border-right: 1px solid rgba(50, 214, 255, 0.45);
+  border-bottom: 1px solid rgba(50, 214, 255, 0.45);
+  background: rgba(50, 214, 255, 0.14);
+}
+
+.workout-motivation-prompt[data-tone="highIntensityFinish"] .workout-motivation-bubble,
+.workout-motivation-prompt[data-tone="moreWorkAhead"] .workout-motivation-bubble {
+  border-color: rgba(241, 191, 75, 0.56);
+  background: rgba(241, 191, 75, 0.16);
+}
+
+.workout-motivation-prompt[data-tone="highIntensityFinish"] .workout-motivation-bubble::after,
+.workout-motivation-prompt[data-tone="moreWorkAhead"] .workout-motivation-bubble::after {
+  border-right-color: rgba(241, 191, 75, 0.56);
+  border-bottom-color: rgba(241, 191, 75, 0.56);
+  background: rgba(241, 191, 75, 0.16);
+}
+
+.workout-motivation-prompt[data-tone="workoutEnding"] .workout-motivation-bubble {
+  border-color: rgba(107, 241, 175, 0.58);
+  background: rgba(107, 241, 175, 0.16);
+}
+
+.workout-motivation-prompt[data-tone="workoutEnding"] .workout-motivation-bubble::after {
+  border-right-color: rgba(107, 241, 175, 0.58);
+  border-bottom-color: rgba(107, 241, 175, 0.58);
+  background: rgba(107, 241, 175, 0.16);
 }
 
 .seismo-chart-shell {
@@ -822,7 +922,7 @@ button:disabled {
 
 .workout-zone-list {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 6px;
   margin-top: 10px;
   align-items: stretch;
@@ -1387,6 +1487,17 @@ button:disabled {
   border-color: rgba(25, 7, 7, 0.2);
 }
 
+.workout-zone-chip.workout-zone-level-6,
+.workout-segment-block.workout-zone-level-6,
+.workout-set-segment-block.workout-zone-level-6,
+.workout-preview-block.workout-zone-level-6,
+.workout-preview-set-segment.workout-zone-level-6,
+.workout-zone-readonly.workout-zone-level-6 {
+  background: #8d939f;
+  color: #11151c;
+  border-color: rgba(17, 21, 28, 0.25);
+}
+
 .workout-zone-readonly {
   margin-top: 8px;
   border-radius: 10px;
@@ -1512,6 +1623,12 @@ button:disabled {
 
   .workout-progress-grid {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .workout-motivation-prompt {
+    left: 10px;
+    bottom: 56px;
+    width: calc(100vw - 20px);
   }
 
 }
